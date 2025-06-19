@@ -14,7 +14,7 @@ os.makedirs(HPO_DIR, exist_ok=True)
 
 
 def objective(trial, direction: str):
-    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    lr = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
     batch_size = trial.suggest_int('batch_size', 256, 2048, step=256)
     epochs = trial.suggest_int('epochs', 3, 15)
     hidden_dim = trial.suggest_int('hidden_dim', 64, 256, step=32)
