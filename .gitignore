@@ -1,0 +1,20 @@
+﻿# 🔒 무시할 파일들
+
+# ✅ data 폴더 전체 무시
+BINANCE_AUTO/data/*
+
+# ✅ 예외: 코드 및 PPO 모델 폴더는 추적 허용
+!**/*.py
+!BINANCE_AUTO/data/models/ppo/
+!BINANCE_AUTO/data/models/ppo/**
+!**/.gitkeep
+
+# ❌ 일반 무시 파일들
+*.pkl
+*.pt
+*.db
+*.csv
+*.log
+*.json
+.env
+__pycache__/
