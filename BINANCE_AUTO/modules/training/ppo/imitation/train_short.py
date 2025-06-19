@@ -1,6 +1,6 @@
 import os
 import sys
-import pickle
+import joblib
 import pandas as pd
 import numpy as np
 import torch
@@ -14,38 +14,29 @@ sys.path.append(PROJECT_ROOT)
 
 from modules.training.ppo.core.model import PPOPolicyNetwork
 
-DATA_PATH = os.path.join(PROJECT_ROOT, 'data', 'models', 'lgbm', 'lgbm_short.pkl')
+CSV_PATH = os.path.join(PROJECT_ROOT, 'data', 'label', 'train_short.csv')
+LGBM_PATH = os.path.join(PROJECT_ROOT, 'data', 'models', 'lgbm', 'lgbm_short.pkl')
 SAVE_PATH = os.path.join(PROJECT_ROOT, 'data', 'models', 'ppo_staging', 'short_imitation.pt')
 
 
-def load_dataset(path: str):
-    obj = pickle.load(open(path, 'rb'))
-    if isinstance(obj, dict):
-        X = obj.get('X')
-        y = obj.get('y')
-    elif isinstance(obj, pd.DataFrame):
-        df = obj
-        y = df.iloc[:, -1]
-        X = df.iloc[:, :-1]
-    else:
-        raise ValueError('Unsupported data format')
+def load_dataset(csv_path: str, model_path: str):
+    df = pd.read_csv(csv_path)
+    exclude_keys = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
+    feature_cols = [c for c in df.columns if not any(key in c.lower() for key in exclude_keys)]
 
-    if isinstance(X, pd.DataFrame):
-        X = X.values
-    if isinstance(y, (pd.Series, pd.DataFrame)):
-        y = y.values
+    X_np = df[feature_cols].values.astype(np.float32)
+    lgbm_model = joblib.load(model_path)
+    prob = lgbm_model.predict_proba(X_np)[:, 1]
+    y_np = np.stack([1 - prob, prob], axis=1).astype(np.float32)
 
-    X = np.array(X, dtype=np.float32)
-    if X.ndim == 2:
-        X = X.reshape(len(X), 1, X.shape[1])
-
-    y = np.array(y)
-    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+    X_tensor = torch.tensor(X_np.reshape(len(X_np), 1, X_np.shape[1]), dtype=torch.float32)
+    y_tensor = torch.tensor(y_np, dtype=torch.float32)
+    return X_tensor, y_tensor
 
 
 def train(lr: float = 1e-4, batch_size: int = 1024, epochs: int = 5, hidden_dim: int = 128, device: str = None, save_model: bool = True):
     device = torch.device(device or ('cuda:0' if torch.cuda.is_available() else 'cpu'))
-    X, y = load_dataset(DATA_PATH)
+    X, y = load_dataset(CSV_PATH, LGBM_PATH)
     dataset = TensorDataset(X, y)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -64,14 +55,8 @@ def train(lr: float = 1e-4, batch_size: int = 1024, epochs: int = 5, hidden_dim:
             batch_y = batch_y.to(device)
             optimizer.zero_grad()
             logits, _ = model(batch_X)
-            if batch_y.dim() == 1 and not batch_y.dtype.is_floating_point:
-                loss = F.cross_entropy(logits, batch_y.long())
-            else:
-                if batch_y.dim() == 1:
-                    target = torch.stack([1 - batch_y, batch_y], dim=-1)
-                else:
-                    target = batch_y
-                loss = -(target * torch.log_softmax(logits, dim=-1)).sum(dim=1).mean()
+            log_prob = F.log_softmax(logits, dim=-1)
+            loss = -(batch_y * log_prob).sum(dim=1).mean()
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * batch_X.size(0)
