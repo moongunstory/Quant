@@ -18,6 +18,7 @@ from modules.config import (
     LGBM_MODEL_PATHS,
     TRAIN_LABEL_PATHS,
     PPO_IMITATION_MODEL_PATHS,
+    IMITATION_THRESHOLD
 )
 
 # 로깅 설정
@@ -132,7 +133,7 @@ def flatten_for_lgbm(X):
     # Shape: (N, 32, 56) -> (N, 32*56)
     return X.reshape(X.shape[0], -1)
 
-def generate_imitation_labels(lgbm_model, X_flat, confidence_threshold=0.85):
+def generate_imitation_labels(lgbm_model, X_flat, IMITATION_THRESHOLD):
     """LGBM 확신도 기반 모방학습 라벨 생성"""
     logger.info("LGBM 확신도 기반 라벨 생성 시작")
     
@@ -144,13 +145,13 @@ def generate_imitation_labels(lgbm_model, X_flat, confidence_threshold=0.85):
     
     # 확신도 통계
     avg_confidence = np.mean(confidences)
-    high_confidence_rate = np.mean(confidences >= confidence_threshold)
+    high_confidence_rate = np.mean(confidences >= IMITATION_THRESHOLD)
     
     logger.info(f"확신도 평균: {avg_confidence:.4f}")
-    logger.info(f"확신도 {confidence_threshold} 이상 비율: {high_confidence_rate:.4f}")
+    logger.info(f"확신도 {IMITATION_THRESHOLD} 이상 비율: {high_confidence_rate:.4f}")
     
     # 라벨 생성: 확신도 >= threshold일 때 1, 이외 0
-    labels = (confidences >= confidence_threshold).astype(int)
+    labels = (confidences >= IMITATION_THRESHOLD).astype(int)
     
     logger.info(f"생성된 라벨 분포 - 0: {np.sum(labels == 0)}, 1: {np.sum(labels == 1)}")
     
@@ -244,7 +245,7 @@ def train_model_for_direction(direction):
     
     # 4. LGBM 확신도 기반 라벨 생성
     X_flat = flatten_for_lgbm(X)
-    labels, confidences = generate_imitation_labels(lgbm_model, X_flat, confidence_threshold=0.85)
+    labels, confidences = generate_imitation_labels(lgbm_model, X_flat, IMITATION_THRESHOLD)
     
     # 5. 데이터셋 생성
     dataset = TimeSeriesDataset(X, labels)
