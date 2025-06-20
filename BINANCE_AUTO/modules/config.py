@@ -16,10 +16,22 @@ TIMEFRAMES = ["5m", "15m", "30m", "1h"]
 START_DATE = "2021-01-01"
 END_DATE = "2025-05-24"
 
-# 데이터 출력 저장 경로
-RAW_DATA_PATH = "data/raw/market_raw_data.csv"
-TRAIN_LONG_PATH = "data/label/train_long.csv"
-TRAIN_SHORT_PATH = "data/label/train_short.csv"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+LGBM_MODEL_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_long.pkl"),
+    "short": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_short.pkl"),
+}
+
+PPO_IMITATION_MODEL_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "long_imitation.pt"),
+    "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "short_imitation.pt"),
+}
+
+TRAIN_LABEL_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.csv"),
+    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.csv"),
+}
 
 # 손익절 값 4봉 기준
 TP_THRESHOLD = 0.008  # +0.8%
@@ -27,7 +39,7 @@ SL_THRESHOLD = 0.008  # -0.8%
 LABEL_HORIZON = 4
 
 # 지도 학습 전용 확신도
-LGBM_THRESHOLD = 0.6
+LGBM_THRESHOLD = 0.5
 
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {

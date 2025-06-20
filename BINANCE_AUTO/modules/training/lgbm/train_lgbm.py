@@ -11,6 +11,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, classificat
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
+
 sys.path.append(PROJECT_ROOT)
 
 from modules.config import TRAIN_LONG_PATH, TRAIN_SHORT_PATH, LGBM_THRESHOLD
