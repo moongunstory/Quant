@@ -100,10 +100,17 @@ def load_lgbm_model(model_path):
 def create_time_series_data(df, window_size=32):
     logger.info(f"시계열 데이터 생성 시작 - Window size: {window_size}")
 
-    # ✅ LGBM 학습 시 사용한 feature 수에 맞춤
+    # 수치형 피처만 추출
     feature_cols = df.select_dtypes(include=[np.number]).columns[:61].tolist()
     features = df[feature_cols].values
 
+    # ✅ NaN 제외 평균/표준편차로 정규화 → NaN은 이후 0.0으로 대체
+    mean = np.nanmean(features, axis=0)
+    std = np.nanstd(features, axis=0)
+    features = (features - mean) / (std + 1e-8)
+    features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    # 시계열 window 생성
     X, y = [], []
     for i in range(len(features) - window_size + 1):
         window_data = features[i:i + window_size]
@@ -116,7 +123,7 @@ def create_time_series_data(df, window_size=32):
 
     X = np.array(X)  # (N, 32, 61)
     y = np.array(y)
-    
+
     logger.info(f"시계열 데이터 생성 완료 - Shape: {X.shape}")
     return X, y
 
