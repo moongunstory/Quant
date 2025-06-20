@@ -44,6 +44,9 @@ LABEL_HORIZON = 4
 # 지도 학습 전용 확신도
 LGBM_THRESHOLD = 0.5
 
+# 모방 학습 전용 확신도
+IMITATION_THRESHOLD = 0.85
+
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
     "15m": [
