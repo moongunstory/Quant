@@ -14,14 +14,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 
 sys.path.append(PROJECT_ROOT)
 
-from modules.config import TRAIN_LONG_PATH, TRAIN_SHORT_PATH, LGBM_THRESHOLD
+from modules.config import TRAIN_LABEL_PATHS, LGBM_THRESHOLD
 
 def load_data(data_type="long"):
     """Long/Short 이진분류 데이터 로딩"""
     if data_type == "long":
-        data_path = os.path.join(PROJECT_ROOT, TRAIN_LONG_PATH)
+        data_path = TRAIN_LABEL_PATHS["long"]
     else:  # short
-        data_path = os.path.join(PROJECT_ROOT, TRAIN_SHORT_PATH)
+        data_path = TRAIN_LABEL_PATHS["short"]
     
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"[📊 {data_type.upper()} 데이터 로딩 완료] 행: {len(df)}, 컬럼: {len(df.columns)}")
