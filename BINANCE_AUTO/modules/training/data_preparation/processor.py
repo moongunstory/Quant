@@ -9,7 +9,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 sys.path.append(PROJECT_ROOT)
 
 from modules.config import (
-    RAW_DATA_PATH, TRAIN_LONG_PATH, TRAIN_SHORT_PATH,
+    RAW_DATA_PATH, TRAIN_LABEL_PATHS,
     TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON
 )
 
@@ -168,9 +168,9 @@ def main():
     print(f"  - Short 모델용: {len(df_short_binary)}행 (short={sum(df_short_binary['label'])}, hold={len(df_short_binary)-sum(df_short_binary['label'])})")
     
     # 7. 저장
-    long_path = os.path.join(PROJECT_ROOT, TRAIN_LONG_PATH)
-    short_path = os.path.join(PROJECT_ROOT, TRAIN_SHORT_PATH)
-    
+    long_path = TRAIN_LABEL_PATHS["long"]
+    short_path = TRAIN_LABEL_PATHS["short"]
+        
     os.makedirs(os.path.dirname(long_path), exist_ok=True)
     os.makedirs(os.path.dirname(short_path), exist_ok=True)
     

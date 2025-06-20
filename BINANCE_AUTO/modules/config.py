@@ -18,6 +18,13 @@ END_DATE = "2025-05-24"
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+RAW_DATA_PATH = (PROJECT_ROOT, "data", "raw")
+
+TRAIN_LABEL_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.csv"),
+    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.csv"),
+}
+
 LGBM_MODEL_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_long.pkl"),
     "short": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_short.pkl"),
@@ -28,10 +35,6 @@ PPO_IMITATION_MODEL_PATHS = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "short_imitation.pt"),
 }
 
-TRAIN_LABEL_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.csv"),
-    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.csv"),
-}
 
 # 손익절 값 4봉 기준
 TP_THRESHOLD = 0.008  # +0.8%
