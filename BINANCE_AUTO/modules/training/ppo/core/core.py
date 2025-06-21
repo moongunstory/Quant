@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
+def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95, normalize=True):
     """
     Generalized Advantage Estimation (GAE)
     """
@@ -14,8 +14,13 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
         gae = delta + gamma * lam * (1 - dones[t]) * gae
         advantages.insert(0, gae)
 
-    returns = [a + v for a, v in zip(advantages, values[:-1])]
-    return torch.tensor(advantages, dtype=torch.float32), torch.tensor(returns, dtype=torch.float32)
+    advantages = torch.tensor(advantages, dtype=torch.float32)
+    returns = advantages + torch.tensor(values[:-1], dtype=torch.float32)
+
+    if normalize:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    return advantages, returns
 
 
 def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
@@ -29,10 +34,13 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns):
+def compute_value_loss(values, returns, normalize=True):
     """
     MSE between predicted state value and return
     """
+    if normalize:
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        values = (values - values.mean()) / (values.std() + 1e-8)
     return F.mse_loss(values, returns)
 
 
