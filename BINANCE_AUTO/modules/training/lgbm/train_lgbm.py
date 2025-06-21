@@ -29,20 +29,21 @@ def load_data(data_type="long"):
 
 def generate_flatten_features(df, window=32):
     print(f"[🔄 Flatten 피처 생성 시작] window={window}")
-    
+
     # ✅ 결측값 먼저 채우기 (ffill)
     df = df.ffill()
-    
+
+    # ✅ 미래 정보 포함 가능성 있는 열 제거
     future_keywords = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
     feature_cols = [col for col in df.columns if not any(keyword in col.lower() for keyword in future_keywords)]
-    
+
     flatten_dfs = []
     for col in feature_cols:
-        for i in range(window):
-            shifted_col = df[col].shift(i)
-            new_col_name = f"{col}_t-{i}"
+        for i in range(window):  # 0부터 시작
+            shifted_col = df[col].shift(i + 1)  # ✅ t-1 ~ t-32 로 변경
+            new_col_name = f"{col}_t-{i+1}"     # ✅ 이름도 시점 반영
             flatten_dfs.append(shifted_col.rename(new_col_name))
-    
+
     X_flatten = pd.concat(flatten_dfs, axis=1)
     X_flatten = X_flatten.dropna()
 

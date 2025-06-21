@@ -26,8 +26,8 @@ TRAIN_LABEL_PATHS = {
 }
 
 LGBM_MODEL_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_long.pkl"),
-    "short": os.path.join(PROJECT_ROOT, "models", "lgbm", "lgbm_short.pkl"),
+    "long": os.path.join(PROJECT_ROOT, "data", "models", "lgbm", "lgbm_long.pkl"),
+    "short": os.path.join(PROJECT_ROOT, "data", "models", "lgbm", "lgbm_short.pkl"),
 }
 
 PPO_IMITATION_MODEL_PATHS = {
@@ -35,6 +35,15 @@ PPO_IMITATION_MODEL_PATHS = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "short_imitation.pt"),
 }
 
+VALUE_PRETRAIN_OUTPUT_PATH = {
+    "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_long.pt"),
+    "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_short.pt"),
+}
+
+PPO_FINAL_MODEL_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_long.pt"),
+    "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_short.pt"),
+}
 
 # 손익절 값 4봉 기준
 TP_THRESHOLD = 0.008  # +0.8%
@@ -43,9 +52,6 @@ LABEL_HORIZON = 4
 
 # 지도 학습 전용 확신도
 LGBM_THRESHOLD = 0.5
-
-# 모방 학습 전용 확신도
-IMITATION_THRESHOLD = 0.85
 
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {

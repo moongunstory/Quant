@@ -1,50 +1,90 @@
 import numpy as np
+import pandas as pd
 
 class PPOTradingEnv:
-    def __init__(self, data, tp_ratio=0.008, sl_ratio=-0.008, horizon=4):
+    def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32, tp_ratio=0.008, sl_ratio=-0.008, horizon=4):
+        self.direction = direction.lower()  # ✅ "long" 또는 "short"
+        self._logged_direction = False 
+        print(f"[ENV INIT] direction = '{self.direction}'")
         """
-        data: numpy array of shape (num_steps, seq_len, feature_dim)
+        csv_path: 라벨링된 CSV 파일 경로
+        seq_len: 상태 시퀀스 길이
         """
-        self.data = data
+        self.df = pd.read_csv(csv_path)
+        self.seq_len = seq_len
         self.tp_ratio = tp_ratio
         self.sl_ratio = sl_ratio
         self.horizon = horizon
 
+        self._prepare_data()
         self.reset()
 
-    def reset(self):
-        self.ptr = 0  # 현재 위치
-        self.episode_steps = 0
-        self.position_open = False
-        self.entry_price = None
+    def _prepare_data(self):
+        # label이 1인 지점만 학습 대상으로 추림 (long 또는 short)
+        self.valid_indices = self.df[self.df["label"] == 1].index.tolist()
 
+        # 전체 feature 컬럼 추출 (label, timestamp 제외)
+        self.feature_cols = [col for col in self.df.columns if col not in ["timestamp", "label"]]
+
+        # ✅ NaN 대체 추가
+        self.df[self.feature_cols] = self.df[self.feature_cols].fillna(0.0)
+
+        self.data = self.df[self.feature_cols].values
+
+        self.sequences = []
+        self.entry_indices = []
+
+        for idx in self.valid_indices:
+            if idx - self.seq_len + 1 < 0:
+                continue
+            seq = self.data[idx - self.seq_len + 1: idx + 1]
+            self.sequences.append(seq)
+            self.entry_indices.append(idx)
+
+        self.sequences = np.array(self.sequences)  # shape: (N, seq_len, feature_dim)
+        self.entry_indices = np.array(self.entry_indices)
+
+    def reset(self):
+        self.ptr = 0
         self.done = False
         return self._get_state()
 
     def _get_state(self):
-        return self.data[self.ptr]
+        return self.sequences[self.ptr]
 
     def step(self, action):
         """
         action: 0 (Hold), 1 (Long)
         """
+        done = False
         reward = 0.0
         info = {}
-        done = False
 
-        current_state = self._get_state()
-        entry_price = current_state[-1, 0]  # 마지막 캔들의 종가 (예시: feature 0번이 close라고 가정)
+        entry_idx = self.entry_indices[self.ptr]
+        # 실제 close 계열 피처 자동 검색
+        close_col = next((col for col in self.feature_cols if "close" in col.lower()), None)
+        if close_col is None:
+            raise ValueError(f"❌ 'close' 관련 컬럼이 feature_cols에 없습니다 → feature_cols={self.feature_cols[:5]}")
+        close_idx = self.feature_cols.index(close_col)
+        entry_price = self.data[entry_idx][close_idx]
 
         if action == 0:
-            reward = 0.0  # 홀드 → 보상 없음
+            reward = 0.0
         else:
-            # 롱 진입 후 horizon 동안 TP/SL 조건 검사
-            done = True
-            horizon_limit = min(self.ptr + self.horizon, len(self.data) - 1)
-
-            prices = self.data[self.ptr + 1:horizon_limit + 1, -1, 0]  # horizon 기간의 close 가격 시퀀스
+            horizon_limit = min(entry_idx + self.horizon, len(self.data) - 1)
+            prices = self.data[entry_idx + 1: horizon_limit + 1, close_idx]
             returns = (prices - entry_price) / entry_price
-
+            if self.direction == "short":
+                if not self._logged_direction:
+                    print(f"[STEP] direction = {self.direction}, action = {action}")
+                    print("🟥 SHORT reward reversal 적용됨")
+                    self._logged_direction = True
+                returns = -returns
+            else:
+                if not self._logged_direction:
+                    print("🟩 LONG reward 구조 적용됨")
+                    self._logged_direction = True
+                    
             tp_hit = np.any(returns >= self.tp_ratio)
             sl_hit = np.any(returns <= self.sl_ratio)
 
@@ -53,11 +93,11 @@ class PPOTradingEnv:
             elif tp_hit:
                 reward = 1.0
             else:
-                reward = -0.1  # 진입했는데 아무 것도 못 하고 끝난 경우
+                reward = -0.1  # 또는 returns[-1] * 스케일링
+
 
         self.ptr += 1
-        if self.ptr >= len(self.data) - self.horizon:
+        if self.ptr >= len(self.sequences) - 1:
             done = True
 
-        next_state = self._get_state()
-        return next_state, reward, done, info
+        return self._get_state(), reward, done, info
