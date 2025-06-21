@@ -19,6 +19,9 @@ from modules.config import (
     PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_FINAL_MODEL_PATHS,
+    TP_THRESHOLD,
+    SL_THRESHOLD,
+    LABEL_HORIZON,
 )
 
 from modules.training.ppo.core.env_train import PPOTradingEnv
@@ -52,7 +55,14 @@ def train_ppo(
     logger.info(f"📁 [{direction.upper()}] CSV 파일: {csv_path}")
     logger.info(f"🎯 [{direction.upper()}] epochs={total_epochs}, batch_size={batch_size}, lr={lr}, device={device}")
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
-    env = PPOTradingEnv(csv_path=csv_path, direction=direction, seq_len=32, tp_ratio=0.008, sl_ratio=0.008, horizon=4)
+    env = PPOTradingEnv(
+        csv_path=csv_path,
+        direction=direction,
+        seq_len=32,
+        tp_ratio=TP_THRESHOLD,
+        sl_ratio=SL_THRESHOLD,
+        horizon=LABEL_HORIZON,
+    )
     input_dim = env.sequences.shape[2]
     logger.info(f"📊 [{direction.upper()}] 환경 생성 완료: input_dim={input_dim}, sequences={env.sequences.shape}")
 
