@@ -2,19 +2,22 @@ import numpy as np
 import pandas as pd
 
 class PPOTradingEnv:
-    def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32, tp_ratio=0.008, sl_ratio=-0.008, horizon=4):
+    def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32,
+                 tp_ratio=0.008, sl_ratio=-0.008, horizon=4, hold_reward: float = 0.0):
         self.direction = direction.lower()  # ✅ "long" 또는 "short"
-        self._logged_direction = False 
-        print(f"[ENV INIT] direction = '{self.direction}'")
+        self._logged_direction = False
+        print(f"[ENV INIT] direction = '{self.direction}', hold_reward={hold_reward}")
         """
         csv_path: 라벨링된 CSV 파일 경로
         seq_len: 상태 시퀀스 길이
+        hold_reward: neither TP nor SL hit → reward value to reduce bias
         """
         self.df = pd.read_csv(csv_path)
         self.seq_len = seq_len
         self.tp_ratio = tp_ratio
         self.sl_ratio = sl_ratio
         self.horizon = horizon
+        self.hold_reward = hold_reward
 
         self._prepare_data()
         self.reset()
@@ -93,7 +96,7 @@ class PPOTradingEnv:
             elif tp_hit:
                 reward = 1.0
             else:
-                reward = -0.1  # 또는 returns[-1] * 스케일링
+                reward = self.hold_reward  # 기본값 0.0으로 편향 완화
 
 
         self.ptr += 1

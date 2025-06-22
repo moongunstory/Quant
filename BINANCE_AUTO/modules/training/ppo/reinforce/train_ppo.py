@@ -112,6 +112,18 @@ def train_ppo(
             _, _, last_value = model.get_action(obs_tensor)
 
         buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=lam)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            rewards_arr = np.array(episode_rewards)
+            logger.debug(
+                f"Reward dist → mean:{rewards_arr.mean():.3f}, "
+                f"std:{rewards_arr.std():.3f}, min:{rewards_arr.min():.3f}, max:{rewards_arr.max():.3f}")
+            logger.debug(
+                f"Advantage dist → mean:{buffer.advantages.mean():.3f}, "
+                f"std:{buffer.advantages.std():.3f}, min:{buffer.advantages.min():.3f}, max:{buffer.advantages.max():.3f}")
+            logger.debug(
+                f"Return dist → mean:{buffer.returns.mean():.3f}, "
+                f"std:{buffer.returns.std():.3f}, min:{buffer.returns.min():.3f}, max:{buffer.returns.max():.3f}")
         
         # 롤아웃 통계
         avg_reward = np.mean(episode_rewards)
@@ -123,6 +135,10 @@ def train_ppo(
         policy_losses = []
         value_losses = []
         entropies = []
+        batch_advantages = []
+        batch_values = []
+        batch_evs = []
+        value_ranges = []
         
         for obs_batch, action_batch, return_batch, adv_batch, old_logprob_batch in buffer.get_batches(batch_size):
             obs_batch = obs_batch.to(device)
@@ -133,7 +149,7 @@ def train_ppo(
 
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
             policy_loss = compute_ppo_loss(log_probs, old_logprob_batch, adv_batch, clip_eps)
-            value_loss = compute_value_loss(values, return_batch, normalize=True)
+            value_loss = compute_value_loss(values, return_batch)
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
 
             optimizer.zero_grad()
@@ -143,11 +159,17 @@ def train_ppo(
             policy_losses.append(policy_loss.item())
             value_losses.append(value_loss.item())
             entropies.append(entropy.mean().item())
+            batch_advantages.append(adv_batch.mean().item())
+            batch_values.append(values.mean().item())
+            batch_evs.append(compute_explained_variance(values.detach(), return_batch.detach()).item())
+            value_ranges.append((values.min().item(), values.max().item()))
 
         # 에폭 통계
-        avg_advantage = adv_batch.mean().item()
-        avg_value = values.mean().item()
-        ev = compute_explained_variance(values.detach(), return_batch.detach())
+        avg_advantage = np.mean(batch_advantages)
+        avg_value = np.mean(batch_values)
+        ev = np.mean(batch_evs)
+        value_min = min(v[0] for v in value_ranges)
+        value_max = max(v[1] for v in value_ranges)
         
         avg_policy_loss = np.mean(policy_losses)
         avg_value_loss = np.mean(value_losses)
@@ -164,11 +186,15 @@ def train_ppo(
                    f"Entropy: {avg_entropy:.4f}")
 
         # 이상치 경고
-        adv_std = adv_batch.std().item()
+        adv_std = np.std(batch_advantages)
         if adv_std > 5.0:
             logger.warning(f"⚠️ [{direction.upper()} Epoch {epoch+1}] High Variance in Advantage: std={adv_std:.3f}")
         if abs(avg_value) < 0.001:
             logger.warning(f"⚠️ [{direction.upper()} Epoch {epoch+1}] Value predictions too low: {avg_value:.6f}")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Value prediction range → min:{value_min:.3f}, max:{value_max:.3f}")
 
     # 학습 완료 통계
     final_avg_reward = np.mean(all_epoch_rewards[-3:]) if len(all_epoch_rewards) >= 3 else np.mean(all_epoch_rewards)
