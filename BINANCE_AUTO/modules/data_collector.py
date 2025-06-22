@@ -1,15 +1,156 @@
-import torch
 import os
+import pandas as pd
+import numpy as np
+import time
+import requests
+from datetime import timedelta
+from binance.client import Client
+from dotenv import load_dotenv
 
-path = os.path.join("data", "models", "ppo_staging", "long_imitation.pt")
+from modules.config import (
+    BINANCE_API_KEY, BINANCE_SECRET_KEY,
+    TIMEFRAMES, REQUIRED_CANDLE_COUNTS,
+    FEATURE_CATEGORIES_BY_TF, DUNE_API_KEY,
+    CACHE_DIR, ONCHAIN_CACHE_DIR, TZ
+)
 
-if not os.path.exists(path):
-    print(f"❌ 파일이 존재하지 않습니다: {path}")
-else:
-    print(f"📂 모델 파일 로딩 중: {path}")
-    state_dict = torch.load(path, map_location='cpu')
+from modules.training.data_preparation.collector import (
+    add_indicators_with_validation,
+    fetch_btc_historical_features
+)
+from modules.training.data_preparation.processor import create_dune_derived_features
 
-    for k, v in state_dict.items():
-        if torch.isnan(v).any():
-            print(f"❌ NaN detected in → {k}")
-    print("✅ 검사 완료")
+
+client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+
+def fetch_ohlcv_from_binance(symbol, tf, now, count):
+    end_time = now.tz_localize(None)
+    start_time = end_time - pd.Timedelta(minutes=int(tf[:-1]) * count)
+
+    klines = client.get_historical_klines(
+        symbol,
+        tf,
+        start_str=start_time.strftime('%Y-%m-%d %H:%M:%S'),
+        end_str=end_time.strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+    df = pd.DataFrame(klines, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "num_trades",
+        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"])
+
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    return df.astype(float).sort_index()
+
+def update_cache(symbol, tf, new_df, cache_dir, max_len):
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{symbol}_{tf}.pkl")
+
+    if os.path.exists(path):
+        old_df = pd.read_pickle(path)
+        combined = pd.concat([old_df, new_df])
+        combined = combined[~combined.index.duplicated(keep='last')]
+    else:
+        combined = new_df
+
+    combined = combined.sort_index().iloc[-max_len:]
+    combined.to_pickle(path)
+    return combined
+
+def fetch_latest_dune_row():
+    url = "https://api.dune.com/api/v1/query/5182378/results"
+    headers = {"x-dune-api-key": DUNE_API_KEY}
+    response = requests.get(url, headers=headers)
+    data = response.json()
+
+    if 'result' not in data or 'rows' not in data['result']:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data['result']['rows'])
+    if df.empty:
+        return pd.DataFrame()
+
+    df['day'] = pd.to_datetime(df['day']).dt.floor('D')
+    df.set_index('day', inplace=True)
+    df = df.sort_index()
+    latest_index = df.index.max()
+    return df.loc[[latest_index]]
+
+class RealTimeDataCollector:
+    def __init__(self):
+        self.now = pd.Timestamp.now(tz=TZ).floor("30min") + pd.Timedelta(seconds=5)
+        self.symbol = "ETHUSDT"
+        self.btc_symbol = "BTCUSDT"
+        self.cache_dir = CACHE_DIR
+
+    def collect_eth_features(self):
+        result_df = None
+
+        for tf in TIMEFRAMES:
+            count = REQUIRED_CANDLE_COUNTS[tf]
+            new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
+
+            expected_last_ts = self.now - pd.Timedelta(minutes=int(tf[:-1]))
+            if new_df.index.max() < expected_last_ts:
+                raise ValueError(f"{tf} 캔들 누락됨: {new_df.index.max()} < {expected_last_ts}")
+
+            updated_df = update_cache(self.symbol, tf, new_df, self.cache_dir, count)
+            df_with_ind = add_indicators_with_validation(updated_df, tf)
+            latest_row = df_with_ind.iloc[[-1]]
+
+            result_df = latest_row if result_df is None else result_df.join(latest_row, how='outer')
+
+        return result_df
+
+    def collect_btc_features(self):
+        df = fetch_btc_historical_features(self.now - timedelta(hours=3), self.now)
+        return df.loc[[df.index.max()]]
+
+    def collect_dune_features(self):
+        dune_raw = fetch_latest_dune_row()
+        if dune_raw.empty:
+            raise ValueError("Dune 결과 없음")
+
+        dune_df = create_dune_derived_features(dune_raw)
+        dune_latest = dune_df.loc[[dune_df.index.max()]]
+
+        date_str = dune_latest.index.max().strftime("%m.%d")
+        os.makedirs(ONCHAIN_CACHE_DIR, exist_ok=True)
+        dune_latest.to_json(os.path.join(ONCHAIN_CACHE_DIR, f"{date_str}.json"), orient="records", date_format="iso")
+
+        files = sorted(os.listdir(ONCHAIN_CACHE_DIR))
+        if len(files) > 3:
+            for f in files[:-3]:
+                os.remove(os.path.join(ONCHAIN_CACHE_DIR, f))
+
+        return dune_latest
+    
+    def get_recent_market_df(self, tf='5m', seq_len=32, horizon=4):
+        """
+        PPO reward 평가용 5분봉 캔들 36줄 반환
+        - seq_len: 상태 관측용
+        - horizon: 보상 평가용
+        - tf: 사용 타임프레임 ('5m')
+        """
+        count = seq_len + horizon  # PPO 학습 기준 총 필요 수
+        df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
+
+        if df is None or len(df) < count:
+            raise ValueError(f"📉 {tf} 캔들 수 부족: {len(df)} < {count}")
+
+        return df.iloc[-count:]
+
+    def run(self):
+        eth_df = self.collect_eth_features()
+        btc_df = self.collect_btc_features()
+        dune_df = self.collect_dune_features()
+
+        final_df = eth_df.join(btc_df, how='left').join(dune_df, how='left')
+
+        if final_df.isna().any().any():
+            print("🚨 결측값 존재 - 추론 skip")
+            return None
+
+        return final_df.iloc[-1]
