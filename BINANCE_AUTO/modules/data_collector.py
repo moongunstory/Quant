@@ -27,11 +27,12 @@ client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
 
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
-    end_time = now.tz_convert("UTC").tz_localize(None)
-    start_time = end_time - pd.Timedelta(minutes=int(tf[:-1]) * count)
+    end_time_utc = now.tz_convert("UTC")
+    end_naive = end_time_utc.tz_localize(None)
+    start_time = (end_time_utc - pd.Timedelta(minutes=int(tf[:-1]) * count)).tz_localize(None)
 
     klines = client.get_historical_klines(
-        symbol, tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_time.strftime("%Y-%m-%d %H:%M:%S")
+        symbol, tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
     )
 
     df = pd.DataFrame(
@@ -53,8 +54,9 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     )
 
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
+    df.index = df.index.tz_convert("UTC")
     return df.astype(float).sort_index()
 
 
@@ -62,8 +64,13 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, f"{symbol}_{tf}.pkl")
 
+    if new_df.index.tz is None:
+        new_df.index = new_df.index.tz_localize("UTC")
+
     if os.path.exists(path):
         old_df = pd.read_pickle(path)
+        if old_df.index.tz is None:
+            old_df.index = old_df.index.tz_localize("UTC")
         combined = pd.concat([old_df, new_df])
         combined = combined[~combined.index.duplicated(keep="last")]
     else:
@@ -87,8 +94,9 @@ def fetch_latest_dune_row():
     if df.empty:
         return pd.DataFrame()
 
-    df["day"] = pd.to_datetime(df["day"]).dt.floor("D")
+    df["day"] = pd.to_datetime(df["day"], utc=True).dt.floor("D")
     df.set_index("day", inplace=True)
+    df.index = df.index.tz_convert("UTC")
     df = df.sort_index()
     latest_index = df.index.max()
     return df.loc[[latest_index]]
@@ -113,7 +121,7 @@ class RealTimeDataCollector:
             # (예: 5분봉 00:55~01:00 구간은 00:55). self.now는 KST 기준이므로
             # 비교 전에 UTC로 맞추고 해당 타임프레임 단위로 정렬한다.
             expected_last_ts = (
-                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=int(tf[:-1]))).floor(tf).tz_localize(None)
+                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=int(tf[:-1]))).floor(tf)
             )
 
             if new_df.index.max() < expected_last_ts:
@@ -129,6 +137,8 @@ class RealTimeDataCollector:
 
     def collect_btc_features(self):
         df = fetch_btc_historical_features(self.now - timedelta(hours=3), self.now)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
         return df.loc[[df.index.max()]]
 
     def collect_dune_features(self):
@@ -137,6 +147,8 @@ class RealTimeDataCollector:
             raise ValueError("Dune 결과 없음")
 
         dune_df = create_dune_derived_features(dune_raw)
+        if dune_df.index.tz is None:
+            dune_df.index = dune_df.index.tz_localize("UTC")
         dune_latest = dune_df.loc[[dune_df.index.max()]]
 
         date_str = dune_latest.index.max().strftime("%m.%d")
@@ -166,6 +178,7 @@ class RealTimeDataCollector:
         return df.iloc[-count:]
 
     def run(self):
+        self.now = pd.Timestamp.now(tz=TZ).floor("5min") - pd.Timedelta(minutes=1)
         eth_df = self.collect_eth_features()
         btc_df = self.collect_btc_features()
         dune_df = self.collect_dune_features()
