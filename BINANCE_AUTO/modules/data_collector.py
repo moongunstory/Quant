@@ -35,12 +35,14 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     klines = client.get_historical_klines(
         symbol, api_tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
     )
+    if not klines:
+        return pd.DataFrame()
 
     df = pd.DataFrame(
         klines,
         columns=[
             "timestamp",
-            "open", 
+            "open",
             "high",
             "low",
             "close",
@@ -58,6 +60,8 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
+    if df.empty:
+        return df
     return df.astype(float).sort_index()
 
 
@@ -105,8 +109,8 @@ def fetch_latest_dune_row():
 
 class RealTimeDataCollector:
     def __init__(self):
-        # 항상 직전 캔들까지만 요청하도록 함 (예: 00:25에 실행 → 00:24:00까지)
-        self.now = pd.Timestamp.now(tz=TZ).floor("5min") - pd.Timedelta(minutes=1)
+        # 항상 직전 캔들까지만 요청하도록 함 (30분 단위 실행 기준)
+        self.now = pd.Timestamp.utcnow().floor("30min").tz_localize("UTC") - pd.Timedelta(minutes=1)
         self.symbol = "ETHUSDT"
         self.btc_symbol = "BTCUSDT"
         self.cache_dir = CACHE_DIR
@@ -117,6 +121,8 @@ class RealTimeDataCollector:
         for tf in TIMEFRAMES:
             count = REQUIRED_CANDLE_COUNTS[tf]
             new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
+            if new_df.empty:
+                raise ValueError(f"{tf} Binance 응답 없음")
 
             value = int(re.findall(r"\d+", tf)[0])
             expected_last_ts = (
@@ -135,9 +141,11 @@ class RealTimeDataCollector:
         return result_df
 
     def collect_btc_features(self):
-        start = (self.now - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-        end = self.now.strftime("%Y-%m-%d %H:%M:%S")
-        df = fetch_btc_historical_features(start, end)
+        start = (self.now.floor("30min") - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        end = self.now.floor("30min").strftime("%Y-%m-%d %H:%M:%S")
+        df = fetch_btc_historical_features(start, end, interval="30m")
+        if df.empty:
+            raise ValueError("BTC 데이터 없음")
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         return df.loc[[df.index.max()]]
@@ -172,14 +180,13 @@ class RealTimeDataCollector:
         """
         count = seq_len + horizon  # PPO 학습 기준 총 필요 수
         df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
-
-        if df is None or len(df) < count:
+        if df is None or df.empty or len(df) < count:
             raise ValueError(f"📉 {tf} 캔들 수 부족: {len(df)} < {count}")
 
         return df.iloc[-count:]
 
     def run(self):
-        self.now = pd.Timestamp.now(tz=TZ).floor("5min") - pd.Timedelta(minutes=1)
+        self.now = pd.Timestamp.utcnow().floor("30min").tz_localize("UTC") - pd.Timedelta(minutes=1)
         eth_df = self.collect_eth_features()
         btc_df = self.collect_btc_features()
         dune_df = self.collect_dune_features()
