@@ -33,7 +33,7 @@ def call_dune_api(query_id: str, query_name: str) -> pd.DataFrame:
         df = pd.DataFrame(data['result']['rows'])
         if not df.empty and 'day' in df.columns:
             df['day'] = df['day'].astype(str).str.replace(r' Asia/Seoul.*$', '', regex=True)
-            df['timestamp'] = pd.to_datetime(df['day'])
+            df['timestamp'] = pd.to_datetime(df['day'], utc=True)
             df = df.drop(columns=['day']).set_index('timestamp')
         return df
     return pd.DataFrame()
@@ -63,7 +63,7 @@ def collect_all_dune_data() -> pd.DataFrame:
 
 def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     """OHLCV 데이터 수집"""
-    start_date = pd.to_datetime(start_str)
+    start_date = pd.to_datetime(start_str, utc=True)
     extended_start = start_date - timedelta(days=5)
     extended_start_str = extended_start.strftime("%Y-%m-%d")
     
@@ -75,8 +75,9 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
         "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"])
     
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
+    df.index = df.index.tz_convert("UTC")
     return df.astype(float).dropna()
 
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
@@ -162,7 +163,7 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 def resample_to_15m_base(df: pd.DataFrame, tf: str, target_start: str) -> pd.DataFrame:
     """타임프레임을 15분봉 기준으로 리샘플링"""
-    target_start_dt = pd.to_datetime(target_start)
+    target_start_dt = pd.to_datetime(target_start, utc=True)
     
     if tf == "5m":
         resampled = df[df.index >= target_start_dt]
@@ -215,7 +216,7 @@ def fetch_btc_historical_features(start_date: str, end_date: str) -> pd.DataFram
     btc_features = btc_features.fillna(0)
     
     # 15분봉 인덱스 생성
-    target_start_dt = pd.to_datetime(start_date)
+    target_start_dt = pd.to_datetime(start_date, utc=True)
     end_dt = btc_features.index.max()
     full_15m_index = pd.date_range(start=target_start_dt, end=end_dt, freq='15min')
     
@@ -231,7 +232,7 @@ def collect_all_market_data() -> pd.DataFrame:
     eth_15m_df = fetch_ohlcv_with_extended_period("ETHUSDT", "15m", START_DATE, END_DATE)
     eth_15m_indicators = add_indicators_with_validation(eth_15m_df, "15m")
     
-    target_start_dt = pd.to_datetime(START_DATE)
+    target_start_dt = pd.to_datetime(START_DATE, utc=True)
     base_df = eth_15m_indicators[eth_15m_indicators.index >= target_start_dt].copy()
     
     # 2. 다른 타임프레임 ETH 데이터 병합
