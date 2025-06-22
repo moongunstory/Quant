@@ -73,7 +73,7 @@ def create_labels(df: pd.DataFrame, label_horizon: int = 4) -> pd.DataFrame:
         
         # TP/SL 가격 계산
         tp_price = entry_price * (1 + TP_THRESHOLD)
-        sl_price = entry_price * (1 - SL_THRESHOLD)
+        sl_price = entry_price * (1 + SL_THRESHOLD)
         
         # horizon 기간 설정 (다음 4개 15분봉)
         end_time = df.index[i + label_horizon]

@@ -18,7 +18,7 @@ END_DATE = "2025-05-24"
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-RAW_DATA_PATH = (PROJECT_ROOT, "data", "raw")
+RAW_DATA_PATH = "data/raw/market_raw_data.csv"
 
 TRAIN_LABEL_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.csv"),

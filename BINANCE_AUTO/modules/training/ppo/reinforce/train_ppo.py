@@ -73,8 +73,16 @@ def train_ppo(
     model.load_model(imitation_model_path)
 
     # 가치 사전학습 weight 적용
-    logger.info(f"🎯 [{direction.upper()}] 가치 사전학습 모델 로딩: {value_model_path}")
-    model.value_head.load_state_dict(torch.load(value_model_path, map_location=device))
+    #logger.info(f"🎯 [{direction.upper()}] 가치 사전학습 모델 로딩: {value_model_path}")
+    #model.value_head.load_state_dict(torch.load(value_model_path, map_location=device))
+    logger.info(f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다.")
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            torch.nn.init.zeros_(m.bias)
+
+    model.value_head.apply(init_weights)
+
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
