@@ -230,11 +230,6 @@ def train_ppo(
     model.save_model(save_path)
     logger.info(f"✅ [{direction.upper()}] PPO 학습 완료 → 저장: {save_path}")
 
-    if last_values is not None and last_returns is not None:
-        np.save("debug_values.npy", last_values.numpy())
-        np.save("debug_returns.npy", last_returns.numpy())
-        logger.info("📝 Debug tensors saved: debug_values.npy, debug_returns.npy")
-    
     return {
         'direction': direction,
         'final_avg_reward': final_avg_reward,

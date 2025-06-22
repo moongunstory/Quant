@@ -9,8 +9,16 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
+TZ = 'Asia/Seoul'
+
 # 타임프레임 설정
 TIMEFRAMES = ["5m", "15m", "30m", "1h"]
+
+# 실제 매매에 사용할 심볼 (ETH/USDT 등)
+TRADE_SYMBOL = "ETHUSDT"
+
+# 실거래에 사용할 잔고 비율 (예: 99% = 0.99)
+TRADE_BALANCE_RATIO = 0.99
 
 # 학습 데이터 수집 기간 설정
 START_DATE = "2021-01-01"
@@ -45,14 +53,33 @@ PPO_FINAL_MODEL_PATHS = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_short.pt"),
 }
 
+# 캐시 저장 경로
+CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
+
+# 온체인 Dune 결과 저장 디렉토리
+ONCHAIN_CACHE_DIR = os.path.join(CACHE_DIR, "onchain")
+
 # 손익절 값 4봉 기준
 TP_THRESHOLD = 0.008  # +0.8%
-# Stop-loss must be negative to represent price drop
 SL_THRESHOLD = -0.008  # -0.8%
 LABEL_HORIZON = 4
 
 # 지도 학습 전용 확신도
 LGBM_THRESHOLD = 0.5
+
+# 실제 매매 전용 확신도
+LONG_THRESHOLD = 0.8
+SHORT_THRESHOLD = 0.8
+
+# PPO 실전 강화학습 설정
+PPO_BUFFER_PATHS = {
+    "long": "data/buffer/long_rollout.pkl",
+    "short": "data/buffer/short_rollout.pkl"
+}
+
+PPO_BUFFER_SIZE = 128
+PPO_EPOCHS = 5
+PPO_INPUT_DIM = 61  # 실전 피처 수 기준
 
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
@@ -96,3 +123,10 @@ DUNE_QUERY_PARTS = {
     'P': '5287873'
 }
 
+# 실시간 수집용 최소 캔들 확보 수 (지표 계산 안정성 확보 목적)
+REQUIRED_CANDLE_COUNTS = {
+    "5m": 50,    # macd_slope_6 등 고려
+    "15m": 70,   # ema_50, sma_50 등 고려
+    "30m": 40,   # macd, ema_20 등 고려
+    "1h": 70     # sma_50 등 고려
+}
