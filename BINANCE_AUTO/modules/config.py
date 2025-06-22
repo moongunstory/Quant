@@ -12,7 +12,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TZ = 'Asia/Seoul'
 
 # 타임프레임 설정
-TIMEFRAMES = ["5m", "15m", "30m", "1h"]
+TIMEFRAMES = ["5min", "15min", "30min", "1H"]
 
 # 실제 매매에 사용할 심볼 (ETH/USDT 등)
 TRADE_SYMBOL = "ETHUSDT"
@@ -83,22 +83,22 @@ PPO_INPUT_DIM = 61  # 실전 피처 수 기준
 
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
-    "15m": [
+    "15min": [
         "rsi", "stochastic_k", "cci", "roc", "mom",
         "macd", "macd_signal", "macd_histogram",
         "ema_20", "ema_50", "sma_20", "sma_50",
         "adx", "atr", "obv", "volume_ratio"
     ],
-    "5m": [
+    "5min": [
         "rsi", "stochastic_k", "macd", "macd_signal",
         "rsi_mean_6", "rsi_std_6",
         "macd_slope_6",
         "stochk_range_6"
     ],
-    "30m": [
+    "30min": [
         "rsi", "macd", "ema_20", "adx"
     ],
-    "1h": [
+    "1H": [
         "rsi", "ema_20", "sma_50", "adx"
     ]
 }
@@ -125,8 +125,14 @@ DUNE_QUERY_PARTS = {
 
 # 실시간 수집용 최소 캔들 확보 수 (지표 계산 안정성 확보 목적)
 REQUIRED_CANDLE_COUNTS = {
-    "5m": 50,    # macd_slope_6 등 고려
-    "15m": 70,   # ema_50, sma_50 등 고려
-    "30m": 40,   # macd, ema_20 등 고려
-    "1h": 70     # sma_50 등 고려
+    "5min": 50,
+    "15min": 70,
+    "30min": 40,
+    "1H": 70
+}
+
+# Binance 호환용 인터벌 변환 맵 
+BINANCE_INTERVAL_MAP = {
+    "1min": "1m", "3min": "3m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"
 }
