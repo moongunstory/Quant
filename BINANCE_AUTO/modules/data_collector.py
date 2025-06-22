@@ -8,41 +8,55 @@ from binance.client import Client
 from dotenv import load_dotenv
 
 from modules.config import (
-    BINANCE_API_KEY, BINANCE_SECRET_KEY,
-    TIMEFRAMES, REQUIRED_CANDLE_COUNTS,
-    FEATURE_CATEGORIES_BY_TF, DUNE_API_KEY,
-    CACHE_DIR, ONCHAIN_CACHE_DIR, TZ
+    BINANCE_API_KEY,
+    BINANCE_SECRET_KEY,
+    TIMEFRAMES,
+    REQUIRED_CANDLE_COUNTS,
+    FEATURE_CATEGORIES_BY_TF,
+    DUNE_API_KEY,
+    CACHE_DIR,
+    ONCHAIN_CACHE_DIR,
+    TZ,
 )
 
-from modules.training.data_preparation.collector import (
-    add_indicators_with_validation,
-    fetch_btc_historical_features
-)
+from modules.training.data_preparation.collector import add_indicators_with_validation, fetch_btc_historical_features
 from modules.training.data_preparation.processor import create_dune_derived_features
 
 
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
+
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
-    end_time = now.tz_convert('UTC').tz_localize(None)
+    end_time = now.tz_convert("UTC").tz_localize(None)
     start_time = end_time - pd.Timedelta(minutes=int(tf[:-1]) * count)
 
     klines = client.get_historical_klines(
-        symbol,
-        tf,
-        start_str=start_time.strftime('%Y-%m-%d %H:%M:%S'),
-        end_str=end_time.strftime('%Y-%m-%d %H:%M:%S')
+        symbol, tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_time.strftime("%Y-%m-%d %H:%M:%S")
     )
 
-    df = pd.DataFrame(klines, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"])
+    df = pd.DataFrame(
+        klines,
+        columns=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_asset_volume",
+            "num_trades",
+            "taker_buy_base_volume",
+            "taker_buy_quote_volume",
+            "ignore",
+        ],
+    )
 
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("timestamp", inplace=True)
     return df.astype(float).sort_index()
+
 
 def update_cache(symbol, tf, new_df, cache_dir, max_len):
     os.makedirs(cache_dir, exist_ok=True)
@@ -51,7 +65,7 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
     if os.path.exists(path):
         old_df = pd.read_pickle(path)
         combined = pd.concat([old_df, new_df])
-        combined = combined[~combined.index.duplicated(keep='last')]
+        combined = combined[~combined.index.duplicated(keep="last")]
     else:
         combined = new_df
 
@@ -59,24 +73,26 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
     combined.to_pickle(path)
     return combined
 
+
 def fetch_latest_dune_row():
     url = "https://api.dune.com/api/v1/query/5182378/results"
     headers = {"x-dune-api-key": DUNE_API_KEY}
     response = requests.get(url, headers=headers)
     data = response.json()
 
-    if 'result' not in data or 'rows' not in data['result']:
+    if "result" not in data or "rows" not in data["result"]:
         return pd.DataFrame()
 
-    df = pd.DataFrame(data['result']['rows'])
+    df = pd.DataFrame(data["result"]["rows"])
     if df.empty:
         return pd.DataFrame()
 
-    df['day'] = pd.to_datetime(df['day']).dt.floor('D')
-    df.set_index('day', inplace=True)
+    df["day"] = pd.to_datetime(df["day"]).dt.floor("D")
+    df.set_index("day", inplace=True)
     df = df.sort_index()
     latest_index = df.index.max()
     return df.loc[[latest_index]]
+
 
 class RealTimeDataCollector:
     def __init__(self):
@@ -93,7 +109,13 @@ class RealTimeDataCollector:
             count = REQUIRED_CANDLE_COUNTS[tf]
             new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
 
-            expected_last_ts = (self.now - pd.Timedelta(minutes=int(tf[:-1]))).tz_localize(None)
+            # Binance API가 반환하는 타임스탬프는 UTC 기준의 캔들 시작 시각
+            # (예: 5분봉 00:55~01:00 구간은 00:55). self.now는 KST 기준이므로
+            # 비교 전에 UTC로 맞추고 해당 타임프레임 단위로 정렬한다.
+            expected_last_ts = (
+                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=int(tf[:-1]))).floor(tf).tz_localize(None)
+            )
+
             if new_df.index.max() < expected_last_ts:
                 raise ValueError(f"{tf} 캔들 누락됨: {new_df.index.max()} < {expected_last_ts}")
 
@@ -101,7 +123,7 @@ class RealTimeDataCollector:
             df_with_ind = add_indicators_with_validation(updated_df, tf)
             latest_row = df_with_ind.iloc[[-1]]
 
-            result_df = latest_row if result_df is None else result_df.join(latest_row, how='outer')
+            result_df = latest_row if result_df is None else result_df.join(latest_row, how="outer")
 
         return result_df
 
@@ -127,8 +149,8 @@ class RealTimeDataCollector:
                 os.remove(os.path.join(ONCHAIN_CACHE_DIR, f))
 
         return dune_latest
-    
-    def get_recent_market_df(self, tf='5m', seq_len=32, horizon=4):
+
+    def get_recent_market_df(self, tf="5m", seq_len=32, horizon=4):
         """
         PPO reward 평가용 5분봉 캔들 36줄 반환
         - seq_len: 상태 관측용
@@ -148,7 +170,7 @@ class RealTimeDataCollector:
         btc_df = self.collect_btc_features()
         dune_df = self.collect_dune_features()
 
-        final_df = eth_df.join(btc_df, how='left').join(dune_df, how='left')
+        final_df = eth_df.join(btc_df, how="left").join(dune_df, how="left")
 
         if final_df.isna().any().any():
             print("🚨 결측값 존재 - 추론 skip")
