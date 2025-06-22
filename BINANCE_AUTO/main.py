@@ -16,8 +16,7 @@ from modules.config import (
     PPO_BUFFER_PATHS,
     PPO_BUFFER_SIZE,
     PPO_EPOCHS,
-    PPO_INPUT_DIM,
-    TZ
+    PPO_INPUT_DIM
 )
 
 def main():
@@ -36,7 +35,7 @@ def main():
     while True:
         try:
             if not immediate_first_run:
-                now_ts = pd.Timestamp.now(tz=TZ)
+                now_ts = pd.Timestamp.utcnow()
                 next_run = now_ts.floor("30min") + pd.Timedelta(minutes=30)
                 sleep_sec = (next_run - now_ts).total_seconds()
                 time.sleep(sleep_sec)
