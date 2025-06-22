@@ -14,7 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 
 sys.path.append(PROJECT_ROOT)
 
-from modules.config import TRAIN_LABEL_PATHS, LGBM_THRESHOLD
+from modules.config import TRAIN_LABEL_PATHS, LGBM_THRESHOLD, LGBM_MODEL_PATHS
 
 def load_data(data_type="long"):
     """Long/Short 이진분류 데이터 로딩"""
@@ -196,14 +196,10 @@ def evaluate_model(model, X_valid, y_valid, data_type="long"):
 
 def save_model(model, metrics, data_type="long"):
     """모델만 저장 (메타데이터는 로그 출력)"""
-    # 저장 디렉토리 생성
-    model_dir = os.path.join(PROJECT_ROOT, "models", "lgbm")
-    os.makedirs(model_dir, exist_ok=True)
-    
-    # 모델만 저장
-    model_path = os.path.join(model_dir, f"lgbm_{data_type}.pkl")
+    model_path = LGBM_MODEL_PATHS[data_type]
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump(model, model_path)
-    
+
     print(f"[💾 {data_type.upper()} 모델 저장 완료] {model_path}")
     
     # 메타데이터는 로그로만 출력
@@ -299,8 +295,8 @@ def main():
     print(f"📊 Long 모델  - F1: {long_metrics['f1']:.4f}, 신호율: {long_metrics['signal_rate']:.2%}")
     print(f"📊 Short 모델 - F1: {short_metrics['f1']:.4f}, 신호율: {short_metrics['signal_rate']:.2%}")
     print(f"\n💾 저장된 모델:")
-    print(f"   ✅ models/lgbm/lgbm_long.pkl")
-    print(f"   ✅ models/lgbm/lgbm_short.pkl")
+    print(f"   ✅ {LGBM_MODEL_PATHS['long']}")
+    print(f"   ✅ {LGBM_MODEL_PATHS['short']}")
     print(f"{'=' * 80}")
     
     return results
