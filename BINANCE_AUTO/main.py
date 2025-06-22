@@ -2,7 +2,7 @@ import time
 import torch
 import traceback
 import pandas as pd
-from modules.trading_executor import TradeExecutor
+from modules.trading_executor import FuturesTradeExecutor, calculate_futures_quantity
 from modules.ppo_runtime.predictor import Predictor
 from modules.data_collector import RealTimeDataCollector
 from modules.training.ppo.core.buffer import RolloutBuffer
@@ -23,8 +23,8 @@ def main():
     collector = RealTimeDataCollector()
     predictor = Predictor(input_dim=PPO_INPUT_DIM)
     executors = {
-        "long": TradeExecutor(),
-        "short": TradeExecutor()
+        "long": FuturesTradeExecutor(),
+        "short": FuturesTradeExecutor()
     }
     buffers = {
         "long": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE),
@@ -54,8 +54,11 @@ def main():
                 print(f"[{direction.upper()}] 예측: {action_str.upper()} (conf={log_prob:.3f})")
 
                 if action != 'hold':
-                    price = float(state['5m_close'])  # 5m 기준 진입가 사용
-                    executors[direction].enter_position(action_str, price) 
+                    price = float(state['5m_close'])
+                    balance = executors[direction].get_balance()
+                    qty = calculate_futures_quantity(balance, price)
+                    side = 'BUY' if action_str == 'long' else 'SELL'
+                    executors[direction].market_entry(side, qty)
 
                 executors[direction].monitor_position()
 

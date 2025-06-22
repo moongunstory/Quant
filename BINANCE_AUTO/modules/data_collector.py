@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import requests
 from datetime import timedelta
-from binance.client import Client
+from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
 from modules.config import (
@@ -22,7 +22,7 @@ from modules.training.data_preparation.collector import add_indicators_with_vali
 from modules.training.data_preparation.processor import create_dune_derived_features
 
 
-client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_SECRET_KEY)
 
 
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
@@ -35,11 +35,12 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     start_naive = start_time.tz_localize(None)
 
     api_tf = BINANCE_INTERVAL_MAP[tf]
-    klines = client.get_historical_klines(
-        symbol,
-        api_tf,
-        start_str=start_naive.strftime("%Y-%m-%d %H:%M:%S"),
-        end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
+    klines = client.klines(
+        symbol=symbol,
+        interval=api_tf,
+        startTime=int(start_naive.timestamp() * 1000),
+        endTime=int(end_naive.timestamp() * 1000),
+        limit=count,
     )
     if not klines:
         return pd.DataFrame()
