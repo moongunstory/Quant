@@ -31,7 +31,7 @@ def main():
         "short": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
     }
 
-    immediate_first_run = True  # comment out to run strictly on schedule
+    #immediate_first_run = True 테스트용
     while True:
         try:
             if not immediate_first_run:
