@@ -27,11 +27,23 @@ class Predictor:
     def predict(self, state_series: np.ndarray, direction: str = None):
         """
         direction: 'long' 또는 'short' 지정 시 해당 방향만 반환 (main.py와 연동 위해)
+        state_series: np.ndarray, shape = (feature_dim,) or (seq_len, feature_dim)
         """
-        state_tensor = torch.tensor(state_series, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # ▶ 타입 강제 변환 및 shape 표준화
+        state_series = np.asarray(state_series, dtype=np.float32)
+
+        if state_series.ndim == 1:
+            # [feature_dim] → [1, 1, feature_dim]
+            state_tensor = torch.tensor(state_series, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        elif state_series.ndim == 2:
+            # [seq_len, feature_dim] → [1, seq_len, feature_dim]
+            state_tensor = torch.tensor(state_series, dtype=torch.float32).unsqueeze(0)
+        else:
+            raise ValueError(f"Invalid input shape for state_series: {state_series.shape}")
+
+        state_tensor = state_tensor.to(self.device)
 
         result = {}
-
         directions = [direction] if direction else ['long', 'short']
 
         for dir_ in directions:
@@ -46,7 +58,7 @@ class Predictor:
         if direction:
             return result[direction]['action'], result[direction]['log_prob'], result[direction]['value']
 
-        # 판단 로직 (dual mode)
+        # dual mode 판단
         long_sig = result['long']['action'] == 1 and result['long']['log_prob'] >= LONG_THRESHOLD
         short_sig = result['short']['action'] == 1 and result['short']['log_prob'] >= SHORT_THRESHOLD
 
@@ -60,7 +72,6 @@ class Predictor:
             else:
                 return 'short', result['short']['log_prob'], result['short']['value']
         else:
-            # hold 시에는 더 높은 확신도를 가진 방향의 value도 같이 리턴
             if result['long']['log_prob'] > result['short']['log_prob']:
                 return 'hold', result['long']['log_prob'], result['long']['value']
             else:
