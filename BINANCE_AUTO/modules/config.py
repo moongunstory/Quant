@@ -9,7 +9,8 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
-TZ = 'Asia/Seoul'
+# 모든 스케줄은 UTC 기준으로 처리한다
+TZ = 'UTC'
 
 # 타임프레임 설정
 TIMEFRAMES = ["5min", "15min", "30min", "1H"]
