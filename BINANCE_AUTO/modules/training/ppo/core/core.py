@@ -34,9 +34,11 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns, normalize=True):
-    """
-    MSE between predicted state value and return
+def compute_value_loss(values, returns, normalize=False):
+    """MSE between predicted state value and return.
+
+    By default no normalization is applied so that the loss is on the
+    same scale as :func:`compute_explained_variance`.
     """
     if normalize:
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
