@@ -21,6 +21,12 @@ TRADE_SYMBOL = "ETHUSDT"
 # 실거래에 사용할 잔고 비율 (예: 99% = 0.99)
 TRADE_BALANCE_RATIO = 0.99
 
+# ---------- Futures Settings ----------
+# USDT-M Perpetual Futures 심볼 및 레버리지 설정
+FUTURES_SYMBOL = "ETHUSDT"
+FUTURES_LEVERAGE = 5
+FUTURES_MARGIN_TYPE = "ISOLATED"
+
 # 학습 데이터 수집 기간 설정
 START_DATE = "2021-01-01"
 END_DATE = "2025-05-24"

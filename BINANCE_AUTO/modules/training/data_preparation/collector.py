@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 import time
-from binance.client import Client
+from binance.um_futures import UMFutures
 import pandas_ta as ta
 import os
 import sys
@@ -19,7 +19,7 @@ from modules.config import (
     RAW_DATA_PATH
 )
 
-client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_SECRET_KEY)
 
 def call_dune_api(query_id: str, query_name: str) -> pd.DataFrame:
     """Dune API 호출"""
@@ -67,7 +67,15 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     extended_start = start_date - timedelta(days=5)
     extended_start_str = extended_start.strftime("%Y-%m-%d")
     
-    klines = client.get_historical_klines(symbol, interval, extended_start_str, end_str)
+    start_ms = int(pd.to_datetime(extended_start_str).timestamp() * 1000)
+    end_ms = int(pd.to_datetime(end_str).timestamp() * 1000)
+    klines = client.klines(
+        symbol=symbol,
+        interval=interval,
+        startTime=start_ms,
+        endTime=end_ms,
+        limit=1000,
+    )
     
     df = pd.DataFrame(klines, columns=[
         "timestamp", "open", "high", "low", "close", "volume",
