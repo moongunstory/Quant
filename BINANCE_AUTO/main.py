@@ -48,10 +48,13 @@ def main():
                 continue
 
             for direction in ["long", "short"]:
+                if executors[direction].position is not None:
+                    print(f"⏸️ [{direction.upper()}] Position already open → skipping decision.")
+                    continue
+
                 action, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
                 action_map_rev = {0: 'hold', 1: direction}
                 action_str = action_map_rev.get(action, 'unknown')
-                print(f"[{direction.upper()}] 예측: {action_str.upper()} (conf={log_prob:.3f})")
 
                 if action_str != 'hold':
                     price = float(state['5m_close'])
@@ -79,7 +82,13 @@ def main():
                     log_prob=log_prob,
                     value=value
                 )
-                print(f"[{direction.upper()}] Buffer size: {len(buffers[direction])}")
+
+                emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
+                emoji = emoji_map.get(action_str, '')
+                print(
+                    f"🧠 [{direction.upper()}] Action: {action_str.upper()} {emoji} | "
+                    f"Confidence: {log_prob:.3f} | Buffer: {len(buffers[direction])}/{PPO_BUFFER_SIZE}"
+                )
 
                 if buffers[direction].is_ready():
                     print(f"🚀 PPO 학습 시작: {direction.upper()}")
