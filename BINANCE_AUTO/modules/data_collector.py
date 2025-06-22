@@ -135,7 +135,9 @@ class RealTimeDataCollector:
         return result_df
 
     def collect_btc_features(self):
-        df = fetch_btc_historical_features(self.now - timedelta(hours=3), self.now)
+        start = (self.now - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        end = self.now.strftime("%Y-%m-%d %H:%M:%S")
+        df = fetch_btc_historical_features(start, end)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         return df.loc[[df.index.max()]]

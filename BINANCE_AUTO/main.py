@@ -1,5 +1,6 @@
 import time
 import torch
+import traceback
 import pandas as pd
 from modules.trading_executor import TradeExecutor
 from modules.ppo_runtime.predictor import Predictor
@@ -90,6 +91,7 @@ def main():
 
         except Exception as e:
             print(f"❌ 오류 발생: {e}")
+            traceback.print_exc()
             time.sleep(60)
 
 if __name__ == "__main__":
