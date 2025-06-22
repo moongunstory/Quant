@@ -24,7 +24,7 @@ from modules.training.data_preparation.processor import create_dune_derived_feat
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
-    end_time = now.tz_localize(None)
+    end_time = now.tz_convert('UTC').tz_localize(None)
     start_time = end_time - pd.Timedelta(minutes=int(tf[:-1]) * count)
 
     klines = client.get_historical_klines(
@@ -80,7 +80,8 @@ def fetch_latest_dune_row():
 
 class RealTimeDataCollector:
     def __init__(self):
-        self.now = pd.Timestamp.now(tz=TZ).floor("30min") + pd.Timedelta(seconds=5)
+        # 항상 직전 캔들까지만 요청하도록 함 (예: 00:25에 실행 → 00:24:00까지)
+        self.now = pd.Timestamp.now(tz=TZ).floor("5min") - pd.Timedelta(minutes=1)
         self.symbol = "ETHUSDT"
         self.btc_symbol = "BTCUSDT"
         self.cache_dir = CACHE_DIR
@@ -92,7 +93,7 @@ class RealTimeDataCollector:
             count = REQUIRED_CANDLE_COUNTS[tf]
             new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
 
-            expected_last_ts = self.now - pd.Timedelta(minutes=int(tf[:-1]))
+            expected_last_ts = (self.now - pd.Timedelta(minutes=int(tf[:-1]))).tz_localize(None)
             if new_df.index.max() < expected_last_ts:
                 raise ValueError(f"{tf} 캔들 누락됨: {new_df.index.max()} < {expected_last_ts}")
 
