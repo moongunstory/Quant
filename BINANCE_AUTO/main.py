@@ -15,7 +15,8 @@ from modules.config import (
     PPO_BUFFER_PATHS,
     PPO_BUFFER_SIZE,
     PPO_EPOCHS,
-    PPO_INPUT_DIM
+    PPO_INPUT_DIM,
+    TZ
 )
 
 def main():
@@ -30,8 +31,16 @@ def main():
         "short": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
     }
 
+    immediate_first_run = True  # comment out to run strictly on schedule
     while True:
         try:
+            if not immediate_first_run:
+                now_ts = pd.Timestamp.now(tz=TZ)
+                next_run = now_ts.floor("30min") + pd.Timedelta(minutes=30)
+                sleep_sec = (next_run - now_ts).total_seconds()
+                time.sleep(sleep_sec)
+            immediate_first_run = False
+
             state = collector.run()
             if state is None:
                 print("🚨 피처 결측 → 스킵")
@@ -78,8 +87,6 @@ def main():
                         total_epochs=PPO_EPOCHS
                     )
                     buffers[direction].reset()
-
-            time.sleep(60 * 30)
 
         except Exception as e:
             print(f"❌ 오류 발생: {e}")
