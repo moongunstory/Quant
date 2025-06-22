@@ -1,7 +1,6 @@
 import os
 import pandas as pd
-import numpy as np
-import time
+import re
 import requests
 from datetime import timedelta
 from binance.client import Client
@@ -12,7 +11,7 @@ from modules.config import (
     BINANCE_SECRET_KEY,
     TIMEFRAMES,
     REQUIRED_CANDLE_COUNTS,
-    FEATURE_CATEGORIES_BY_TF,
+    BINANCE_INTERVAL_MAP,
     DUNE_API_KEY,
     CACHE_DIR,
     ONCHAIN_CACHE_DIR,
@@ -29,17 +28,19 @@ client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
     end_time_utc = now.tz_convert("UTC")
     end_naive = end_time_utc.tz_localize(None)
-    start_time = (end_time_utc - pd.Timedelta(minutes=int(tf[:-1]) * count)).tz_localize(None)
+    value = int(re.findall(r"\d+", tf)[0])
+    start_time = (end_time_utc - pd.Timedelta(minutes=value * count)).tz_localize(None)
+    api_tf = BINANCE_INTERVAL_MAP[tf]
 
     klines = client.get_historical_klines(
-        symbol, tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
+        symbol, api_tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
     )
 
     df = pd.DataFrame(
         klines,
         columns=[
             "timestamp",
-            "open",
+            "open", 
             "high",
             "low",
             "close",
@@ -117,11 +118,9 @@ class RealTimeDataCollector:
             count = REQUIRED_CANDLE_COUNTS[tf]
             new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
 
-            # Binance API가 반환하는 타임스탬프는 UTC 기준의 캔들 시작 시각
-            # (예: 5분봉 00:55~01:00 구간은 00:55). self.now는 KST 기준이므로
-            # 비교 전에 UTC로 맞추고 해당 타임프레임 단위로 정렬한다.
+            value = int(re.findall(r"\d+", tf)[0])
             expected_last_ts = (
-                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=int(tf[:-1]))).floor(tf)
+                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=value)).floor(tf.lower())
             )
 
             if new_df.index.max() < expected_last_ts:
