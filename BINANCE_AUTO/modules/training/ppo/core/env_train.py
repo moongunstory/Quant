@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 class PPOTradingEnv:
-    def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32, tp_ratio=0.008, sl_ratio=-0.008, horizon=4):
+    def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32, tp_ratio=0.008, sl_ratio=-0.008, horizon=4, neutral_coef: float = 0.1):
         self.direction = direction.lower()  # ✅ "long" 또는 "short"
         self._logged_direction = False 
         print(f"[ENV INIT] direction = '{self.direction}'")
@@ -15,6 +15,8 @@ class PPOTradingEnv:
         self.tp_ratio = tp_ratio
         self.sl_ratio = sl_ratio
         self.horizon = horizon
+        # coefficient for scaling reward when neither TP nor SL hit
+        self.neutral_coef = neutral_coef
 
         self._prepare_data()
         self.reset()
@@ -93,7 +95,8 @@ class PPOTradingEnv:
             elif tp_hit:
                 reward = 1.0
             else:
-                reward = -0.1  # 또는 returns[-1] * 스케일링
+                # neither TP nor SL hit -> small reward scaled by final return
+                reward = returns[-1] * self.neutral_coef
 
 
         self.ptr += 1

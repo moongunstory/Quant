@@ -34,7 +34,7 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns, normalize=True):
+def compute_value_loss(values, returns, normalize=False):
     """
     MSE between predicted state value and return
     """
