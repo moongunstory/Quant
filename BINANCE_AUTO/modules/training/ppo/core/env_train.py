@@ -3,7 +3,7 @@ import pandas as pd
 
 class PPOTradingEnv:
     def __init__(self, csv_path: str, direction: str = "long", seq_len: int = 32,
-                 tp_ratio=0.008, sl_ratio=-0.008, horizon=4, hold_reward: float = 0.0):
+                 tp_ratio=0.008, sl_ratio=-0.008, horizon=4, hold_reward: float = 0.01):
         self.direction = direction.lower()  # ✅ "long" 또는 "short"
         self._logged_direction = False
         print(f"[ENV INIT] direction = '{self.direction}', hold_reward={hold_reward}")
@@ -92,11 +92,11 @@ class PPOTradingEnv:
             sl_hit = np.any(returns <= self.sl_ratio)
 
             if sl_hit:
-                reward = -1.0
+                reward = -0.5
             elif tp_hit:
                 reward = 1.0
             else:
-                reward = self.hold_reward  # 기본값 0.0으로 편향 완화
+                reward = self.hold_reward
 
 
         self.ptr += 1
@@ -104,3 +104,4 @@ class PPOTradingEnv:
             done = True
 
         return self._get_state(), reward, done, info
+

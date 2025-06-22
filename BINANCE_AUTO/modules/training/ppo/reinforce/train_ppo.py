@@ -40,7 +40,7 @@ def train_ppo(
     imitation_model_path: str,
     value_model_path: str,
     save_path: str,
-    total_epochs=10,
+    total_epochs=30,
     batch_size=64,
     gamma=0.99,
     lam=0.95,
@@ -137,8 +137,12 @@ def train_ppo(
         entropies = []
         batch_advantages = []
         batch_values = []
+        batch_returns = []
         batch_evs = []
         value_ranges = []
+
+        last_values = None
+        last_returns = None
         
         for obs_batch, action_batch, return_batch, adv_batch, old_logprob_batch in buffer.get_batches(batch_size):
             obs_batch = obs_batch.to(device)
@@ -161,25 +165,32 @@ def train_ppo(
             entropies.append(entropy.mean().item())
             batch_advantages.append(adv_batch.mean().item())
             batch_values.append(values.mean().item())
+            batch_returns.append(return_batch.mean().item())
             batch_evs.append(compute_explained_variance(values.detach(), return_batch.detach()).item())
             value_ranges.append((values.min().item(), values.max().item()))
+
+            last_values = values.detach().cpu()
+            last_returns = return_batch.detach().cpu()
 
         # 에폭 통계
         avg_advantage = np.mean(batch_advantages)
         avg_value = np.mean(batch_values)
+        avg_return = np.mean(batch_returns) if batch_returns else 0.0
         ev = np.mean(batch_evs)
         value_min = min(v[0] for v in value_ranges)
         value_max = max(v[1] for v in value_ranges)
-        
+
         avg_policy_loss = np.mean(policy_losses)
         avg_value_loss = np.mean(value_losses)
         avg_entropy = np.mean(entropies)
         all_epoch_rewards.append(avg_reward)
 
         # 핵심 로그 출력
-        logger.info(f"📊 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
-                   f"Avg Reward: {avg_reward:.3f} | Avg Advantage: {avg_advantage:.3f} | "
-                   f"Avg Value: {avg_value:.3f} | Explained Variance: {ev:.3f}")
+        logger.info(
+            f"📊 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
+            f"Avg Reward: {avg_reward:.3f} | Avg Advantage: {avg_advantage:.3f} | "
+            f"Avg Return: {avg_return:.3f} | Avg Value: {avg_value:.3f} | Explained Variance: {ev:.3f}"
+        )
         
         logger.info(f"🔧 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
                    f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
@@ -204,6 +215,11 @@ def train_ppo(
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     model.save_model(save_path)
     logger.info(f"✅ [{direction.upper()}] PPO 학습 완료 → 저장: {save_path}")
+
+    if last_values is not None and last_returns is not None:
+        np.save("debug_values.npy", last_values.numpy())
+        np.save("debug_returns.npy", last_returns.numpy())
+        logger.info("📝 Debug tensors saved: debug_values.npy, debug_returns.npy")
     
     return {
         'direction': direction,
@@ -225,7 +241,7 @@ if __name__ == "__main__":
             imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
             value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
             save_path=PPO_FINAL_MODEL_PATHS[direction],
-            total_epochs=10
+            total_epochs=30
         )
         results.append(result)
     

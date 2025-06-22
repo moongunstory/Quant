@@ -38,12 +38,15 @@ class RolloutBuffer:
             self.advantages.insert(0, gae)
             self.returns.insert(0, gae + values[t])
 
-        self.advantages = torch.tensor(self.advantages, dtype=torch.float32)
-        self.returns = torch.tensor(self.returns, dtype=torch.float32)
+        advantages = torch.tensor(self.advantages, dtype=torch.float32)
+        returns = torch.tensor(self.returns, dtype=torch.float32)
 
         if normalize:
-            self.advantages = (self.advantages - self.advantages.mean()) / (
-                self.advantages.std() + 1e-8)
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std() + 1e-8)
+
+        self.advantages = advantages
+        self.returns = returns
 
     def get_batches(self, batch_size):
         n = len(self.observations)
