@@ -145,12 +145,6 @@ class RealTimeDataCollector:
         end = self.now.floor("30min").strftime("%Y-%m-%d %H:%M:%S")
         df = fetch_btc_historical_features(start, end, interval="30m")
 
-        print(f"[BTC] 수집된 데이터 수: {len(df)}")
-        if not df.empty:
-            print(f"[BTC] 최근 캔들 timestamp: {df.index.max()}")
-            print(f"[BTC] 최근 행 결측 수:\n{df.tail(1).isna().sum()}")
-            print(f"[BTC] 컬럼명:\n{df.columns.tolist()}")
-
         if df.empty:
             raise ValueError("BTC 데이터 없음")
         if df.index.tz is None:
