@@ -33,6 +33,13 @@ class FuturesTradeExecutor:
     def _setup_leverage(self):
         try:
             self.client.change_margin_type(symbol=self.symbol, marginType=FUTURES_MARGIN_TYPE)
+        except Exception as e:
+            if "-4046" in str(e) or "No need to change margin type" in str(e):
+                pass  # 이미 설정된 경우 → 조용히 무시
+            else:
+                print("⚠️ Margin type setup failed:", e)
+
+        try:
             self.client.change_leverage(symbol=self.symbol, leverage=self.leverage)
         except Exception as e:
             print("⚠️ Leverage setup failed:", e)
