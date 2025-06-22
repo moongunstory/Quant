@@ -86,10 +86,14 @@ def train_ppo(
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    initial_entropy_coef = entropy_coef
     all_epoch_rewards = []
 
     for epoch in range(total_epochs):
-        logger.info(f"📈 [{direction.upper()}] Epoch {epoch+1}/{total_epochs} 시작")
+        entropy_coef = initial_entropy_coef * (1 - epoch / total_epochs)
+        logger.info(
+            f"📈 [{direction.upper()}] Epoch {epoch+1}/{total_epochs} 시작 "
+            f"(entropy_coef={entropy_coef:.4f})")
         
         buffer = RolloutBuffer(buffer_size=max_steps)
         obs = env.reset()
@@ -160,6 +164,7 @@ def train_ppo(
             old_logprob_batch = old_logprob_batch.to(device)
 
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
+            entropy = torch.clamp(entropy, min=0.01)
             policy_loss = compute_ppo_loss(log_probs, old_logprob_batch, adv_batch, clip_eps)
             value_loss = compute_value_loss(values, return_batch)
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
@@ -200,9 +205,10 @@ def train_ppo(
             f"Avg Return: {avg_return:.3f} | Avg Value: {avg_value:.3f} | Explained Variance: {ev:.3f}"
         )
         
-        logger.info(f"🔧 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
-                   f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
-                   f"Entropy: {avg_entropy:.4f}")
+        logger.info(
+            f"🔧 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
+            f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
+            f"Entropy: {avg_entropy:.4f} | Entropy Coef: {entropy_coef:.4f}")
 
         # 이상치 경고
         adv_std = np.std(batch_advantages)
