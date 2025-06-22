@@ -176,9 +176,9 @@ def resample_to_15m_base(df: pd.DataFrame, tf: str, target_start: str) -> pd.Dat
     
     return resampled[resampled.index >= target_start_dt]
 
-def fetch_btc_historical_features(start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_btc_historical_features(start_date: str, end_date: str, interval: str = "1h") -> pd.DataFrame:
     """BTC 피처 수집"""
-    btc_df = fetch_ohlcv_with_extended_period("BTCUSDT", "1h", start_date, end_date)
+    btc_df = fetch_ohlcv_with_extended_period("BTCUSDT", interval, start_date, end_date)
     
     btc_features = pd.DataFrame(index=btc_df.index)
     
@@ -221,8 +221,9 @@ def fetch_btc_historical_features(start_date: str, end_date: str) -> pd.DataFram
     full_15m_index = pd.date_range(start=target_start_dt, end=end_dt, freq='15min')
     
     btc_15m = pd.DataFrame(index=full_15m_index, columns=btc_features.columns)
-    hourly_mask = btc_15m.index.minute == 0
-    btc_15m.loc[hourly_mask] = btc_features.reindex(btc_15m.index[hourly_mask]).values
+    interval_minutes = 60 if interval == "1h" else int(interval.rstrip("m"))
+    mask = btc_15m.index.minute % interval_minutes == 0
+    btc_15m.loc[mask] = btc_features.reindex(btc_15m.index[mask]).values
     
     return btc_15m[btc_15m.index >= target_start_dt]
 

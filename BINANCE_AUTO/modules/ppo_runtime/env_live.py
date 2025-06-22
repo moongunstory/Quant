@@ -5,7 +5,7 @@ from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON
 class LivePPOEnv:
     def __init__(self, market_df: pd.DataFrame, seq_len: int = 32):
         """
-        market_df: OHLCV 포함, 15m 단위 캔들, index=timestamp
+        market_df: OHLCV 포함 데이터프레임 (타임프레임 자유)
         """
         self.df = market_df.copy()
         self.seq_len = seq_len
