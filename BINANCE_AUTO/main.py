@@ -5,7 +5,7 @@ import pandas as pd
 from modules.trading_executor import FuturesTradeExecutor, calculate_futures_quantity
 from modules.ppo_runtime.predictor import Predictor
 from modules.data_collector import RealTimeDataCollector
-from modules.training.ppo.core.buffer import RolloutBuffer
+from modules.ppo_runtime.rollout_updater import RolloutBuffer
 from modules.ppo_runtime.env_live import LivePPOEnv
 from modules.training.ppo.reinforce.train_ppo import train_ppo
 from modules.config import (
@@ -49,14 +49,15 @@ def main():
 
             for direction in ["long", "short"]:
                 action, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
-                action_map_rev = {0: 'long', 1: 'short', 2: 'hold'}
+                action_map_rev = {0: 'hold', 1: direction}
                 action_str = action_map_rev.get(action, 'unknown')
                 print(f"[{direction.upper()}] 예측: {action_str.upper()} (conf={log_prob:.3f})")
 
-                if action != 'hold':
+                if action_str != 'hold':
                     price = float(state['5m_close'])
                     balance = executors[direction].get_balance()
                     qty = calculate_futures_quantity(balance, price)
+                    print(f"[DEBUG] balance={balance}, price={price}, notional={balance * 5}, qty={qty}")  # ← 추가
                     side = 'BUY' if action_str == 'long' else 'SELL'
                     executors[direction].market_entry(side, qty)
 
@@ -65,7 +66,7 @@ def main():
                 market_df = collector.get_recent_market_df(tf='5min')  # 5m 기준 명시
                 env = LivePPOEnv(market_df)
                 obs = env.reset()
-                _, reward, done, _ = env.step(action)
+                _, reward, done, _ = env.step(action_str)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
                 action_idx = action  # ✅ 이미 int형이므로 그대로 사용하면 됨
