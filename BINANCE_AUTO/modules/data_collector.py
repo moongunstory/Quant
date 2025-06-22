@@ -28,12 +28,18 @@ client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
     end_time_utc = now.tz_convert("UTC")
     end_naive = end_time_utc.tz_localize(None)
-    value = int(re.findall(r"\d+", tf)[0])
-    start_time = (end_time_utc - pd.Timedelta(minutes=value * count)).tz_localize(None)
-    api_tf = BINANCE_INTERVAL_MAP[tf]
 
+    unit = "minutes" if "min" in tf.lower() else "hours"
+    value = int(re.findall(r"\d+", tf)[0])
+    start_time = end_time_utc - pd.Timedelta(**{unit: value * count})
+    start_naive = start_time.tz_localize(None)
+
+    api_tf = BINANCE_INTERVAL_MAP[tf]
     klines = client.get_historical_klines(
-        symbol, api_tf, start_str=start_time.strftime("%Y-%m-%d %H:%M:%S"), end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
+        symbol,
+        api_tf,
+        start_str=start_naive.strftime("%Y-%m-%d %H:%M:%S"),
+        end_str=end_naive.strftime("%Y-%m-%d %H:%M:%S")
     )
     if not klines:
         return pd.DataFrame()
@@ -41,18 +47,9 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     df = pd.DataFrame(
         klines,
         columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_asset_volume",
-            "num_trades",
-            "taker_buy_base_volume",
-            "taker_buy_quote_volume",
-            "ignore",
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "num_trades",
+            "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
         ],
     )
 
@@ -60,8 +57,6 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
-    if df.empty:
-        return df
     return df.astype(float).sort_index()
 
 
@@ -117,6 +112,7 @@ class RealTimeDataCollector:
 
     def collect_eth_features(self):
         result_df = None
+        unified_ts = self.now.floor("5min")  # 모든 타임프레임의 마지막 row 인덱스를 통일
 
         for tf in TIMEFRAMES:
             count = REQUIRED_CANDLE_COUNTS[tf]
@@ -134,7 +130,10 @@ class RealTimeDataCollector:
 
             updated_df = update_cache(self.symbol, tf, new_df, self.cache_dir, count)
             df_with_ind = add_indicators_with_validation(updated_df, tf)
+            if tf == "5min":
+                df_with_ind["5m_close"] = updated_df["close"]  # ✅ 진입가 용도
             latest_row = df_with_ind.iloc[[-1]]
+            latest_row.index = pd.DatetimeIndex([unified_ts])  # ✅ 인덱스 통일
 
             result_df = latest_row if result_df is None else result_df.join(latest_row, how="outer")
 
@@ -144,11 +143,22 @@ class RealTimeDataCollector:
         start = (self.now.floor("30min") - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
         end = self.now.floor("30min").strftime("%Y-%m-%d %H:%M:%S")
         df = fetch_btc_historical_features(start, end, interval="30m")
+
+        print(f"[BTC] 수집된 데이터 수: {len(df)}")
+        if not df.empty:
+            print(f"[BTC] 최근 캔들 timestamp: {df.index.max()}")
+            print(f"[BTC] 최근 행 결측 수:\n{df.tail(1).isna().sum()}")
+            print(f"[BTC] 컬럼명:\n{df.columns.tolist()}")
+
         if df.empty:
             raise ValueError("BTC 데이터 없음")
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
-        return df.loc[[df.index.max()]]
+
+        latest = df.loc[[df.index.max()]]
+        latest.index = pd.DatetimeIndex([self.now.floor("5min")])  # ✅ 인덱스 강제 통일
+
+        return latest
 
     def collect_dune_features(self):
         dune_raw = fetch_latest_dune_row()
@@ -158,7 +168,9 @@ class RealTimeDataCollector:
         dune_df = create_dune_derived_features(dune_raw)
         if dune_df.index.tz is None:
             dune_df.index = dune_df.index.tz_localize("UTC")
+
         dune_latest = dune_df.loc[[dune_df.index.max()]]
+        dune_latest.index = pd.DatetimeIndex([self.now.floor("5min")])  # ✅ 인덱스 통일
 
         date_str = dune_latest.index.max().strftime("%m.%d")
         os.makedirs(ONCHAIN_CACHE_DIR, exist_ok=True)

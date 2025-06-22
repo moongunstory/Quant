@@ -48,23 +48,24 @@ def main():
                 continue
 
             for direction in ["long", "short"]:
-                action, log_prob, value = predictor.predict(state.values, direction=direction)
-                print(f"[{direction.upper()}] 예측: {action.upper()} (conf={log_prob:.3f})")
+                action, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
+                action_map_rev = {0: 'long', 1: 'short', 2: 'hold'}
+                action_str = action_map_rev.get(action, 'unknown')
+                print(f"[{direction.upper()}] 예측: {action_str.upper()} (conf={log_prob:.3f})")
 
                 if action != 'hold':
                     price = float(state['5m_close'])  # 5m 기준 진입가 사용
-                    executors[direction].enter_position(action, price)
+                    executors[direction].enter_position(action_str, price) 
 
                 executors[direction].monitor_position()
 
-                market_df = collector.get_recent_market_df(tf='5m')  # 5m 기준 명시
+                market_df = collector.get_recent_market_df(tf='5min')  # 5m 기준 명시
                 env = LivePPOEnv(market_df)
                 obs = env.reset()
                 _, reward, done, _ = env.step(action)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
-                action_map = {'long': 0, 'short': 1, 'hold': 2}
-                action_idx = action_map[action]
+                action_idx = action  # ✅ 이미 int형이므로 그대로 사용하면 됨
 
                 buffers[direction].add(
                     obs_tensor,
