@@ -110,7 +110,7 @@ def fetch_latest_dune_row():
 class RealTimeDataCollector:
     def __init__(self):
         # 항상 직전 캔들까지만 요청하도록 함 (30분 단위 실행 기준)
-        self.now = pd.Timestamp.utcnow().floor("30min").tz_localize("UTC") - pd.Timedelta(minutes=1)
+        self.now = pd.Timestamp.utcnow().floor("30min") - pd.Timedelta(minutes=1)
         self.symbol = "ETHUSDT"
         self.btc_symbol = "BTCUSDT"
         self.cache_dir = CACHE_DIR
@@ -186,7 +186,8 @@ class RealTimeDataCollector:
         return df.iloc[-count:]
 
     def run(self):
-        self.now = pd.Timestamp.utcnow().floor("30min").tz_localize("UTC") - pd.Timedelta(minutes=1)
+        self.now = pd.Timestamp.utcnow().floor("30min") - pd.Timedelta(minutes=1)
+
         eth_df = self.collect_eth_features()
         btc_df = self.collect_btc_features()
         dune_df = self.collect_dune_features()
@@ -194,7 +195,13 @@ class RealTimeDataCollector:
         final_df = eth_df.join(btc_df, how="left").join(dune_df, how="left")
 
         if final_df.isna().any().any():
-            print("🚨 결측값 존재 - 추론 skip")
+            print("\n🚨 결측값 존재 - 추론 skip")
+            print("🚨 결측 컬럼 목록:")
+            print(final_df.isna().sum()[final_df.isna().sum() > 0])
+
+            print("\n📋 마지막 추론 대상 행 (최신 데이터):")
+            print(final_df.tail(1).T)
+
             return None
 
         return final_df.iloc[-1]
