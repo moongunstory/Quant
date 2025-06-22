@@ -26,7 +26,7 @@ class RolloutBuffer:
         self.log_probs.append(log_prob)
         self.values.append(value)
 
-    def compute_returns_and_advantages(self, last_value, gamma=0.99, lam=0.95):
+    def compute_returns_and_advantages(self, last_value, gamma=0.99, lam=0.95, normalize=True):
         values = self.values + [last_value]
         gae = 0
         self.returns = []
@@ -40,6 +40,10 @@ class RolloutBuffer:
 
         self.advantages = torch.tensor(self.advantages, dtype=torch.float32)
         self.returns = torch.tensor(self.returns, dtype=torch.float32)
+
+        if normalize:
+            self.advantages = (self.advantages - self.advantages.mean()) / (
+                self.advantages.std() + 1e-8)
 
     def get_batches(self, batch_size):
         n = len(self.observations)
