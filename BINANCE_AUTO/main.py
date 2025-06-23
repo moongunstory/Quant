@@ -11,15 +11,12 @@ from modules.ppo_runtime.env_live import LivePPOEnv
 from modules.ppo_runtime.train_ppo_live import train_ppo_live
 from modules.config import (
     PPO_FINAL_MODEL_PATHS,
-    TRAIN_LABEL_PATHS,
     PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_BUFFER_PATHS,
     PPO_BUFFER_SIZE,
     PPO_EPOCHS,
     PPO_INPUT_DIM,
-    LONG_THRESHOLD, 
-    SHORT_THRESHOLD
 )
 
 def main():
