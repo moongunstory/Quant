@@ -26,10 +26,6 @@ def main():
         "long": FuturesTradeExecutor(),
         "short": FuturesTradeExecutor()
     }
-    buffers = {
-        "long": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE),
-        "short": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
-    }
 
     while True:
         try:
@@ -38,12 +34,12 @@ def main():
                 time.sleep(60)
                 continue
 
-            print(f"✅ {now.strftime('%H:%M')} → 매매 판단 시작")
-            time.sleep(60)  # ✅ 같은 분기 중 중복 실행 방지
+            print(f"✅ {now.strftime('%H:%M')} → 메매 판단 시작")
+            time.sleep(60)
 
             state = collector.run()
             if state is None:
-                print("🚨 피처 결측 → 스킵")
+                print("🚨 피처 결식 → 스킵")
                 time.sleep(60)
                 continue
 
@@ -60,7 +56,7 @@ def main():
                     executors[direction].enter_position(direction=direction, current_price=price)
                 else:
                     print(
-                        f"⛔ [{direction.upper()}] 진입 조건 불충족 → 생략 "
+                        f"⛔ [{direction.upper()}] 진입 조건 불\uuc77c축 → 생난 "
                         f"(action={action_str.upper()}, prob={log_prob:.3f})"
                     )
 
@@ -74,7 +70,17 @@ def main():
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
                 action_idx = 1 if action_str == direction else 0
 
-                buffers[direction].add(
+                # [현재 파일을 목적지형으로 저장]
+                dir_path = os.path.dirname(PPO_BUFFER_PATHS[direction])
+                prefix = os.path.splitext(os.path.basename(PPO_BUFFER_PATHS[direction]))[0]
+                temp_path = PPO_BUFFER_PATHS[direction]
+
+                if os.path.exists(temp_path):
+                    buffer = RolloutBuffer.load(temp_path)
+                else:
+                    buffer = RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
+
+                buffer.add(
                     obs_tensor,
                     action_idx,
                     reward,
@@ -83,44 +89,30 @@ def main():
                     value=value
                 )
 
-                # [1] 루프별 step 기록 파일 저장 (시간별로 분리됨)
-                step_timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-                step_log_path = PPO_BUFFER_PATHS[direction].replace('.pkl', f'_step_{step_timestamp}.pkl')
-                buffers[direction].save(step_log_path)
-
-                # [2] 누적 학습용 버퍼에 append 저장
-                buffer_path = PPO_BUFFER_PATHS[direction]
-                if os.path.exists(buffer_path):
-                    existing = RolloutBuffer.load(buffer_path)
-                    existing.observations += buffers[direction].observations
-                    existing.actions += buffers[direction].actions
-                    existing.rewards += buffers[direction].rewards
-                    existing.dones += buffers[direction].dones
-                    existing.log_probs += buffers[direction].log_probs
-                    existing.values += buffers[direction].values
-                    existing.save(buffer_path)
-                else:
-                    buffers[direction].save(buffer_path)
+                buffer.save(temp_path)
+                record_count = len(buffer)
+                indexed_path = os.path.join(dir_path, f"{prefix}_{record_count:04d}.pkl")
+                os.replace(temp_path, indexed_path)
 
                 emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
                 emoji = emoji_map.get(action_str, '')
                 print(
-                    f"🧠 [{direction.upper()}] Action: {action_str.upper()} {emoji} | "
-                    f"Confidence(prob): {log_prob:.3f} | Buffer: {len(buffers[direction])}/{PPO_BUFFER_SIZE}"
+                    f"🧐 [{direction.upper()}] Action: {action_str.upper()} {emoji} | "
+                    f"Confidence(prob): {log_prob:.3f} | Buffer: {len(buffer)}/{PPO_BUFFER_SIZE}"
                 )
 
-                if buffers[direction].is_ready():
+                if buffer.is_ready():
                     print(f"🚀 PPO 학습 시작: {direction.upper()}")
                     train_ppo_live(
                         direction=direction,
-                        buffer_path=PPO_BUFFER_PATHS[direction],
+                        buffer_path=indexed_path,
                         imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
                         value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
                         save_path=PPO_FINAL_MODEL_PATHS[direction],
                         total_epochs=PPO_EPOCHS
                     )
-                    buffers[direction].reset()
-                    RolloutBuffer.delete(PPO_BUFFER_PATHS[direction])
+                    buffer.reset()
+                    RolloutBuffer.delete(indexed_path)
 
         except Exception as e:
             print(f"❌ 오류 발생: {e}")
