@@ -51,7 +51,7 @@ class Predictor:
                 action, log_prob, value = self.models[dir_].get_action(state_tensor)
                 result[dir_] = {
                     'action': int(action.item()),
-                    'log_prob': float(log_prob.item()),
+                    'log_prob': float(log_prob.exp().item()),  # ✅ 여기 수정
                     'value': float(value.item())
                 }
 

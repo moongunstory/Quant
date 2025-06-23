@@ -52,6 +52,8 @@ class FuturesTradeExecutor:
         raise ValueError("No USDT balance")
 
     def market_entry(self, side: str, quantity: float):
+        if quantity <= 0:
+            raise ValueError(f"🚫 진입 수량이 0 이하: qty={quantity}")
         return self.client.new_order(
             symbol=self.symbol,
             side=side.upper(),
@@ -60,10 +62,16 @@ class FuturesTradeExecutor:
         )
 
     def cancel_existing_orders(self):
+        if self.position is not None:
+            return  # ✅ 포지션 보유 중이면 건드리지 않음
+        if not self.tp_order_id and not self.sl_order_id:
+            return  # ✅ 취소할 주문이 명시적으로 없음
+
         try:
             open_orders = self.client.get_open_orders(symbol=self.symbol)
             for order in open_orders:
-                self.client.cancel_order(symbol=self.symbol, orderId=order["orderId"])
+                if "orderId" in order:
+                    self.client.cancel_order(symbol=self.symbol, orderId=order["orderId"])
             self.tp_order_id = None
             self.sl_order_id = None
             print("🧹 기존 TP/SL 주문 전부 취소됨")
@@ -85,9 +93,6 @@ class FuturesTradeExecutor:
 
         self.cancel_existing_orders()
 
-        self.position = direction
-        self.entry_price = current_price
-
         side = "BUY" if direction == "long" else "SELL"
         exit_side = "SELL" if side == "BUY" else "BUY"
 
@@ -99,10 +104,13 @@ class FuturesTradeExecutor:
         try:
             self.market_entry(side, quantity)
             print(f"🚀 시장가 진입: {direction.upper()} @ {current_price:.2f}, 수량: {quantity}")
+            self.position = direction
         except Exception as e:
             print(f"❌ 시장가 진입 실패: {e}")
+            self.position = None       # ✅ 실패 시 상태 초기화
+            self.entry_price = None
             return
-
+        
         time.sleep(0.5)
 
         tp_price = round(current_price * (1 + TP_THRESHOLD if direction == "long" else 1 - TP_THRESHOLD), 2)

@@ -2,6 +2,7 @@ import time
 import torch
 import traceback
 import pandas as pd
+from datetime import datetime
 from modules.trading_executor import FuturesTradeExecutor, calculate_futures_quantity
 from modules.ppo_runtime.predictor import Predictor
 from modules.data_collector import RealTimeDataCollector
@@ -33,6 +34,14 @@ def main():
 
     while True:
         try:
+            now = datetime.utcnow()
+            if now.minute % 30 != 0:
+                time.sleep(60)
+                continue
+
+            print(f"✅ {now.strftime('%H:%M')} → 매매 판단 시작")
+            time.sleep(60)  # ✅ 같은 분기 중 중복 실행 방지
+
             state = collector.run()
             if state is None:
                 print("🚨 피처 결측 → 스킵")
@@ -52,19 +61,21 @@ def main():
                     price = float(state['5m_close'])
                     balance = executors[direction].get_balance()
                     qty = calculate_futures_quantity(balance, price)
-                    print(f"[DEBUG] balance={balance}, price={price}, notional={balance * 5}, qty={qty}")  # ← 추가
+                    print(f"[DEBUG] balance={balance}, price={price}, notional={balance * 5}, qty={qty}")
                     side = 'BUY' if action_str == 'long' else 'SELL'
-                    executors[direction].market_entry(side, qty)
+                    price = float(state['5m_close'])
+                    executors[direction].enter_position(direction=direction, current_price=price)
+                    continue
 
                 executors[direction].monitor_position()
 
-                market_df = collector.get_recent_market_df(tf='5min')  # 5m 기준 명시
+                market_df = collector.get_recent_market_df(tf='5min')
                 env = LivePPOEnv(market_df)
                 obs = env.reset()
                 _, reward, done, _ = env.step(action_str)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
-                action_idx = action  # ✅ 이미 int형이므로 그대로 사용하면 됨
+                action_idx = action  # 이미 int형
 
                 buffers[direction].add(
                     obs_tensor,
@@ -79,7 +90,7 @@ def main():
                 emoji = emoji_map.get(action_str, '')
                 print(
                     f"🧠 [{direction.upper()}] Action: {action_str.upper()} {emoji} | "
-                    f"Confidence: {log_prob:.3f} | Buffer: {len(buffers[direction])}/{PPO_BUFFER_SIZE}"
+                    f"Confidence(prob): {log_prob:.3f} | Buffer: {len(buffers[direction])}/{PPO_BUFFER_SIZE}"
                 )
 
                 if buffers[direction].is_ready():
