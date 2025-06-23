@@ -1,7 +1,7 @@
 import time
 import torch
 import traceback
-import pandas as pd
+import os
 from datetime import datetime
 from modules.trading_executor import FuturesTradeExecutor
 from modules.ppo_runtime.predictor import Predictor
@@ -85,7 +85,25 @@ def main():
                     log_prob=log_prob,
                     value=value
                 )
-                buffers[direction].save(PPO_BUFFER_PATHS[direction])
+
+                # [1] 루프별 step 기록 파일 저장 (시간별로 분리됨)
+                step_timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                step_log_path = PPO_BUFFER_PATHS[direction].replace('.pkl', f'_step_{step_timestamp}.pkl')
+                buffers[direction].save(step_log_path)
+
+                # [2] 누적 학습용 버퍼에 append 저장
+                buffer_path = PPO_BUFFER_PATHS[direction]
+                if os.path.exists(buffer_path):
+                    existing = RolloutBuffer.load(buffer_path)
+                    existing.observations += buffers[direction].observations
+                    existing.actions += buffers[direction].actions
+                    existing.rewards += buffers[direction].rewards
+                    existing.dones += buffers[direction].dones
+                    existing.log_probs += buffers[direction].log_probs
+                    existing.values += buffers[direction].values
+                    existing.save(buffer_path)
+                else:
+                    buffers[direction].save(buffer_path)
 
                 emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
                 emoji = emoji_map.get(action_str, '')
