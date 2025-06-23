@@ -86,3 +86,13 @@ class RolloutBuffer:
             buffer = pickle.load(f)
         print(f"📥 RolloutBuffer 로드됨: {path}")
         return buffer
+
+    @staticmethod
+    def delete(path):
+        try:
+            os.remove(path)
+            print(f"🗑️ RolloutBuffer 삭제됨: {path}")
+        except FileNotFoundError:
+            print(f"⚠️ 삭제할 버퍼 없음: {path}")
+        except Exception as e:
+            print(f"❌ 버퍼 삭제 오류: {e}")

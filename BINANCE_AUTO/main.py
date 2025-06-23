@@ -3,12 +3,12 @@ import torch
 import traceback
 import pandas as pd
 from datetime import datetime
-from modules.trading_executor import FuturesTradeExecutor, calculate_futures_quantity
+from modules.trading_executor import FuturesTradeExecutor
 from modules.ppo_runtime.predictor import Predictor
 from modules.data_collector import RealTimeDataCollector
 from modules.ppo_runtime.rollout_updater import RolloutBuffer
 from modules.ppo_runtime.env_live import LivePPOEnv
-from modules.training.ppo.reinforce.train_ppo import train_ppo
+from modules.ppo_runtime.train_ppo_live import train_ppo_live
 from modules.config import (
     PPO_FINAL_MODEL_PATHS,
     TRAIN_LABEL_PATHS,
@@ -17,7 +17,9 @@ from modules.config import (
     PPO_BUFFER_PATHS,
     PPO_BUFFER_SIZE,
     PPO_EPOCHS,
-    PPO_INPUT_DIM
+    PPO_INPUT_DIM,
+    LONG_THRESHOLD, 
+    SHORT_THRESHOLD
 )
 
 def main():
@@ -49,24 +51,22 @@ def main():
                 continue
 
             for direction in ["long", "short"]:
-                if executors[direction].position is not None:
-                    print(f"⏸️ [{direction.upper()}] Position already open → skipping decision.")
+                if not executors[direction].should_enter():
                     executors[direction].monitor_position()
                     continue
 
-                action, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
-                action_map_rev = {0: 'hold', 1: direction}
-                action_str = action_map_rev.get(action, 'unknown')
+                action_str, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
 
-                if action_str != 'hold':
-                    price = float(state['5m_close'])
-                    balance = executors[direction].get_balance()
-                    qty = calculate_futures_quantity(balance, price)
-                    print(f"[DEBUG] balance={balance}, price={price}, notional={balance * 5}, qty={qty}")
-                    side = 'BUY' if action_str == 'long' else 'SELL'
+                if action_str in ['long', 'short']:
+                    executors[direction].cancel_existing_orders()  # ✅ 기존 SL/TP 강제 정리
                     price = float(state['5m_close'])
                     executors[direction].enter_position(direction=direction, current_price=price)
                     continue
+                else:
+                    print(
+                        f"⛔ [{direction.upper()}] 진입 조건 불충족 → 생략 "
+                        f"(action={action_str.upper()}, prob={log_prob:.3f})"
+                    )
 
                 executors[direction].monitor_position()
 
@@ -76,7 +76,7 @@ def main():
                 _, reward, done, _ = env.step(action_str)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
-                action_idx = action  # 이미 int형
+                action_idx = 1 if action_str == direction else 0
 
                 buffers[direction].add(
                     obs_tensor,
@@ -86,7 +86,7 @@ def main():
                     log_prob=log_prob,
                     value=value
                 )
-
+                buffers[direction].save(PPO_BUFFER_PATHS[direction])
                 emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
                 emoji = emoji_map.get(action_str, '')
                 print(
@@ -96,15 +96,16 @@ def main():
 
                 if buffers[direction].is_ready():
                     print(f"🚀 PPO 학습 시작: {direction.upper()}")
-                    train_ppo(
+                    train_ppo_live(
                         direction=direction,
-                        csv_path=TRAIN_LABEL_PATHS[direction],
+                        buffer_path=PPO_BUFFER_PATHS[direction],
                         imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
                         value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
                         save_path=PPO_FINAL_MODEL_PATHS[direction],
                         total_epochs=PPO_EPOCHS
                     )
                     buffers[direction].reset()
+                    RolloutBuffer.delete(PPO_BUFFER_PATHS[direction])
 
         except Exception as e:
             print(f"❌ 오류 발생: {e}")
