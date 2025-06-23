@@ -60,6 +60,12 @@ PPO_FINAL_MODEL_PATHS = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_short.pt"),
 }
 
+# PPO 실전 강화학습 설정
+PPO_BUFFER_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "buffer", "long_rollout.pkl"),
+    "short": os.path.join(PROJECT_ROOT, "data", "buffer", "short_rollout.pkl")
+}
+
 # 캐시 저장 경로
 CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
 
@@ -77,12 +83,6 @@ LGBM_THRESHOLD = 0.5
 # 실제 매매 전용 확신도
 LONG_THRESHOLD = 0.8
 SHORT_THRESHOLD = 0.8
-
-# PPO 실전 강화학습 설정
-PPO_BUFFER_PATHS = {
-    "long": "data/buffer/long_rollout.pkl",
-    "short": "data/buffer/short_rollout.pkl"
-}
 
 PPO_BUFFER_SIZE = 128
 PPO_EPOCHS = 5
