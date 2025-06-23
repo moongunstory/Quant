@@ -56,7 +56,15 @@ class Predictor:
                 }
 
         if direction:
-            return result[direction]['action'], result[direction]['log_prob'], result[direction]['value']
+            action = result[direction]['action']
+            log_prob = result[direction]['log_prob']
+            value = result[direction]['value']
+            threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
+
+            if action == 1 and log_prob >= threshold:
+                return direction, log_prob, value
+            else:
+                return 'hold', log_prob, value
 
         # dual mode 판단
         long_sig = result['long']['action'] == 1 and result['long']['log_prob'] >= LONG_THRESHOLD

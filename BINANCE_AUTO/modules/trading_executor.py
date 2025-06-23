@@ -158,3 +158,12 @@ class FuturesTradeExecutor:
                 self.sl_order_id = None
         except Exception as e:
             print(f"❌ 포지션 모니터링 오류: {e}")
+            
+    def should_enter(self):
+        """
+        현재 포지션이 없을 때만 진입 가능하다는 신호를 반환
+        """
+        if self.position is not None:
+            print(f"⏸️ 이미 {self.position.upper()} 포지션 보유 중 → 진입 판단 생략")
+            return False
+        return True
