@@ -58,10 +58,9 @@ def main():
                 action_str, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
 
                 if action_str in ['long', 'short']:
-                    executors[direction].cancel_existing_orders()  # ✅ 기존 SL/TP 강제 정리
+                    executors[direction].cancel_existing_orders()
                     price = float(state['5m_close'])
                     executors[direction].enter_position(direction=direction, current_price=price)
-                    continue
                 else:
                     print(
                         f"⛔ [{direction.upper()}] 진입 조건 불충족 → 생략 "
@@ -87,6 +86,7 @@ def main():
                     value=value
                 )
                 buffers[direction].save(PPO_BUFFER_PATHS[direction])
+
                 emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
                 emoji = emoji_map.get(action_str, '')
                 print(
