@@ -2,6 +2,7 @@ import time
 import torch
 import traceback
 import os
+import shutil
 from datetime import datetime
 from modules.trading_executor import FuturesTradeExecutor
 from modules.ppo_runtime.predictor import Predictor
@@ -92,7 +93,8 @@ def main():
                 buffer.save(temp_path)
                 record_count = len(buffer)
                 indexed_path = os.path.join(dir_path, f"{prefix}_{record_count:04d}.pkl")
-                os.replace(temp_path, indexed_path)
+                buffer.save(temp_path)  
+                shutil.copy2(temp_path, indexed_path)  
 
                 emoji_map = {'hold': '⏸️', 'long': '⚡', 'short': '⛓️'}
                 emoji = emoji_map.get(action_str, '')
