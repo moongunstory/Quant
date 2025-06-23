@@ -31,16 +31,8 @@ def main():
         "short": RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
     }
 
-    #immediate_first_run = True 테스트용
     while True:
         try:
-            if not immediate_first_run:
-                now_ts = pd.Timestamp.utcnow()
-                next_run = now_ts.floor("30min") + pd.Timedelta(minutes=30)
-                sleep_sec = (next_run - now_ts).total_seconds()
-                time.sleep(sleep_sec)
-            immediate_first_run = False
-
             state = collector.run()
             if state is None:
                 print("🚨 피처 결측 → 스킵")
