@@ -51,6 +51,7 @@ def main():
             for direction in ["long", "short"]:
                 if executors[direction].position is not None:
                     print(f"⏸️ [{direction.upper()}] Position already open → skipping decision.")
+                    executors[direction].monitor_position()
                     continue
 
                 action, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
