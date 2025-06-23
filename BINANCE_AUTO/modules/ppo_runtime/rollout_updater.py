@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import pickle
 import os
+import re
 
 class RolloutBuffer:
     def __init__(self, buffer_size: int):
@@ -96,3 +97,18 @@ class RolloutBuffer:
             print(f"⚠️ 삭제할 버퍼 없음: {path}")
         except Exception as e:
             print(f"❌ 버퍼 삭제 오류: {e}")
+
+    @staticmethod
+    def get_next_rollout_index(dir_path, prefix):
+        """
+        해당 디렉토리 내에서 주어진 prefix를 가진 pkl 파일들 중
+        가장 큰 인덱스를 찾아 다음 인덱스를 반환함.
+        예: long_rollout_001.pkl → 다음은 002 반환
+        """
+        files = os.listdir(dir_path)
+        pattern = re.compile(rf"{re.escape(prefix)}_(\d+)\.pkl")
+        indices = [
+            int(match.group(1)) for f in files
+            if (match := pattern.match(f))
+        ]
+        return max(indices, default=0) + 1
