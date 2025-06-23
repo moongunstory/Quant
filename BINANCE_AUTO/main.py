@@ -56,7 +56,7 @@ def main():
                     executors[direction].enter_position(direction=direction, current_price=price)
                 else:
                     print(
-                        f"⛔ [{direction.upper()}] 진입 조건 불\uuc77c축 → 생난 "
+                        f"⛔ [{direction.upper()}] 진입 조건 불일치 → 생략 "
                         f"(action={action_str.upper()}, prob={log_prob:.3f})"
                     )
 
