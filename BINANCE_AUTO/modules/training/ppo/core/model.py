@@ -38,13 +38,14 @@ class PPOPolicyNetwork(nn.Module):
 
     def get_action(self, x):
         """
-        행동 샘플링: 정책 분포에서 하나 선택 + log_prob + 가치 예측
+        행동 샘플링: 정책 분포에서 하나 선택 + log_prob + 가치 예측 + 확신도 벡터 반환
         """
         logits, value = self.forward(x)
-        dist = Categorical(logits=logits)
+        probs = torch.softmax(logits, dim=-1)
+        dist = Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action, log_prob, value
+        return action, log_prob, value, probs
 
     def evaluate_action(self, x, action):
         """
