@@ -7,6 +7,7 @@ BINANCE_AUTO/data/*
 !**/*.py
 !BINANCE_AUTO/data/models/ppo/
 !BINANCE_AUTO/data/models/ppo/**
+!BINANCE_AUTO/data/models/ppo/*.pt   
 !**/.gitkeep
 
 # ❌ 일반 무시 파일들
