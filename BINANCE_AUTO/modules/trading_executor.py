@@ -1,6 +1,6 @@
 import time
 from math import floor
-from binance.um_futures import UMFutures
+from binance.client import Client
 from modules.config import (
     BINANCE_API_KEY,
     BINANCE_SECRET_KEY,
@@ -20,7 +20,7 @@ def calculate_futures_quantity(usdt_balance: float, price: float, leverage: int 
 
 class FuturesTradeExecutor:
     def __init__(self, client=None, symbol=FUTURES_SYMBOL, leverage=FUTURES_LEVERAGE):
-        self.client = client or UMFutures(key=BINANCE_API_KEY, secret=BINANCE_SECRET_KEY)
+        self.client = client or Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
         self.symbol = symbol
         self.leverage = leverage
         self._setup_leverage()
@@ -32,7 +32,7 @@ class FuturesTradeExecutor:
 
     def _setup_leverage(self):
         try:
-            self.client.change_margin_type(symbol=self.symbol, marginType=FUTURES_MARGIN_TYPE)
+            self.client.futures_change_margin_type(symbol=self.symbol, marginType=FUTURES_MARGIN_TYPE)
         except Exception as e:
             if "-4046" in str(e) or "No need to change margin type" in str(e):
                 pass  # 이미 설정된 경우 → 조용히 무시
@@ -40,12 +40,12 @@ class FuturesTradeExecutor:
                 print("⚠️ Margin type setup failed:", e)
 
         try:
-            self.client.change_leverage(symbol=self.symbol, leverage=self.leverage)
+            self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
         except Exception as e:
             print("⚠️ Leverage setup failed:", e)
 
     def get_balance(self, asset="USDT"):
-        balances = self.client.balance()
+        balances = self.client.futures_account_balance()
         for b in balances:
             if b["asset"] == asset:
                 return float(b["availableBalance"])
@@ -54,7 +54,7 @@ class FuturesTradeExecutor:
     def market_entry(self, side: str, quantity: float):
         if quantity <= 0:
             raise ValueError(f"🚫 진입 수량이 0 이하: qty={quantity}")
-        return self.client.new_order(
+        return self.client.futures_create_order(
             symbol=self.symbol,
             side=side.upper(),
             type="MARKET",
@@ -68,10 +68,10 @@ class FuturesTradeExecutor:
             return  # ✅ 취소할 주문이 명시적으로 없음
 
         try:
-            open_orders = self.client.get_open_orders(symbol=self.symbol)
+            open_orders = self.client.futures_get_open_orders(symbol=self.symbol)
             for order in open_orders:
                 if "orderId" in order:
-                    self.client.cancel_order(symbol=self.symbol, orderId=order["orderId"])
+                    self.client.futures_cancel_order(symbol=self.symbol, orderId=order["orderId"])
             self.tp_order_id = None
             self.sl_order_id = None
             print("🧹 기존 TP/SL 주문 전부 취소됨")
@@ -117,7 +117,7 @@ class FuturesTradeExecutor:
         sl_price = round(current_price * (1 + SL_THRESHOLD if direction == "long" else 1 - SL_THRESHOLD), 2)
 
         try:
-            tp_order = self.client.new_order(
+            tp_order = self.client.futures_create_order(
                 symbol=self.symbol,
                 side=exit_side,
                 type="TAKE_PROFIT_MARKET",
@@ -128,7 +128,7 @@ class FuturesTradeExecutor:
             )
             self.tp_order_id = tp_order["orderId"]
 
-            sl_order = self.client.new_order(
+            sl_order = self.client.futures_create_order(
                 symbol=self.symbol,
                 side=exit_side,
                 type="STOP_MARKET",
@@ -147,7 +147,7 @@ class FuturesTradeExecutor:
         if self.position is None:
             return
         try:
-            orders = self.client.get_all_orders(symbol=self.symbol)
+            orders = self.client.futures_get_all_orders(symbol=self.symbol)
             tp_filled = any(o["orderId"] == self.tp_order_id and o["status"] == "FILLED" for o in orders)
             sl_filled = any(o["orderId"] == self.sl_order_id and o["status"] == "FILLED" for o in orders)
             if tp_filled or sl_filled:
