@@ -77,7 +77,8 @@ def train_value_network(direction='long', epochs=10, batch_size=1024, lr=3e-4):
             batch = batch.to(device)
             logits, _ = model(batch)
             probs = softmax(logits)
-            probs_list.append(probs[:, 1].cpu())
+            # Entry probability is at index 0 after reordering
+            probs_list.append(probs[:, 0].cpu())
 
     rewards = torch.cat(probs_list, dim=0).numpy()
 
