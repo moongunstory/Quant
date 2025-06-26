@@ -18,6 +18,8 @@ from modules.config import (
     PPO_BUFFER_SIZE,
     PPO_EPOCHS,
     PPO_INPUT_DIM,
+    LONG_THRESHOLD,
+    SHORT_THRESHOLD,
 )
 
 def main():
@@ -49,7 +51,13 @@ def main():
                     executors[direction].monitor_position()
                     continue
 
-                action_str, log_prob, value = predictor.predict(state.astype(float).values, direction=direction)
+                # Debugging: print threshold values before prediction
+                print(
+                    f"LONG_THRESHOLD = {LONG_THRESHOLD}, SHORT_THRESHOLD = {SHORT_THRESHOLD}"
+                )
+                action_str, log_prob, value = predictor.predict(
+                    state.astype(float).values, direction=direction
+                )
 
                 if action_str in ['long', 'short']:
                     executors[direction].cancel_existing_orders()
