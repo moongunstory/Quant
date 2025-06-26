@@ -41,12 +41,10 @@ class Predictor:
         for dir_ in directions:
             with torch.no_grad():
                 _, _, value, probs = self.models[dir_].get_action(state_tensor)
-                # Debugging: log probability vector and selected index
-                print(f"probs = {probs}")
-                print(f"direction = {dir_}, selected prob = {probs[0, 1].item()}")
-                prob = float(probs[0, 1].item())  # 확신도 = action=1 (진입) 확률
+                enter_prob = float(probs[0, 1].item())  # action=1 확률 = 진입 확률
+                print(f"[DEBUG] direction = {dir_} | probs = {probs.tolist()} | enter_prob = {enter_prob:.3f}")
                 result[dir_] = {
-                    'prob': prob,
+                    'prob': enter_prob,
                     'value': float(value.item())
                 }
 
@@ -54,11 +52,13 @@ class Predictor:
             prob = result[direction]['prob']
             value = result[direction]['value']
             threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
+            print(f"[DEBUG] [predict()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
             if prob >= threshold:
                 return direction, prob, value
             else:
                 return 'hold', prob, value
 
+        # 양방향 판단일 경우
         long_prob = result['long']['prob']
         short_prob = result['short']['prob']
         long_value = result['long']['value']
@@ -67,16 +67,13 @@ class Predictor:
         long_sig = long_prob >= LONG_THRESHOLD
         short_sig = short_prob >= SHORT_THRESHOLD
 
-        if long_sig and not short_sig:
-            return 'long', long_prob, long_value
-        elif short_sig and not long_sig:
-            return 'short', short_prob, short_value
-        elif long_sig and short_sig:
-            if long_prob > short_prob:
+        if long_sig or short_sig:
+            if long_sig and (not short_sig or long_prob > short_prob):
                 return 'long', long_prob, long_value
             else:
                 return 'short', short_prob, short_value
         else:
+            # 확신도 부족 → HOLD
             if long_prob > short_prob:
                 return 'hold', long_prob, long_value
             else:
