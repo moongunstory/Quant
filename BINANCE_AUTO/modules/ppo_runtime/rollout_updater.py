@@ -79,13 +79,11 @@ class RolloutBuffer:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump(self, f)
-        print(f"📦 RolloutBuffer 저장됨: {path}")
 
     @staticmethod
     def load(path):
         with open(path, 'rb') as f:
             buffer = pickle.load(f)
-        print(f"📥 RolloutBuffer 로드됨: {path}")
         return buffer
 
     @staticmethod
