@@ -77,7 +77,7 @@ def main():
                 _, reward, done, _ = env.step(action_str)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
-                action_idx = 1 if action_str == direction else 0
+                action_idx = 0 if action_str == direction else 1
 
                 # [현재 파일을 목적지형으로 저장]
                 dir_path = os.path.dirname(PPO_BUFFER_PATHS[direction])

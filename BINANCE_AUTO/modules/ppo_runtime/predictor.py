@@ -41,7 +41,8 @@ class Predictor:
         for dir_ in directions:
             with torch.no_grad():
                 _, _, value, probs = self.models[dir_].get_action(state_tensor)
-                enter_prob = float(probs[0, 1].item())  # action=1 확률 = 진입 확률
+                # probs[:, 0] is entry probability according to the unified format
+                enter_prob = float(probs[0, 0].item())
                 print(f"[DEBUG] direction = {dir_} | probs = {probs.tolist()} | enter_prob = {enter_prob:.3f}")
                 result[dir_] = {
                     'prob': enter_prob,
