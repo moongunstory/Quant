@@ -103,8 +103,9 @@ def train_ppo(
         # 롤아웃 수집
         while not done and len(buffer.rewards) < max_steps:
             obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-            action, log_prob, value = model.get_action(obs_tensor)
-            next_obs, reward, done, _ = env.step(action.item())
+            action, log_prob, value, _ = model.get_action(obs_tensor)
+            env_action = 1 if action.item() == 0 else 0  # 0→enter, 1→hold
+            next_obs, reward, done, _ = env.step(env_action)
 
             buffer.add(
                 obs_tensor.squeeze(0).cpu(),

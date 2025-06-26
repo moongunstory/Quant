@@ -41,7 +41,8 @@ class PPOPolicyNetwork(nn.Module):
         행동 샘플링: 정책 분포에서 하나 선택 + log_prob + 가치 예측 + 확신도 벡터 반환
         """
         logits, value = self.forward(x)
-        probs = torch.softmax(logits, dim=-1)
+        # Reorder probabilities so index 0 corresponds to "enter" and 1 to "hold"
+        probs = torch.softmax(logits, dim=-1)[:, [1, 0]]
         dist = Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
@@ -52,6 +53,8 @@ class PPOPolicyNetwork(nn.Module):
         PPO 학습 시: 행동의 log_prob, entropy, value 예측
         """
         logits, value = self.forward(x)
+        # Use same [enter, hold] ordering during evaluation
+        logits = logits[:, [1, 0]]
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
