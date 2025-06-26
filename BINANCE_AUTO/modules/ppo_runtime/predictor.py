@@ -41,6 +41,9 @@ class Predictor:
         for dir_ in directions:
             with torch.no_grad():
                 _, _, value, probs = self.models[dir_].get_action(state_tensor)
+                # Debugging: log probability vector and selected index
+                print(f"probs = {probs}")
+                print(f"direction = {dir_}, selected prob = {probs[0, 1].item()}")
                 prob = float(probs[0, 1].item())  # 확신도 = action=1 (진입) 확률
                 result[dir_] = {
                     'prob': prob,
