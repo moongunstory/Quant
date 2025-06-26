@@ -9,6 +9,7 @@ from modules.ppo_runtime.predictor import Predictor
 from modules.data_collector import RealTimeDataCollector
 from modules.ppo_runtime.rollout_updater import RolloutBuffer
 from modules.ppo_runtime.env_live import LivePPOEnv
+from datetime import datetime, timezone
 from modules.ppo_runtime.train_ppo_live import train_ppo_live
 from modules.config import (
     PPO_FINAL_MODEL_PATHS,
@@ -32,7 +33,7 @@ def main():
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if now.minute % 30 != 0:
                 time.sleep(60)
                 continue
