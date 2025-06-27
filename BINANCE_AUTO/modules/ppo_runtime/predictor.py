@@ -43,7 +43,7 @@ class Predictor:
                 action, log_prob, value, probs = self.models[direction].get_action(state_tensor)
 
             action_str = direction if action.item() == 0 else 'hold'
-            prob = float(probs[0, 1].item())  # index 1 = ENTER 확률
+            prob = float(probs[0, 0].item())
             return action_str, float(log_prob.item()), float(value.item()), prob
 
         else:
@@ -52,7 +52,7 @@ class Predictor:
             for dir_ in ['long', 'short']:
                 with torch.no_grad():
                     _, _, value, probs = self.models[dir_].get_action(state_tensor)
-                    prob = float(probs[0, 1].item())
+                    prob = float(probs[0, 0].item())
                     result[dir_] = {'prob': prob, 'value': float(value.item())}
 
             if result['long']['prob'] > result['short']['prob']:
@@ -64,7 +64,7 @@ class Predictor:
         """
         실전용: threshold 적용. 확신도 없으면 HOLD 반환
         """
-        action, prob, value, _ = self.predict_policy(state_series, direction)
+        action, log_prob, value, prob = self.predict_policy(state_series, direction)
 
         threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
         print(f"[DEBUG] [predict_filtered()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
