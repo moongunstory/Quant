@@ -211,4 +211,4 @@ class RealTimeDataCollector:
 
             return None
 
-        return final_df.iloc[-1]
+        return final_df.iloc[-16:]

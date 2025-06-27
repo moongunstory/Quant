@@ -31,12 +31,17 @@ def main():
         "short": FuturesTradeExecutor()
     }
 
+    force_immediate_run = True  # ← 테스트 시 True, 실전 시 False
+
     while True:
         try:
             now = datetime.now(timezone.utc)
-            if now.minute % 30 != 0:
+
+            if not force_immediate_run and now.minute % 30 != 0:
                 time.sleep(60)
                 continue
+
+            force_immediate_run = False  # 한 번 실행하고 False로 바꿔줌
 
             print(f"✅ {now.strftime('%H:%M')} → 메매 판단 시작")
             time.sleep(60)
@@ -57,35 +62,30 @@ def main():
                     f"LONG_THRESHOLD = {LONG_THRESHOLD}, SHORT_THRESHOLD = {SHORT_THRESHOLD}"
                 )
                 # 1. 실전용 확신도 필터 적용
-                filtered_action, filtered_prob, _ = predictor.predict_filtered(
+                policy_action, log_prob, value, prob = predictor.predict_policy(
                     state.astype(float).values, direction=direction
                 )
 
-                # 2. 실전 진입 판단
-                if filtered_action in ['long', 'short']:
+                # 2 + 3.
+                threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
+                if policy_action == direction and prob >= threshold:
                     executors[direction].cancel_existing_orders()
                     price = float(state['5m_close'])
                     executors[direction].enter_position(direction=direction, current_price=price)
                 else:
                     print(
                         f"⛔ [{direction.upper()}] 진입 조건 불일치 → 생략 "
-                        f"(action={filtered_action.upper()}, prob={filtered_prob:.3f})"
+                        f"(action={policy_action.upper()}, prob={prob:.3f})"
                     )
-
-                executors[direction].monitor_position()
-
-                # 3. 학습용: 확신도 조건 없는 원본 정책 행동 추출
-                policy_action, log_prob, value = predictor.predict_policy(
-                    state.astype(float).values, direction=direction
-                )
 
                 # 4. 환경에서 정책 행동 평가 (진입 여부와 무관)
                 market_df = collector.get_recent_market_df(tf='5min')
                 env = LivePPOEnv(market_df)
-                obs = env.reset()
+                obs = state.astype(float).values  # ✅ 시계열 상태 사용 (예: shape = (16, 64))
                 _, reward, done, _ = env.step(policy_action)
 
                 obs_tensor = torch.tensor(obs, dtype=torch.float32)
+                print(f"📐 [DEBUG] obs_tensor shape = {obs_tensor.shape}")
                 action_idx = 0 if policy_action == direction else 1
 
                 # ✅ 4.5 버퍼 경로 및 파일명 설정
@@ -119,7 +119,7 @@ def main():
                 emoji = emoji_map.get(policy_action, '')
                 print(
                     f"🧐 [{direction.upper()}] Action: {policy_action.upper()} {emoji} | "
-                    f"Confidence(prob): {log_prob:.3f} | Buffer: {len(buffer)}/{PPO_BUFFER_SIZE}"
+                    f"Confidence(prob): {prob:.3f} | Buffer: {len(buffer)}/{PPO_BUFFER_SIZE}"
                 )
 
                 # ✅ 8. 학습 실행
