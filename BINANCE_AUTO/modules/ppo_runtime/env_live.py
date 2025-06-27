@@ -59,10 +59,8 @@ class LivePPOEnv:
             done = tp_hit or sl_hit or (i == LABEL_HORIZON - 1)
 
         elif action == 'hold':
-            max_rise = (highs.max() - entry_price) / entry_price
-            max_fall = (entry_price - lows.min()) / entry_price
-            reward = -1 if (max_rise >= TP_THRESHOLD or max_fall >= TP_THRESHOLD) else 0
-            done = True  # hold는 평가 기준이 horizon이므로 바로 True
+            reward = 0  # HOLD는 중립적 행동으로 보상 없음
+            done = True  # HOLD는 즉시 종료
 
         else:
             raise ValueError(f"Unknown action: {action}")

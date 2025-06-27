@@ -23,59 +23,59 @@ class Predictor:
         for model in self.models.values():
             model.eval()
 
-    def predict(self, state_series: np.ndarray, direction: str = None):
+    def _preprocess(self, state_series: np.ndarray) -> torch.Tensor:
         state_series = np.asarray(state_series, dtype=np.float32)
-
         if state_series.ndim == 1:
-            state_tensor = torch.tensor(state_series, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            return torch.tensor(state_series).unsqueeze(0).unsqueeze(0).to(self.device)
         elif state_series.ndim == 2:
-            state_tensor = torch.tensor(state_series, dtype=torch.float32).unsqueeze(0)
+            return torch.tensor(state_series).unsqueeze(0).to(self.device)
         else:
-            raise ValueError(f"Invalid input shape for state_series: {state_series.shape}")
+            raise ValueError(f"Invalid input shape: {state_series.shape}")
 
-        state_tensor = state_tensor.to(self.device)
-
-        result = {}
+    def predict_policy(self, state_series: np.ndarray, direction: str = None):
+        """
+        학습용: 확신도와 관계없이 policy가 뽑은 action 정보 반환
+        """
+        state_tensor = self._preprocess(state_series)
         directions = [direction] if direction else ['long', 'short']
+        result = {}
 
         for dir_ in directions:
             with torch.no_grad():
                 _, _, value, probs = self.models[dir_].get_action(state_tensor)
-                # probs[:, 0] is entry probability according to the unified format
-                enter_prob = float(probs[0, 0].item())
-                print(f"[DEBUG] direction = {dir_} | probs = {probs.tolist()} | enter_prob = {enter_prob:.3f}")
+                prob = float(probs[0, 0].item())
                 result[dir_] = {
-                    'prob': enter_prob,
+                    'prob': prob,
                     'value': float(value.item())
                 }
 
         if direction:
-            prob = result[direction]['prob']
-            value = result[direction]['value']
+            return direction, result[direction]['prob'], result[direction]['value']
+        else:
+            # 양방향 비교: 확신도 높은 쪽 선택
+            long_prob = result['long']['prob']
+            short_prob = result['short']['prob']
+            if long_prob > short_prob:
+                return 'long', long_prob, result['long']['value']
+            else:
+                return 'short', short_prob, result['short']['value']
+
+    def predict_filtered(self, state_series: np.ndarray, direction: str = None):
+        """
+        실전용: threshold 적용. 확신도 없으면 HOLD 반환
+        """
+        direction, prob, value = self.predict_policy(state_series, direction)
+
+        # 단일 방향
+        if direction in ['long', 'short']:
             threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
-            print(f"[DEBUG] [predict()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
+            print(f"[DEBUG] [predict_filtered()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
             if prob >= threshold:
                 return direction, prob, value
             else:
                 return 'hold', prob, value
 
-        # 양방향 판단일 경우
-        long_prob = result['long']['prob']
-        short_prob = result['short']['prob']
-        long_value = result['long']['value']
-        short_value = result['short']['value']
-
-        long_sig = long_prob >= LONG_THRESHOLD
-        short_sig = short_prob >= SHORT_THRESHOLD
-
-        if long_sig or short_sig:
-            if long_sig and (not short_sig or long_prob > short_prob):
-                return 'long', long_prob, long_value
-            else:
-                return 'short', short_prob, short_value
+        # 혹시 None이 들어온 경우 양방향 판단 (양방향 정책 비교 시)
         else:
-            # 확신도 부족 → HOLD
-            if long_prob > short_prob:
-                return 'hold', long_prob, long_value
-            else:
-                return 'hold', short_prob, short_value
+            # 이 코드는 predict_policy에서 이미 'long' 또는 'short'만 반환함
+            raise ValueError("Unexpected fallback in predict_filtered().")
