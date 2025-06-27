@@ -31,51 +31,45 @@ class Predictor:
             return torch.tensor(state_series).unsqueeze(0).to(self.device)
         else:
             raise ValueError(f"Invalid input shape: {state_series.shape}")
-
+        
     def predict_policy(self, state_series: np.ndarray, direction: str = None):
         """
-        학습용: 확신도와 관계없이 policy가 뽑은 action 정보 반환
+        학습용: 모델이 뽑은 행동과 log_prob (PPO 학습용), ENTER 확률 (로그 출력용) 모두 반환
         """
         state_tensor = self._preprocess(state_series)
-        directions = [direction] if direction else ['long', 'short']
-        result = {}
-
-        for dir_ in directions:
-            with torch.no_grad():
-                _, _, value, probs = self.models[dir_].get_action(state_tensor)
-                prob = float(probs[0, 0].item())
-                result[dir_] = {
-                    'prob': prob,
-                    'value': float(value.item())
-                }
 
         if direction:
-            return direction, result[direction]['prob'], result[direction]['value']
+            with torch.no_grad():
+                action, log_prob, value, probs = self.models[direction].get_action(state_tensor)
+
+            action_str = direction if action.item() == 0 else 'hold'
+            prob = float(probs[0, 1].item())  # index 1 = ENTER 확률
+            return action_str, float(log_prob.item()), float(value.item()), prob
+
         else:
-            # 양방향 비교: 확신도 높은 쪽 선택
-            long_prob = result['long']['prob']
-            short_prob = result['short']['prob']
-            if long_prob > short_prob:
-                return 'long', long_prob, result['long']['value']
+            # 양방향 비교 (확신도 높은 방향 선택, 샘플링은 없음)
+            result = {}
+            for dir_ in ['long', 'short']:
+                with torch.no_grad():
+                    _, _, value, probs = self.models[dir_].get_action(state_tensor)
+                    prob = float(probs[0, 1].item())
+                    result[dir_] = {'prob': prob, 'value': float(value.item())}
+
+            if result['long']['prob'] > result['short']['prob']:
+                return 'long', None, result['long']['value'], result['long']['prob']
             else:
-                return 'short', short_prob, result['short']['value']
+                return 'short', None, result['short']['value'], result['short']['prob']
 
     def predict_filtered(self, state_series: np.ndarray, direction: str = None):
         """
         실전용: threshold 적용. 확신도 없으면 HOLD 반환
         """
-        direction, prob, value = self.predict_policy(state_series, direction)
+        action, prob, value, _ = self.predict_policy(state_series, direction)
 
-        # 단일 방향
-        if direction in ['long', 'short']:
-            threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
-            print(f"[DEBUG] [predict_filtered()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
-            if prob >= threshold:
-                return direction, prob, value
-            else:
-                return 'hold', prob, value
+        threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
+        print(f"[DEBUG] [predict_filtered()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
 
-        # 혹시 None이 들어온 경우 양방향 판단 (양방향 정책 비교 시)
+        if prob >= threshold and action == direction:
+            return direction, prob, value
         else:
-            # 이 코드는 predict_policy에서 이미 'long' 또는 'short'만 반환함
-            raise ValueError("Unexpected fallback in predict_filtered().")
+            return 'hold', prob, value
