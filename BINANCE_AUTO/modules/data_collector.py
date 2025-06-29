@@ -65,19 +65,32 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
     if new_df.index.tz is None:
         new_df.index = new_df.index.tz_localize("UTC")
 
+    use_old_cache = True
     if os.path.exists(path):
         old_df = pd.read_pickle(path)
         if old_df.index.tz is None:
             old_df.index = old_df.index.tz_localize("UTC")
+
+        # 최신성 비교
+        old_max = old_df.index.max()
+        new_max = new_df.index.max()
+
+        # 기준: old가 new보다 1 interval 이상 과거면 버린다
+        tf_minutes = int(re.findall(r"\d+", tf)[0]) if "min" in tf else int(re.findall(r"\d+", tf)[0]) * 60
+        max_allowed_delay = pd.Timedelta(minutes=tf_minutes)
+        
+        if old_max < new_max - max_allowed_delay:
+            print(f"[INFO] {tf} 캐시가 너무 구식입니다 → 무시하고 새로 덮어씁니다.")
+            use_old_cache = False
+
+    if use_old_cache and os.path.exists(path):
         combined = pd.concat([old_df, new_df])
         combined = combined[~combined.index.duplicated(keep="last")]
     else:
         combined = new_df
 
     combined = combined.sort_index().iloc[-max_len:]
-    print(
-        f"[DEBUG] {tf} cache combined rows: {len(combined)} / max index: {combined.index.max()}"
-    )
+    print(f"[DEBUG] {tf} cache combined rows: {len(combined)} / max index: {combined.index.max()}")
     combined.to_pickle(path)
     return combined
 
