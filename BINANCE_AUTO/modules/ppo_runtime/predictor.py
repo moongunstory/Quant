@@ -37,6 +37,9 @@ class Predictor:
         학습용: 모델이 뽑은 행동과 log_prob (PPO 학습용), ENTER 확률 (로그 출력용) 모두 반환
         """
         state_tensor = self._preprocess(state_series)
+        
+        print(f"[LOG] ▶️ [predict_policy] state_tensor shape = {state_tensor.shape}")
+        print(f"[LOG] ▶️ [predict_policy] state_tensor[:, :1, :5] = {state_tensor[:, :1, :5]}")
 
         if direction:
             with torch.no_grad():

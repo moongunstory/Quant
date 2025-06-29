@@ -134,7 +134,7 @@ DUNE_QUERY_PARTS = {
 REQUIRED_CANDLE_COUNTS = {
     "5min": 50,
     "15min": 70,
-    "30min": 40,
+    "30min": 70,
     "1H": 70
 }
 

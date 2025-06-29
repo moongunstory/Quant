@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import re
 import requests
+import json
 from datetime import timedelta
 from binance.client import Client
 from dotenv import load_dotenv
@@ -18,7 +19,7 @@ from modules.config import (
     TZ,
 )
 
-from modules.training.data_preparation.collector import add_indicators_with_validation, fetch_btc_historical_features
+from modules.training.data_preparation.collector import fetch_btc_historical_features
 from modules.training.data_preparation.processor import create_dune_derived_features
 
 
@@ -103,42 +104,39 @@ def fetch_latest_dune_row():
     return df.loc[[latest_index]]
 
 
+def add_indicators_for_live(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    from ta.momentum import RSIIndicator, StochasticOscillator
+    from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator
+    
+    df = df.copy()
+    
+    if 'close' not in df.columns or df['close'].isna().all():
+        return pd.DataFrame()
+
+    prefix = f"{tf}_" if tf != "5min" else ""
+
+    df[f"{prefix}rsi"] = RSIIndicator(df['close']).rsi()
+    df[f"{prefix}stoch_k"] = StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+    
+    macd = MACD(df['close'])
+    df[f"{prefix}macd"] = macd.macd()
+    df[f"{prefix}macd_signal"] = macd.macd_signal()
+    
+    df[f"{prefix}ema_20"] = EMAIndicator(df['close'], window=20).ema_indicator()
+    df[f"{prefix}sma_50"] = SMAIndicator(df['close'], window=50).sma_indicator()
+    df[f"{prefix}adx"] = ADXIndicator(df['high'], df['low'], df['close']).adx()
+    
+    df = df.ffill().bfill()
+    
+    return df
+
+
 class RealTimeDataCollector:
     def __init__(self):
-        # 항상 직전 캔들까지만 요청하도록 함 (30분 단위 실행 기준)
         self.now = pd.Timestamp.utcnow().floor("30min") - pd.Timedelta(minutes=1)
         self.symbol = "ETHUSDT"
         self.btc_symbol = "BTCUSDT"
         self.cache_dir = CACHE_DIR
-
-    def collect_eth_features(self):
-        result_df = None
-        unified_ts = self.now.floor("5min")  # 모든 타임프레임의 마지막 row 인덱스를 통일
-
-        for tf in TIMEFRAMES:
-            count = REQUIRED_CANDLE_COUNTS[tf]
-            new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
-            if new_df.empty:
-                raise ValueError(f"{tf} Binance 응답 없음")
-
-            value = int(re.findall(r"\d+", tf)[0])
-            expected_last_ts = (
-                (self.now.tz_convert("UTC") - pd.Timedelta(minutes=value)).floor(tf.lower())
-            )
-
-            if new_df.index.max() < expected_last_ts:
-                raise ValueError(f"{tf} 캔들 누락됨: {new_df.index.max()} < {expected_last_ts}")
-
-            updated_df = update_cache(self.symbol, tf, new_df, self.cache_dir, count)
-            df_with_ind = add_indicators_with_validation(updated_df, tf)
-            if tf == "5min":
-                df_with_ind["5m_close"] = updated_df["close"]  # ✅ 진입가 용도
-            latest_row = df_with_ind.iloc[[-1]]
-            latest_row.index = pd.DatetimeIndex([unified_ts])  # ✅ 인덱스 통일
-
-            result_df = latest_row if result_df is None else result_df.join(latest_row, how="outer")
-
-        return result_df
 
     def collect_btc_features(self):
         start = (self.now.floor("30min") - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
@@ -151,8 +149,7 @@ class RealTimeDataCollector:
             df.index = df.index.tz_localize("UTC")
 
         latest = df.loc[[df.index.max()]]
-        latest.index = pd.DatetimeIndex([self.now.floor("5min")])  # ✅ 인덱스 강제 통일
-
+        latest.index = pd.DatetimeIndex([self.now.floor("5min")])
         return latest
 
     def collect_dune_features(self):
@@ -165,7 +162,7 @@ class RealTimeDataCollector:
             dune_df.index = dune_df.index.tz_localize("UTC")
 
         dune_latest = dune_df.loc[[dune_df.index.max()]]
-        dune_latest.index = pd.DatetimeIndex([self.now.floor("5min")])  # ✅ 인덱스 통일
+        dune_latest.index = pd.DatetimeIndex([self.now.floor("5min")])
 
         date_str = dune_latest.index.max().strftime("%m.%d")
         os.makedirs(ONCHAIN_CACHE_DIR, exist_ok=True)
@@ -179,36 +176,106 @@ class RealTimeDataCollector:
         return dune_latest
 
     def get_recent_market_df(self, tf="5m", seq_len=32, horizon=4):
-        """
-        PPO reward 평가용 5분봉 캔들 36줄 반환
-        - seq_len: 상태 관측용
-        - horizon: 보상 평가용
-        - tf: 사용 타임프레임 ('5m')
-        """
-        count = seq_len + horizon  # PPO 학습 기준 총 필요 수
+        count = seq_len + horizon
         df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
         if df is None or df.empty or len(df) < count:
             raise ValueError(f"📉 {tf} 캔들 수 부족: {len(df)} < {count}")
 
         return df.iloc[-count:]
 
-    def run(self):
+    def refresh_caches(self):
+        print("[디버그] 🔄 캐시 새로고침 중...")
+        for tf in TIMEFRAMES:
+            new_df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, REQUIRED_CANDLE_COUNTS[tf])
+            if not new_df.empty:
+                update_cache(self.symbol, tf, new_df, self.cache_dir, REQUIRED_CANDLE_COUNTS[tf])
+
+    def run(self, seq_len=32, auto_refresh_cache=False):
+        print(f"[디버그] 🕒 추론 기준 시간: {self.now}")
+        
         self.now = pd.Timestamp.utcnow().floor("30min") - pd.Timedelta(minutes=1)
+        unified_ts = self.now.floor("5min")
 
-        eth_df = self.collect_eth_features()
-        btc_df = self.collect_btc_features()
-        dune_df = self.collect_dune_features()
+        if auto_refresh_cache:
+            self.refresh_caches()
 
-        final_df = eth_df.join(btc_df, how="left").join(dune_df, how="left")
-
-        if final_df.isna().any().any():
-            print("\n🚨 결측값 존재 - 추론 skip")
-            print("🚨 결측 컬럼 목록:")
-            print(final_df.isna().sum()[final_df.isna().sum() > 0])
-
-            print("\n📋 마지막 추론 대상 행 (최신 데이터):")
-            print(final_df.tail(1).T)
-
+        # 1. 5분봉 기준 로드
+        path_5m = os.path.join(self.cache_dir, "ETHUSDT_5min.pkl")
+        if not os.path.exists(path_5m):
+            print(f"🚨 5분봉 캐시 누락: {path_5m}")
             return None
 
-        return final_df.iloc[-32:]
+        df_5m = pd.read_pickle(path_5m).sort_index()
+        df_5m = add_indicators_for_live(df_5m, "5min")
+        df_5m = df_5m.loc[df_5m.index <= unified_ts].iloc[-seq_len:]
+
+        if len(df_5m) < seq_len:
+            print(f"🚨 5분봉 시퀀스 부족: {len(df_5m)} < {seq_len}")
+            return None
+
+        base_df = df_5m.copy()
+
+        # 2. 멀티 타임프레임 지표 추가
+        for tf in ["15min", "30min", "1H"]:
+            path_tf = os.path.join(self.cache_dir, f"ETHUSDT_{tf}.pkl")
+            if not os.path.exists(path_tf):
+                print(f"🚨 {tf} 캐시 누락: {path_tf}")
+                return None
+
+            df_tf = pd.read_pickle(path_tf).sort_index()
+            df_tf = add_indicators_for_live(df_tf, tf)
+
+            # 미래 인덱스 체크
+            max_index = df_tf.index.max()
+            if max_index > base_df.index.max():
+                print(f"🚨 {tf} 미래 인덱스 포함: {max_index} > {base_df.index.max()}")
+
+            # Forward fill
+            df_tf = df_tf[df_tf.index <= base_df.index.max()]
+            df_tf = df_tf.reindex(base_df.index, method='ffill')
+            
+            # 컬럼 충돌 방지
+            for col in df_tf.columns:
+                if col not in base_df.columns:
+                    base_df[col] = df_tf[col]
+
+        # 3. BTC 및 Dune 피처 추가
+        btc_row = self.collect_btc_features().iloc[0]
+        dune_row = self.collect_dune_features().iloc[0]
+        
+        for col in btc_row.index:
+            if col not in base_df.columns:
+                base_df[col] = btc_row[col]
+        for col in dune_row.index:
+            if col not in base_df.columns:
+                base_df[col] = dune_row[col]
+
+        # 4. 피처 검증
+        total_cols = len(base_df.columns)
+        unique_cols = len(set(base_df.columns))
+        print(f"[디버그] 전체 피처: {total_cols}, 고유 피처: {unique_cols}")
+
+        duplicates = base_df.columns[base_df.columns.duplicated()].tolist()
+        if duplicates:
+            print(f"🚨 중복 피처명: {duplicates}")
+            base_df = base_df.loc[:, ~base_df.columns.duplicated(keep='last')]
+
+        # 5. 피처 순서 검증
+        try:
+            with open("trained_feature_order.json") as f:
+                trained_order = json.load(f)
+                current_order = base_df.columns.tolist()
+                if current_order != trained_order:
+                    print("🚨 피처 순서 불일치 → 재정렬 시도")
+                    base_df = base_df[trained_order]
+        except:
+            print("⚠️ 피처 순서 검증 실패")
+
+        # 6. 결측값 체크
+        if base_df.isna().any().any():
+            print("🚨 결측값 발견 → 건너뛰기")
+            print(base_df.isna().sum()[base_df.isna().sum() > 0])
+            return None
+
+        print(f"[디버그] ✅ 최종 상태 형태: {base_df.shape}")
+        return base_df
