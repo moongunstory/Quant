@@ -27,22 +27,14 @@ client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
 
 
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
-    end_time_utc = now.tz_convert("UTC")
-    end_naive = end_time_utc.tz_localize(None)
-
-    unit = "minutes" if "min" in tf.lower() else "hours"
-    value = int(re.findall(r"\d+", tf)[0])
-    start_time = end_time_utc - pd.Timedelta(**{unit: value * count})
-    start_naive = start_time.tz_localize(None)
 
     api_tf = BINANCE_INTERVAL_MAP[tf]
     klines = client.futures_klines(
         symbol=symbol,
         interval=api_tf,
-        startTime=int(start_naive.timestamp() * 1000),
-        endTime=int(end_naive.timestamp() * 1000),
-        limit=count,
+        limit=count  # 가장 최근 count개만 요청
     )
+
     if not klines:
         return pd.DataFrame()
 
