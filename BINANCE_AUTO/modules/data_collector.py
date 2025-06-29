@@ -27,7 +27,6 @@ client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
 
 
 def fetch_ohlcv_from_binance(symbol, tf, now, count):
-
     api_tf = BINANCE_INTERVAL_MAP[tf]
     klines = client.futures_klines(
         symbol=symbol,
@@ -36,6 +35,7 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     )
 
     if not klines:
+        print(f"[WARNING] {symbol} {tf} OHLCV 수집 실패: 빈 응답")
         return pd.DataFrame()
 
     df = pd.DataFrame(
@@ -52,9 +52,11 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
     df = df.astype(float).sort_index()
-    print(
-        f"[DEBUG] {tf} OHLCV count = {len(df)} / index range: {df.index.min()} ~ {df.index.max()}"
-    )
+
+    if not df.empty:
+        print(f"[DEBUG] {symbol} {tf} OHLCV 수집 완료: {len(df)} rows")
+        print(f"[DEBUG] {symbol} {tf} 인덱스 범위: {df.index.min()} ~ {df.index.max()}")
+
     return df
 
 
@@ -231,7 +233,7 @@ class RealTimeDataCollector:
 
         base_df = df_5m.copy()
 
-        # 2. 멀티 타임프레임 지표 추가
+        # 2. 멀티 타임프레임 병합
         for tf in ["15min", "30min", "1H"]:
             path_tf = os.path.join(self.cache_dir, f"ETHUSDT_{tf}.pkl")
             if not os.path.exists(path_tf):
@@ -239,21 +241,38 @@ class RealTimeDataCollector:
                 return None
 
             df_tf = pd.read_pickle(path_tf).sort_index()
-            df_tf = add_indicators_for_live(df_tf, tf)
-
-            # 미래 인덱스 체크
-            max_index = df_tf.index.max()
-            if max_index > base_df.index.max():
-                print(f"🚨 {tf} 미래 인덱스 포함: {max_index} > {base_df.index.max()}")
-
-            # Forward fill
-            df_tf = df_tf[df_tf.index <= base_df.index.max()]
-            df_tf = df_tf.reindex(base_df.index, method='ffill')
             
-            # 컬럼 충돌 방지
+            # ✅ 지표 계산용 close 길이 확인
+            if "close" in df_tf:
+                close_len = df_tf["close"].dropna().shape[0]
+                print(f"[DEBUG] {tf} close 값 수: {close_len}")
+            else:
+                print(f"[WARN] {tf} → close 컬럼 없음")
+
+            df_tf = add_indicators_for_live(df_tf, tf)
+            if df_tf.empty:
+                print(f"🚨 {tf} 보조 지표 생성 실패 → 건너뜀")
+                continue
+
+            # ✅ 유효값 없는 지표 제거
             for col in df_tf.columns:
-                if col not in base_df.columns:
-                    base_df[col] = df_tf[col]
+                if df_tf[col].notna().sum() == 0:
+                    print(f"[INFO] {tf} → {col} 전부 NaN → 병합 제외")
+                    df_tf.drop(columns=col, inplace=True)
+
+            # ✅ 중복 컬럼 제거 (OHLCV)
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col in df_tf.columns:
+                    df_tf.drop(columns=col, inplace=True)
+
+            # 병합
+            before_cols = set(base_df.columns)
+            base_df = base_df.merge(df_tf, left_index=True, right_index=True, how="left")
+            after_cols = set(base_df.columns)
+
+            added = list(after_cols - before_cols)
+            print(f"[DEBUG] {tf} 병합 피처 수: {len(added)} | {added[:3]}...")
+            base_df = base_df.ffill()
 
         # 3. BTC 및 Dune 피처 추가
         btc_row = self.collect_btc_features().iloc[0]
