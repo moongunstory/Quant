@@ -51,7 +51,11 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
-    return df.astype(float).sort_index()
+    df = df.astype(float).sort_index()
+    print(
+        f"[DEBUG] {tf} OHLCV count = {len(df)} / index range: {df.index.min()} ~ {df.index.max()}"
+    )
+    return df
 
 
 def update_cache(symbol, tf, new_df, cache_dir, max_len):
@@ -71,6 +75,9 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
         combined = new_df
 
     combined = combined.sort_index().iloc[-max_len:]
+    print(
+        f"[DEBUG] {tf} cache combined rows: {len(combined)} / max index: {combined.index.max()}"
+    )
     combined.to_pickle(path)
     return combined
 
@@ -115,8 +122,12 @@ def add_indicators_for_live(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     df[f"{prefix}macd_signal"] = macd.macd_signal()
     
     df[f"{prefix}ema_20"] = EMAIndicator(df['close'], window=20).ema_indicator()
-    df[f"{prefix}sma_50"] = SMAIndicator(df['close'], window=50).sma_indicator()
+    sma_col = f"{prefix}sma_50"
+    df[sma_col] = SMAIndicator(df['close'], window=50).sma_indicator()
     df[f"{prefix}adx"] = ADXIndicator(df['high'], df['low'], df['close']).adx()
+    print(
+        f"[DEBUG] {sma_col} NaNs: {df[sma_col].isna().sum()} / Valid: {df[sma_col].notna().sum()}"
+    )
     
     df = df.ffill().bfill()
     
