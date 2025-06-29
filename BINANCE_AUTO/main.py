@@ -31,7 +31,7 @@ def main():
         "short": FuturesTradeExecutor()
     }
 
-    force_immediate_run = False  # ← 테스트 시 True, 실전 시 False
+    force_immediate_run = True  # ← 테스트 시 True, 실전 시 False
 
     while True:
         try:
