@@ -23,15 +23,8 @@ from modules.config import (
     TIMEFRAMES,
     SEQ_LEN,
     HIDDEN_DIM,
-    LEARNING_RATE,
-    PPO_EPOCHS,
-    PPO_BATCH_SIZE,
     PPO_MAX_STEPS,
-    GAMMA,
-    LAMBDA,
-    CLIP_EPS,
-    VALUE_COEF,
-    ENTROPY_COEF
+    PPO_CONFIG
 )
 
 from modules.training.ppo.core.env_train import PPOTradingEnv
@@ -58,6 +51,16 @@ def squeeze_obs_dict(obs_tensor: Dict[str, torch.Tensor]) -> Dict[str, torch.Ten
     """MTF 관찰값 텐서에서 배치 차원 제거"""
     return {tf: tensor.squeeze(0).cpu() for tf, tensor in obs_tensor.items()}
 
+def monitor_training_health(ev: float, entropy: float) -> bool:
+    """Return True if training should stop due to collapse."""
+    if ev < -2.0:
+        logger.error("Value function collapsed (explained variance < -2.0)")
+        return True
+    if entropy < 0.01:
+        logger.error("Policy collapsed to deterministic (entropy < 0.01)")
+        return True
+    return False
+
 def init_value_head_weights(model: PPOPolicyNetwork):
     """가치 헤드 가중치 초기화 (MTF 지원)"""
     def init_weights(m):
@@ -82,14 +85,14 @@ def train_ppo(
     imitation_model_path: str,
     value_model_path: str,
     save_path: str,
-    total_epochs: int = PPO_EPOCHS,
-    batch_size: int = PPO_BATCH_SIZE,
-    gamma: float = GAMMA,
-    lam: float = LAMBDA,
-    clip_eps: float = CLIP_EPS,
-    value_coef: float = VALUE_COEF,
-    entropy_coef: float = ENTROPY_COEF,
-    lr: float = LEARNING_RATE,
+    total_epochs: int = PPO_CONFIG['epochs'],
+    batch_size: int = PPO_CONFIG['batch_size'],
+    gamma: float = PPO_CONFIG['gamma'],
+    lam: float = PPO_CONFIG['lambda'],
+    clip_eps: float = PPO_CONFIG['clip_eps'],
+    value_coef: float = PPO_CONFIG['value_coef'],
+    entropy_coef: float = PPO_CONFIG['entropy_coef'],
+    lr: float = PPO_CONFIG['learning_rate'],
     max_steps: int = PPO_MAX_STEPS,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> Dict[str, Any]:
@@ -129,6 +132,7 @@ def train_ppo(
     optimizer = optim.Adam(model.parameters(), lr=lr)
     initial_entropy_coef = entropy_coef
     all_epoch_rewards = []
+    early_stop = False
 
     for epoch in range(total_epochs):
         entropy_coef = initial_entropy_coef * (1 - epoch / total_epochs)
@@ -258,6 +262,10 @@ def train_ppo(
             f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
             f"Entropy: {avg_entropy:.4f} | Entropy Coef: {entropy_coef:.4f}")
 
+        if monitor_training_health(ev, avg_entropy):
+            early_stop = True
+            break
+
         # 이상치 경고
         adv_std = np.std(batch_advantages)
         if adv_std > 5.0:
@@ -268,6 +276,9 @@ def train_ppo(
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"Value prediction range → min:{value_min:.3f}, max:{value_max:.3f}")
+
+    if early_stop:
+        logger.warning(f"⚠️ [{direction.upper()}] Early stopping triggered at epoch {epoch+1}")
 
     # 학습 완료 통계
     final_avg_reward = np.mean(all_epoch_rewards[-3:]) if len(all_epoch_rewards) >= 3 else np.mean(all_epoch_rewards)
@@ -299,7 +310,7 @@ if __name__ == "__main__":
             imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
             value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
             save_path=PPO_FINAL_MODEL_PATHS[direction],
-            total_epochs=PPO_EPOCHS
+            total_epochs=PPO_CONFIG['epochs']
         )
         results.append(result)
     
