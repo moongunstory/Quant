@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 from typing import Dict
+import pickle
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,7 +11,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 sys.path.append(PROJECT_ROOT)
 
 from modules.config import (
-    RAW_DATA_PATH, TRAIN_LABEL_PATHS,
+    RAW_DATA_PATH, TRAIN_PICKLE_PATHS,
     TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON,
     TIMEFRAMES
 )
@@ -261,15 +262,20 @@ def main():
     print(f"  - Short 모델용: {len(df_short_binary)}행 (short={sum(df_short_binary['label'])}, hold={len(df_short_binary)-sum(df_short_binary['label'])})")
     
     # 7. 저장
-    long_path = TRAIN_LABEL_PATHS["long"]
-    short_path = TRAIN_LABEL_PATHS["short"]
+    long_path = TRAIN_PICKLE_PATHS["long"]
+    short_path = TRAIN_PICKLE_PATHS["short"]
     
     os.makedirs(os.path.dirname(long_path), exist_ok=True)
     os.makedirs(os.path.dirname(short_path), exist_ok=True)
     
-    df_long_binary.to_csv(long_path)
-    df_short_binary.to_csv(short_path)
-    
+    # ✅ long
+    with open(long_path, "wb") as f:
+        pickle.dump({**mtf_data_masked, "15min": df_long_binary}, f)
+
+    # ✅ short
+    with open(short_path, "wb") as f:
+        pickle.dump({**mtf_data_masked, "15min": df_long_binary}, f)
+
     print(f"[💾 저장 완료]")
     print(f"  - Long 이진분류 데이터: {len(df_long_binary)}행 → {long_path}")
     print(f"  - Short 이진분류 데이터: {len(df_short_binary)}행 → {short_path}")

@@ -70,7 +70,7 @@ class PPOTradingEnv:
             raise ValueError(f"Reference timeframe '{self.reference_timeframe}' must have 'label' column")
         
         # Find valid entry indices from reference timeframe
-        self.valid_indices = ref_df[ref_df["label"] == 1].index.tolist()
+        self.valid_indices = ref_df[ref_df["label"] == 1].index.to_series().reset_index(drop=True).index.tolist()
         
         # Prepare sequences for each timeframe
         self.sequences = {}
@@ -266,3 +266,13 @@ class PPOTradingEnv:
             if len(sequences) > 0:
                 obs_space[tf] = sequences[0].shape
         return obs_space
+    
+    def get_input_dims(self) -> Dict[str, int]:
+        """각 타임프레임별 입력 feature 수 반환"""
+        input_dims = {}
+        for tf, data in self.sequences.items():
+            if data.ndim == 3:  # (num_seq, seq_len, feature_dim)
+                input_dims[tf] = data.shape[2]
+            elif data.ndim == 2:  # (num_seq, feature_dim) for external features like btc/dune
+                input_dims[tf] = data.shape[1]
+        return input_dims
