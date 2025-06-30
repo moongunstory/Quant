@@ -62,29 +62,55 @@ def collect_all_dune_data() -> pd.DataFrame:
     return pd.DataFrame()
 
 def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
-    """OHLCV 데이터 수집"""
-    start_date = pd.to_datetime(start_str, utc=True)
-    extended_start = start_date - timedelta(days=5)
-    extended_start_str = extended_start.strftime("%Y-%m-%d")
-    
-    start_ms = int(pd.to_datetime(extended_start_str).timestamp() * 1000)
-    end_ms = int(pd.to_datetime(end_str).timestamp() * 1000)
-    klines = client.futures_klines(
-        symbol=symbol,
-        interval=interval,
-        startTime=start_ms,
-        endTime=end_ms,
-        limit=1000,
-    )
-    df = pd.DataFrame(klines, columns=[
+    """OHLCV 데이터 수집 (페이지네이션 포함)"""
+    start_dt = pd.to_datetime(start_str, utc=True)
+    end_dt = pd.to_datetime(end_str, utc=True)
+    extended_start_dt = start_dt - timedelta(days=5)
+
+    start_ms = int(extended_start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    all_klines = []
+    max_limit = 1000
+
+    while True:
+        klines = client.futures_klines(
+            symbol=symbol,
+            interval=interval,
+            startTime=start_ms,
+            endTime=end_ms,
+            limit=max_limit,
+        )
+
+        if not klines:
+            break
+
+        all_klines.extend(klines)
+
+        # 다음 요청을 위해 마지막 캔들의 close_time + 1ms로 이동
+        last_close_time = klines[-1][6]  # close_time
+        if last_close_time >= end_ms:
+            break
+
+        start_ms = last_close_time + 1
+
+        # Binance API 요청 제한 대응을 위해 약간 대기 (optional)
+        time.sleep(0.2)
+
+    if not all_klines:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_klines, columns=[
         "timestamp", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"])
-    
+        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+    ])
+
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
+    
     return df.astype(float).dropna()
 
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
