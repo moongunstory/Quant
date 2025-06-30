@@ -118,7 +118,7 @@ def train_ppo(
 
     # 정책 사전학습 모델 로드
     logger.info(f"📦 [{direction.upper()}] 모방학습 모델 로딩: {imitation_model_path}")
-    model.load_model(imitation_model_path)
+    model.load_model(imitation_model_path, allow_partial=True)
 
     # 가치 헤드 랜덤 초기화 (사전학습 없이)
     logger.info(f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다.")
