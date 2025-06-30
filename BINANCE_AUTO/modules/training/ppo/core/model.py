@@ -171,11 +171,30 @@ class PPOPolicyNetwork(nn.Module):
         torch.save(self.state_dict(), path)
         print(f"[MODEL SAVE] Saved to {path}")
 
-    def load_model(self, path: str):
-        """Load model state dict"""
-        self.load_state_dict(torch.load(path, map_location='cpu'))
+    def load_model(self, path: str, allow_partial: bool = False):
+        """Load model state dict with optional partial loading"""
+        state_dict = torch.load(path, map_location='cpu')
+
+        if allow_partial:
+            current_state = self.state_dict()
+            loaded, skipped = [], []
+
+            for k, v in state_dict.items():
+                if k in current_state and current_state[k].shape == v.shape:
+                    current_state[k].copy_(v)
+                    loaded.append(k)
+                else:
+                    skipped.append(k)
+
+            self.load_state_dict(current_state)
+            print(f"[MODEL LOAD] Partially loaded from {path} ({len(loaded)} tensors)")
+            if skipped:
+                print(f"[MODEL LOAD WARNING] Skipped {len(skipped)} tensors: {skipped}")
+        else:
+            self.load_state_dict(state_dict)
+            print(f"[MODEL LOAD] Loaded from {path}")
+
         self.eval()
-        print(f"[MODEL LOAD] Loaded from {path}")
     
     def get_model_info(self):
         """Get model architecture information"""
