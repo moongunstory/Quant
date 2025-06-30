@@ -274,7 +274,7 @@ def main():
 
     # ✅ short
     with open(short_path, "wb") as f:
-        pickle.dump({**mtf_data_masked, "15min": df_long_binary}, f)
+        pickle.dump({**mtf_data_masked, "15min": df_short_binary}, f)
 
     print(f"[💾 저장 완료]")
     print(f"  - Long 이진분류 데이터: {len(df_long_binary)}행 → {long_path}")

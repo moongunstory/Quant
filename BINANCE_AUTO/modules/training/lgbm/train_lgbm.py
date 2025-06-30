@@ -16,8 +16,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 sys.path.append(PROJECT_ROOT)
 
 from modules.config import (
-    TRAIN_LABEL_PATHS, 
-    LGBM_THRESHOLD, 
+    TRAIN_PICKLE_PATHS,
+    LGBM_THRESHOLD,
     LGBM_MODEL_PATHS,
     TIMEFRAMES,
     FEATURE_CATEGORIES_BY_TF,
@@ -46,7 +46,7 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
 
 def load_labeled_data(data_type: str = "long") -> pd.DataFrame:
     """Long/Short 이진분류 데이터 로딩"""
-    data_path = TRAIN_LABEL_PATHS[data_type]
+    data_path = TRAIN_PICKLE_PATHS[data_type]
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"[📊 {data_type.upper()} 라벨 데이터 로딩 완료] 행: {len(df)}, 컬럼: {len(df.columns)}")
     return df
