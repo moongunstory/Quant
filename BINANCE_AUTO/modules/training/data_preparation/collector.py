@@ -114,29 +114,31 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     return df.astype(float).dropna()
 
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """기술적 지표 추가 - config 기반 피처 선택"""
+    """기술적 지표 추가 + OHLCV 컬럼 포함"""
     prefix = f"{tf}_"
     features = FEATURE_CATEGORIES_BY_TF.get(tf, [])
-    result_df = pd.DataFrame(index=df.index)
     
-    # 기본 지표 계산
+    # ⬇️ OHLCV 컬럼 포함시키기
+    result_df = df[["open", "high", "low", "close", "volume"]].copy()
+
+    # 1. 공통 지표 계산 (모든 TF에서 config 기반 적용)
     if "rsi" in features and len(df) >= 14:
         result_df[prefix + "rsi"] = ta.rsi(df["close"], length=14)
-    
+
     if "stochastic_k" in features and len(df) >= 14:
         stoch = ta.stoch(df["high"], df["low"], df["close"], k=14)
         if stoch is not None and not stoch.empty:
             result_df[prefix + "stochastic_k"] = stoch["STOCHk_14_3_3"]
-    
+
     if "cci" in features and len(df) >= 20:
         result_df[prefix + "cci"] = ta.cci(df["high"], df["low"], df["close"], length=20)
-    
+
     if "roc" in features and len(df) >= 10:
         result_df[prefix + "roc"] = ta.roc(df["close"], length=10)
-    
+
     if "mom" in features and len(df) >= 10:
         result_df[prefix + "mom"] = ta.mom(df["close"], length=10)
-    
+
     if "macd" in features and len(df) >= 26:
         macd = ta.macd(df["close"])
         if macd is not None and not macd.empty:
@@ -145,35 +147,35 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
                 result_df[prefix + "macd_signal"] = macd["MACDs_12_26_9"]
             if "macd_histogram" in features:
                 result_df[prefix + "macd_histogram"] = macd["MACDh_12_26_9"]
-    
+
     if "ema_20" in features and len(df) >= 20:
         result_df[prefix + "ema_20"] = ta.ema(df["close"], length=20)
-    
+
     if "ema_50" in features and len(df) >= 50:
         result_df[prefix + "ema_50"] = ta.ema(df["close"], length=50)
-    
+
     if "sma_20" in features and len(df) >= 20:
         result_df[prefix + "sma_20"] = ta.sma(df["close"], length=20)
-    
+
     if "sma_50" in features and len(df) >= 50:
         result_df[prefix + "sma_50"] = ta.sma(df["close"], length=50)
-    
+
     if "adx" in features and len(df) >= 14:
         adx_result = ta.adx(df["high"], df["low"], df["close"], length=14)
         if adx_result is not None and not adx_result.empty:
             result_df[prefix + "adx"] = adx_result["ADX_14"]
-    
+
     if "atr" in features and len(df) >= 14:
         result_df[prefix + "atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    
+
     if "obv" in features:
         result_df[prefix + "obv"] = ta.obv(df["close"], df["volume"])
-    
+
     if "volume_ratio" in features and len(df) >= 20:
         volume_ma = df["volume"].rolling(window=20).mean()
         result_df[prefix + "volume_ratio"] = df["volume"] / volume_ma
-    
-    # 5분봉 특화 피처
+
+    # 2. 5분봉 전용 확장 피처
     if tf == "5min":
         if "rsi_mean_6" in features and prefix + "rsi" in result_df.columns:
             result_df[prefix + "rsi_mean_6"] = result_df[prefix + "rsi"].rolling(6).mean()
@@ -183,7 +185,7 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
             result_df[prefix + "macd_slope_6"] = result_df[prefix + "macd"].diff().rolling(6).mean()
         if "stochk_range_6" in features and prefix + "stochastic_k" in result_df.columns:
             result_df[prefix + "stochk_range_6"] = result_df[prefix + "stochastic_k"].rolling(6).apply(lambda x: x.max() - x.min(), raw=True)
-    
+
     return result_df
 
 def fetch_btc_historical_features(start_date: str, end_date: str, interval: str = "1h") -> pd.DataFrame:
