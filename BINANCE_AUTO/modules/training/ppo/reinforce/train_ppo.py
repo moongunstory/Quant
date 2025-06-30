@@ -5,6 +5,7 @@ import pandas as pd
 import os
 import sys
 import logging
+from typing import Dict, Any, Tuple
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +23,18 @@ from modules.config import (
     TP_THRESHOLD,
     SL_THRESHOLD,
     LABEL_HORIZON,
+    TIMEFRAMES,
+    SEQ_LEN,
+    HIDDEN_DIM,
+    LEARNING_RATE,
+    PPO_EPOCHS,
+    PPO_BATCH_SIZE,
+    PPO_MAX_STEPS,
+    GAMMA,
+    LAMBDA,
+    CLIP_EPS,
+    VALUE_COEF,
+    ENTROPY_COEF
 )
 
 from modules.training.ppo.core.env_train import PPOTradingEnv
@@ -33,6 +46,38 @@ from modules.training.ppo.core.core import (
     compute_explained_variance,
 )
 
+def move_obs_to_device(obs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    """MTF 관찰값을 디바이스로 이동"""
+    return {tf: obs_tensor.to(device) for tf, obs_tensor in obs.items()}
+
+def convert_obs_to_tensor(obs: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    """MTF numpy 관찰값을 torch 텐서로 변환"""
+    return {
+        tf: torch.tensor(obs_data, dtype=torch.float32).unsqueeze(0).to(device)
+        for tf, obs_data in obs.items()
+    }
+
+def squeeze_obs_dict(obs_tensor: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """MTF 관찰값 텐서에서 배치 차원 제거"""
+    return {tf: tensor.squeeze(0).cpu() for tf, tensor in obs_tensor.items()}
+
+def init_value_head_weights(model: PPOPolicyNetwork):
+    """가치 헤드 가중치 초기화 (MTF 지원)"""
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            torch.nn.init.zeros_(m.bias)
+    
+    # MTF 모델의 경우 각 타임프레임별 가치 헤드 초기화
+    if hasattr(model, 'value_heads'):
+        # Multi-head value network
+        for tf, value_head in model.value_heads.items():
+            value_head.apply(init_weights)
+        logger.info("🧹 MTF value heads 랜덤 초기화 완료")
+    else:
+        # Single value head
+        model.value_head.apply(init_weights)
+        logger.info("🧹 Single value head 랜덤 초기화 완료")
 
 def train_ppo(
     direction: str,
@@ -40,48 +85,50 @@ def train_ppo(
     imitation_model_path: str,
     value_model_path: str,
     save_path: str,
-    total_epochs=30,
-    batch_size=64,
-    gamma=0.99,
-    lam=0.95,
-    clip_eps=0.2,
-    value_coef=0.5,
-    entropy_coef=0.01,
-    lr=2.5e-4,
-    max_steps=5000,
-    device='cuda' if torch.cuda.is_available() else 'cpu',
-):
-    logger.info(f"🔁 [{direction.upper()}] PPO 학습 시작")
+    total_epochs: int = PPO_EPOCHS,
+    batch_size: int = PPO_BATCH_SIZE,
+    gamma: float = GAMMA,
+    lam: float = LAMBDA,
+    clip_eps: float = CLIP_EPS,
+    value_coef: float = VALUE_COEF,
+    entropy_coef: float = ENTROPY_COEF,
+    lr: float = LEARNING_RATE,
+    max_steps: int = PPO_MAX_STEPS,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+) -> Dict[str, Any]:
+    logger.info(f"🔁 [{direction.upper()}] PPO 학습 시작 (MTF)")
     logger.info(f"📁 [{direction.upper()}] CSV 파일: {csv_path}")
     logger.info(f"🎯 [{direction.upper()}] epochs={total_epochs}, batch_size={batch_size}, lr={lr}, device={device}")
+    logger.info(f"🕒 [{direction.upper()}] Timeframes: {TIMEFRAMES}, seq_len={SEQ_LEN}")
+    
+    # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
     env = PPOTradingEnv(
         csv_path=csv_path,
         direction=direction,
-        seq_len=32,
+        seq_len=SEQ_LEN,
         tp_ratio=TP_THRESHOLD,
         sl_ratio=SL_THRESHOLD,
         horizon=LABEL_HORIZON,
     )
-    input_dim = env.sequences.shape[2]
-    logger.info(f"📊 [{direction.upper()}] 환경 생성 완료: input_dim={input_dim}, sequences={env.sequences.shape}")
+    
+    # MTF 입력 차원 정보 가져오기
+    input_dims = env.get_input_dims()  # Returns Dict[str, int]
+    logger.info(f"📊 [{direction.upper()}] 환경 생성 완료: input_dims={input_dims}")
 
-    model = PPOPolicyNetwork(input_dim=input_dim, hidden_dim=256).to(device)
+    # MTF 지원 PPO 모델 초기화
+    model = PPOPolicyNetwork(
+        input_dims=input_dims,
+        hidden_dim=HIDDEN_DIM
+    ).to(device)
 
-    # 정책 사전학습 로드
+    # 정책 사전학습 모델 로드
     logger.info(f"📦 [{direction.upper()}] 모방학습 모델 로딩: {imitation_model_path}")
     model.load_model(imitation_model_path)
 
-    # 가치 사전학습 weight 적용
-    #logger.info(f"🎯 [{direction.upper()}] 가치 사전학습 모델 로딩: {value_model_path}")
-    #model.value_head.load_state_dict(torch.load(value_model_path, map_location=device))
+    # 가치 헤드 랜덤 초기화 (사전학습 없이)
     logger.info(f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다.")
-    def init_weights(m):
-        if isinstance(m, torch.nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
-            torch.nn.init.zeros_(m.bias)
-
-    model.value_head.apply(init_weights)
+    init_value_head_weights(model)
 
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
@@ -96,19 +143,24 @@ def train_ppo(
             f"(entropy_coef={entropy_coef:.4f})")
         
         buffer = RolloutBuffer(buffer_size=max_steps)
-        obs = env.reset()
+        obs = env.reset()  # Returns Dict[str, np.ndarray]
         done = False
         episode_rewards = []
 
         # 롤아웃 수집
         while not done and len(buffer.rewards) < max_steps:
-            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+            # MTF 관찰값을 텐서로 변환
+            obs_tensor = convert_obs_to_tensor(obs, device)
+            
             action, log_prob, value, _ = model.get_action(obs_tensor)
             env_action = 1 if action.item() == 0 else 0  # 0→enter, 1→hold
             next_obs, reward, done, _ = env.step(env_action)
 
+            # MTF 관찰값을 CPU로 이동하여 버퍼에 저장
+            obs_cpu = squeeze_obs_dict(obs_tensor)
+            
             buffer.add(
-                obs_tensor.squeeze(0).cpu(),
+                obs_cpu,  # Dict[str, Tensor] 형태로 저장
                 action.item(),
                 reward,
                 done,
@@ -121,8 +173,8 @@ def train_ppo(
 
         # 마지막 value 계산
         with torch.no_grad():
-            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-            _, _, last_value = model.get_action(obs_tensor)
+            obs_tensor = convert_obs_to_tensor(obs, device)
+            _, _, last_value, _ = model.get_action(obs_tensor)
 
         buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=lam)
 
@@ -158,7 +210,8 @@ def train_ppo(
         last_returns = None
         
         for obs_batch, action_batch, return_batch, adv_batch, old_logprob_batch in buffer.get_batches(batch_size):
-            obs_batch = obs_batch.to(device)
+            # MTF 관찰값 배치를 디바이스로 이동
+            obs_batch = move_obs_to_device(obs_batch, device)
             action_batch = action_batch.to(device)
             return_batch = return_batch.to(device)
             adv_batch = adv_batch.to(device)
@@ -229,17 +282,18 @@ def train_ppo(
     # 모델 저장
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     model.save_model(save_path)
-    logger.info(f"✅ [{direction.upper()}] PPO 학습 완료 → 저장: {save_path}")
+    logger.info(f"✅ [{direction.upper()}] PPO 학습 완료 (MTF) → 저장: {save_path}")
 
     return {
         'direction': direction,
         'final_avg_reward': final_avg_reward,
-        'model_path': save_path
+        'model_path': save_path,
+        'input_dims': input_dims
     }
 
 
 if __name__ == "__main__":
-    logger.info("🚀 PPO 강화학습 훈련 시작")
+    logger.info("🚀 PPO 강화학습 훈련 시작 (MTF)")
     logger.info("=" * 60)
     
     results = []
@@ -251,17 +305,21 @@ if __name__ == "__main__":
             imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
             value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
             save_path=PPO_FINAL_MODEL_PATHS[direction],
-            total_epochs=30
+            total_epochs=PPO_EPOCHS
         )
         results.append(result)
     
     # 전체 결과 요약
     logger.info("\n" + "=" * 60)
-    logger.info("🏁 전체 PPO 학습 결과 요약")
+    logger.info("🏁 전체 PPO 학습 결과 요약 (MTF)")
     logger.info("=" * 60)
     
     for result in results:
         logger.info(f"{result['direction'].upper()} 모델: "
                    f"최종 평균 보상 {result['final_avg_reward']:.4f} → {result['model_path']}")
+        logger.info(f"  📐 입력 차원: {result['input_dims']}")
     
-    logger.info("🎉 모든 PPO 강화학습 훈련이 완료되었습니다!")
+    logger.info("🎉 모든 PPO 강화학습 훈련이 완료되었습니다! (MTF)")
+    logger.info(f"🕒 사용된 Timeframes: {TIMEFRAMES}")
+    logger.info(f"📏 Sequence Length: {SEQ_LEN}")
+    logger.info(f"🧠 Hidden Dimension: {HIDDEN_DIM}")

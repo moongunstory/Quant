@@ -16,7 +16,7 @@ from modules.config import (
     DUNE_API_KEY, BINANCE_API_KEY, BINANCE_SECRET_KEY,
     TIMEFRAMES, START_DATE, END_DATE,
     FEATURE_CATEGORIES_BY_TF, DUNE_QUERY_PARTS,
-    RAW_DATA_PATH
+    RAW_DATA_PATH, BINANCE_INTERVAL_MAP, FUTURES_SYMBOL
 )
 
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
@@ -76,7 +76,6 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
         endTime=end_ms,
         limit=1000,
     )
-
     df = pd.DataFrame(klines, columns=[
         "timestamp", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "num_trades",
@@ -89,37 +88,29 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     return df.astype(float).dropna()
 
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """기술적 지표 추가"""
+    """기술적 지표 추가 - config 기반 피처 선택"""
     prefix = f"{tf}_"
-    features = FEATURE_CATEGORIES_BY_TF[tf]
+    features = FEATURE_CATEGORIES_BY_TF.get(tf, [])
     result_df = pd.DataFrame(index=df.index)
     
-    # OHLC 데이터 추가 (15m, 5m만)
-    if tf in ["15m", "5m"]:
-        result_df[f"{tf}_open"] = df["open"]
-        result_df[f"{tf}_high"] = df["high"] 
-        result_df[f"{tf}_low"] = df["low"]
-        result_df[f"{tf}_close"] = df["close"]
-        result_df[f"{tf}_volume"] = df["volume"]
-
     # 기본 지표 계산
     if "rsi" in features and len(df) >= 14:
         result_df[prefix + "rsi"] = ta.rsi(df["close"], length=14)
-
+    
     if "stochastic_k" in features and len(df) >= 14:
         stoch = ta.stoch(df["high"], df["low"], df["close"], k=14)
         if stoch is not None and not stoch.empty:
             result_df[prefix + "stochastic_k"] = stoch["STOCHk_14_3_3"]
-
+    
     if "cci" in features and len(df) >= 20:
         result_df[prefix + "cci"] = ta.cci(df["high"], df["low"], df["close"], length=20)
-
+    
     if "roc" in features and len(df) >= 10:
         result_df[prefix + "roc"] = ta.roc(df["close"], length=10)
-
+    
     if "mom" in features and len(df) >= 10:
         result_df[prefix + "mom"] = ta.mom(df["close"], length=10)
-
+    
     if "macd" in features and len(df) >= 26:
         macd = ta.macd(df["close"])
         if macd is not None and not macd.empty:
@@ -128,36 +119,36 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
                 result_df[prefix + "macd_signal"] = macd["MACDs_12_26_9"]
             if "macd_histogram" in features:
                 result_df[prefix + "macd_histogram"] = macd["MACDh_12_26_9"]
-
+    
     if "ema_20" in features and len(df) >= 20:
         result_df[prefix + "ema_20"] = ta.ema(df["close"], length=20)
-
+    
     if "ema_50" in features and len(df) >= 50:
         result_df[prefix + "ema_50"] = ta.ema(df["close"], length=50)
-
+    
     if "sma_20" in features and len(df) >= 20:
         result_df[prefix + "sma_20"] = ta.sma(df["close"], length=20)
-
+    
     if "sma_50" in features and len(df) >= 50:
         result_df[prefix + "sma_50"] = ta.sma(df["close"], length=50)
-
+    
     if "adx" in features and len(df) >= 14:
         adx_result = ta.adx(df["high"], df["low"], df["close"], length=14)
         if adx_result is not None and not adx_result.empty:
             result_df[prefix + "adx"] = adx_result["ADX_14"]
-
+    
     if "atr" in features and len(df) >= 14:
         result_df[prefix + "atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-
+    
     if "obv" in features:
         result_df[prefix + "obv"] = ta.obv(df["close"], df["volume"])
-
+    
     if "volume_ratio" in features and len(df) >= 20:
         volume_ma = df["volume"].rolling(window=20).mean()
         result_df[prefix + "volume_ratio"] = df["volume"] / volume_ma
-
+    
     # 5분봉 특화 피처
-    if tf == "5m":
+    if tf == "5min":
         if "rsi_mean_6" in features and prefix + "rsi" in result_df.columns:
             result_df[prefix + "rsi_mean_6"] = result_df[prefix + "rsi"].rolling(6).mean()
         if "rsi_std_6" in features and prefix + "rsi" in result_df.columns:
@@ -166,23 +157,8 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
             result_df[prefix + "macd_slope_6"] = result_df[prefix + "macd"].diff().rolling(6).mean()
         if "stochk_range_6" in features and prefix + "stochastic_k" in result_df.columns:
             result_df[prefix + "stochk_range_6"] = result_df[prefix + "stochastic_k"].rolling(6).apply(lambda x: x.max() - x.min(), raw=True)
-
+    
     return result_df
-
-def resample_to_15m_base(df: pd.DataFrame, tf: str, target_start: str) -> pd.DataFrame:
-    """타임프레임을 15분봉 기준으로 리샘플링"""
-    target_start_dt = pd.to_datetime(target_start, utc=True)
-    
-    if tf == "5m":
-        resampled = df[df.index >= target_start_dt]
-    elif tf == "30m":
-        resampled = df.resample('15min').ffill()
-    elif tf == "1h":
-        resampled = df.resample('15min').ffill()
-    else:
-        resampled = df
-    
-    return resampled[resampled.index >= target_start_dt]
 
 def fetch_btc_historical_features(start_date: str, end_date: str, interval: str = "1h") -> pd.DataFrame:
     """BTC 피처 수집"""
@@ -221,59 +197,56 @@ def fetch_btc_historical_features(start_date: str, end_date: str, interval: str 
     btc_features["btc_sideways"] = ((btc_features["btc_uptrend"] + btc_features["btc_downtrend"] + 
                                     btc_features["btc_recovery"] + btc_features["btc_correction"]) == 0).astype(float)
     
-    btc_features = btc_features.fillna(0)
-    
-    # 15분봉 인덱스 생성
-    target_start_dt = pd.to_datetime(start_date, utc=True)
-    end_dt = btc_features.index.max()
-    full_15m_index = pd.date_range(start=target_start_dt, end=end_dt, freq='15min')
-    
-    btc_15m = pd.DataFrame(index=full_15m_index, columns=btc_features.columns)
-    interval_minutes = 60 if interval == "1h" else int(interval.rstrip("m"))
-    mask = btc_15m.index.minute % interval_minutes == 0
-    btc_15m.loc[mask] = btc_features.reindex(btc_15m.index[mask]).values
-    
-    return btc_15m[btc_15m.index >= target_start_dt]
+    return btc_features.fillna(0)
 
-def collect_all_market_data() -> pd.DataFrame:
-    """전체 마켓 데이터 수집 및 병합"""
-    # 1. 15분봉 ETH 데이터 기준
-    eth_15m_df = fetch_ohlcv_with_extended_period("ETHUSDT", "15m", START_DATE, END_DATE)
-    eth_15m_indicators = add_indicators_with_validation(eth_15m_df, "15m")
+def collect_all_market_data() -> dict:
+    """전체 마켓 데이터 수집 - MTF 독립 구조"""
+    result = {}
     
-    target_start_dt = pd.to_datetime(START_DATE, utc=True)
-    base_df = eth_15m_indicators[eth_15m_indicators.index >= target_start_dt].copy()
-    
-    # 2. 다른 타임프레임 ETH 데이터 병합
-    other_timeframes = [tf for tf in TIMEFRAMES if tf != "15m"]
-
-    for tf in other_timeframes:
-        eth_tf_df = fetch_ohlcv_with_extended_period("ETHUSDT", tf, START_DATE, END_DATE)
-        eth_tf_indicators = add_indicators_with_validation(eth_tf_df, tf)
+    # 1. 각 타임프레임별 ETH 데이터 독립 수집
+    for tf in TIMEFRAMES:
+        print(f"[수집] {tf} 타임프레임 데이터...")
+        interval = BINANCE_INTERVAL_MAP[tf]
+        eth_df = fetch_ohlcv_with_extended_period(FUTURES_SYMBOL, interval, START_DATE, END_DATE)
+        eth_indicators = add_indicators_with_validation(eth_df, tf)
         
-        if tf == "5m":
-            eth_tf_15m = eth_tf_indicators[eth_tf_indicators.index >= target_start_dt]
-        else:
-            eth_tf_15m = resample_to_15m_base(eth_tf_indicators, tf, START_DATE)
+        # 시작 날짜부터 필터링
+        target_start_dt = pd.to_datetime(START_DATE, utc=True)
+        result[tf] = eth_indicators[eth_indicators.index >= target_start_dt].copy()
         
-        base_df = base_df.join(eth_tf_15m, how='left')
+        print(f"[완료] {tf}: {len(result[tf])} rows, {len(result[tf].columns)} features")
     
-    # 3. BTC 피처 병합
+    # 2. BTC 피처 독립 수집
+    print("[수집] BTC 피처...")
     btc_df = fetch_btc_historical_features(START_DATE, END_DATE)
-    base_df = base_df.join(btc_df, how='left')
+    result["btc"] = btc_df.copy()
+    print(f"[완료] BTC: {len(result['btc'])} rows, {len(result['btc'].columns)} features")
     
-    # 4. DUNE 온체인 데이터 병합
+    # 3. DUNE 온체인 데이터 독립 수집
+    print("[수집] DUNE 온체인 데이터...")
     dune_df = collect_all_dune_data()
     if not dune_df.empty:
-        base_df = base_df.join(dune_df, how='left')
+        result["dune"] = dune_df.copy()
+        print(f"[완료] DUNE: {len(result['dune'])} rows, {len(result['dune'].columns)} features")
+    else:
+        result["dune"] = pd.DataFrame()
+        print("[경고] DUNE 데이터 수집 실패")
     
-    # 5. 저장
-    save_path = os.path.join(PROJECT_ROOT, RAW_DATA_PATH)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    base_df.to_csv(save_path)
+    # 4. 선택적 저장 (딕셔너리 구조 유지)
+    save_dir = os.path.dirname(os.path.join(PROJECT_ROOT, RAW_DATA_PATH))
+    os.makedirs(save_dir, exist_ok=True)
     
-    print(f"[✅ 수집 완료] 행: {len(base_df)}, 컬럼: {len(base_df.columns)}")
-    return base_df
+    # 각 타임프레임별로 개별 저장
+    for key, df in result.items():
+        if not df.empty:
+            save_path = os.path.join(save_dir, f"market_data_{key}.pkl")
+            df.to_pickle(save_path)
+            print(f"[저장] {key}: {save_path}")
+    
+    total_features = sum(len(df.columns) for df in result.values() if not df.empty)
+    print(f"[✅ 수집 완료] 총 {len(result)} 타임프레임, 총 {total_features} 피처")
+    
+    return result
 
 if __name__ == "__main__":
-    result_df = collect_all_market_data()
+    result_dict = collect_all_market_data()

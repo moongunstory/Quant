@@ -3,10 +3,9 @@ import pandas as pd
 import re
 import requests
 import json
+import numpy as np
 from datetime import timedelta
 from binance.client import Client
-from dotenv import load_dotenv
-
 from modules.config import (
     BINANCE_API_KEY,
     BINANCE_SECRET_KEY,
@@ -17,6 +16,7 @@ from modules.config import (
     CACHE_DIR,
     ONCHAIN_CACHE_DIR,
     TZ,
+    FEATURE_CATEGORIES_BY_TF,
 )
 
 from modules.training.data_preparation.collector import fetch_btc_historical_features
@@ -31,7 +31,7 @@ def fetch_ohlcv_from_binance(symbol, tf, now, count):
     klines = client.futures_klines(
         symbol=symbol,
         interval=api_tf,
-        limit=count  # 가장 최근 count개만 요청
+        limit=count
     )
 
     if not klines:
@@ -73,11 +73,9 @@ def update_cache(symbol, tf, new_df, cache_dir, max_len):
         if old_df.index.tz is None:
             old_df.index = old_df.index.tz_localize("UTC")
 
-        # 최신성 비교
         old_max = old_df.index.max()
         new_max = new_df.index.max()
 
-        # 기준: old가 new보다 1 interval 이상 과거면 버린다
         tf_minutes = int(re.findall(r"\d+", tf)[0]) if "min" in tf else int(re.findall(r"\d+", tf)[0]) * 60
         max_allowed_delay = pd.Timedelta(minutes=tf_minutes)
         
@@ -121,31 +119,74 @@ def fetch_latest_dune_row():
 def add_indicators_for_live(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     from ta.momentum import RSIIndicator, StochasticOscillator
     from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator
+    from ta.volume import OnBalanceVolumeIndicator
+    from ta.volatility import AverageTrueRange
+    from ta.trend import CCIIndicator
     
     df = df.copy()
     
     if 'close' not in df.columns or df['close'].isna().all():
         return pd.DataFrame()
 
-    prefix = f"{tf}_" if tf != "5min" else ""
-
-    df[f"{prefix}rsi"] = RSIIndicator(df['close']).rsi()
-    df[f"{prefix}stoch_k"] = StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+    # Get features for this timeframe from config
+    features = FEATURE_CATEGORIES_BY_TF.get(tf, [])
     
-    macd = MACD(df['close'])
-    df[f"{prefix}macd"] = macd.macd()
-    df[f"{prefix}macd_signal"] = macd.macd_signal()
+    # Calculate indicators based on required features
+    if "rsi" in features:
+        df["rsi"] = RSIIndicator(df['close']).rsi()
     
-    df[f"{prefix}ema_20"] = EMAIndicator(df['close'], window=20).ema_indicator()
-    sma_col = f"{prefix}sma_50"
-    df[sma_col] = SMAIndicator(df['close'], window=50).sma_indicator()
-    df[f"{prefix}adx"] = ADXIndicator(df['high'], df['low'], df['close']).adx()
-    print(
-        f"[DEBUG] {sma_col} NaNs: {df[sma_col].isna().sum()} / Valid: {df[sma_col].notna().sum()}"
-    )
+    if "stochastic_k" in features:
+        df["stochastic_k"] = StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+    
+    if "cci" in features:
+        df["cci"] = CCIIndicator(df['high'], df['low'], df['close']).cci()
+    
+    if any(feat in features for feat in ["roc", "mom"]):
+        df["roc"] = df['close'].pct_change(periods=10) * 100
+        df["mom"] = df['close'] - df['close'].shift(10)
+    
+    if any(feat in features for feat in ["macd", "macd_signal", "macd_histogram"]):
+        macd = MACD(df['close'])
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        df["macd_histogram"] = macd.macd_diff()
+    
+    if "ema_20" in features:
+        df["ema_20"] = EMAIndicator(df['close'], window=20).ema_indicator()
+    
+    if "ema_50" in features:
+        df["ema_50"] = EMAIndicator(df['close'], window=50).ema_indicator()
+    
+    if "sma_20" in features:
+        df["sma_20"] = SMAIndicator(df['close'], window=20).sma_indicator()
+    
+    if "sma_50" in features:
+        df["sma_50"] = SMAIndicator(df['close'], window=50).sma_indicator()
+    
+    if "adx" in features:
+        df["adx"] = ADXIndicator(df['high'], df['low'], df['close']).adx()
+    
+    if "atr" in features:
+        df["atr"] = AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+    
+    if "obv" in features:
+        df["obv"] = OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
+    
+    if "volume_ratio" in features:
+        df["volume_ratio"] = df['volume'] / df['volume'].rolling(20).mean()
+    
+    # 5min specific features
+    if tf == "5min":
+        if "rsi_mean_6" in features:
+            df["rsi_mean_6"] = df["rsi"].rolling(6).mean()
+        if "rsi_std_6" in features:
+            df["rsi_std_6"] = df["rsi"].rolling(6).std()
+        if "macd_slope_6" in features:
+            df["macd_slope_6"] = df["macd"].diff().rolling(6).mean()
+        if "stochk_range_6" in features:
+            df["stochk_range_6"] = df["stochastic_k"].rolling(6).max() - df["stochastic_k"].rolling(6).min()
     
     df = df.ffill().bfill()
-    
     return df
 
 
@@ -193,14 +234,6 @@ class RealTimeDataCollector:
 
         return dune_latest
 
-    def get_recent_market_df(self, tf="5m", seq_len=32, horizon=4):
-        count = seq_len + horizon
-        df = fetch_ohlcv_from_binance(self.symbol, tf, self.now, count)
-        if df is None or df.empty or len(df) < count:
-            raise ValueError(f"📉 {tf} 캔들 수 부족: {len(df)} < {count}")
-
-        return df.iloc[-count:]
-
     def refresh_caches(self):
         print("[디버그] 🔄 캐시 새로고침 중...")
         for tf in TIMEFRAMES:
@@ -208,109 +241,83 @@ class RealTimeDataCollector:
             if not new_df.empty:
                 update_cache(self.symbol, tf, new_df, self.cache_dir, REQUIRED_CANDLE_COUNTS[tf])
 
+    def _load_timeframe_data(self, tf, seq_len):
+        """Load and process individual timeframe data without merging"""
+        path = os.path.join(self.cache_dir, f"{self.symbol}_{tf}.pkl")
+        if not os.path.exists(path):
+            print(f"🚨 {tf} 캐시 누락: {path}")
+            return None
+
+        df = pd.read_pickle(path).sort_index()
+        df = add_indicators_for_live(df, tf)
+        
+        if df.empty:
+            print(f"🚨 {tf} 지표 생성 실패")
+            return None
+
+        # Get only the features defined for this timeframe
+        features = FEATURE_CATEGORIES_BY_TF.get(tf, [])
+        available_features = [col for col in features if col in df.columns]
+        
+        if not available_features:
+            print(f"🚨 {tf} 유효한 피처가 없음")
+            return None
+
+        df_features = df[available_features]
+        
+        # Return last seq_len rows
+        return df_features.iloc[-seq_len:] if len(df_features) >= seq_len else df_features
+
+    def _validate_timeframe_data(self, df_dict):
+        """Simple validation - check for NaN values only"""
+        for tf, df in df_dict.items():
+            if df is None:
+                print(f"🚨 {tf} 데이터가 None입니다")
+                return False
+            if df.isna().any().any():
+                print(f"🚨 {tf} 결측값 발견")
+                return False
+        return True
+
     def run(self, seq_len=32, auto_refresh_cache=False):
+        """
+        Returns Dict[str, np.ndarray] with independent timeframe sequences
+        Keys: "5min", "15min", "30min", "1H", "btc", "dune"
+        """
         print(f"[디버그] 🕒 추론 기준 시간: {self.now}")
         
         self.now = pd.Timestamp.utcnow().floor("30min") - pd.Timedelta(minutes=1)
-        unified_ts = self.now.floor("5min")
 
         if auto_refresh_cache:
             self.refresh_caches()
 
-        # 1. 5분봉 기준 로드
-        path_5m = os.path.join(self.cache_dir, "ETHUSDT_5min.pkl")
-        if not os.path.exists(path_5m):
-            print(f"🚨 5분봉 캐시 누락: {path_5m}")
-            return None
-
-        df_5m = pd.read_pickle(path_5m).sort_index()
-        df_5m = add_indicators_for_live(df_5m, "5min")
-        df_5m = df_5m.loc[df_5m.index <= unified_ts].iloc[-seq_len:]
-
-        if len(df_5m) < seq_len:
-            print(f"🚨 5분봉 시퀀스 부족: {len(df_5m)} < {seq_len}")
-            return None
-
-        base_df = df_5m.copy()
-
-        # 2. 멀티 타임프레임 병합
-        for tf in ["15min", "30min", "1H"]:
-            path_tf = os.path.join(self.cache_dir, f"ETHUSDT_{tf}.pkl")
-            if not os.path.exists(path_tf):
-                print(f"🚨 {tf} 캐시 누락: {path_tf}")
-                return None
-
-            df_tf = pd.read_pickle(path_tf).sort_index()
-            
-            # ✅ 지표 계산용 close 길이 확인
-            if "close" in df_tf:
-                close_len = df_tf["close"].dropna().shape[0]
-                print(f"[DEBUG] {tf} close 값 수: {close_len}")
-            else:
-                print(f"[WARN] {tf} → close 컬럼 없음")
-
-            df_tf = add_indicators_for_live(df_tf, tf)
-            if df_tf.empty:
-                print(f"🚨 {tf} 보조 지표 생성 실패 → 건너뜀")
-                continue
-
-            # ✅ 유효값 없는 지표 제거
-            for col in df_tf.columns:
-                if df_tf[col].notna().sum() == 0:
-                    print(f"[INFO] {tf} → {col} 전부 NaN → 병합 제외")
-                    df_tf.drop(columns=col, inplace=True)
-
-            # ✅ 중복 컬럼 제거 (OHLCV)
-            for col in ["open", "high", "low", "close", "volume"]:
-                if col in df_tf.columns:
-                    df_tf.drop(columns=col, inplace=True)
-
-            # 병합
-            before_cols = set(base_df.columns)
-            base_df = base_df.merge(df_tf, left_index=True, right_index=True, how="left")
-            after_cols = set(base_df.columns)
-
-            added = list(after_cols - before_cols)
-            print(f"[DEBUG] {tf} 병합 피처 수: {len(added)} | {added[:3]}...")
-            base_df = base_df.ffill()
-
-        # 3. BTC 및 Dune 피처 추가
-        btc_row = self.collect_btc_features().iloc[0]
-        dune_row = self.collect_dune_features().iloc[0]
+        # Load individual timeframe data
+        tf_data = {}
+        for tf in TIMEFRAMES:
+            tf_data[tf] = self._load_timeframe_data(tf, seq_len)
         
-        for col in btc_row.index:
-            if col not in base_df.columns:
-                base_df[col] = btc_row[col]
-        for col in dune_row.index:
-            if col not in base_df.columns:
-                base_df[col] = dune_row[col]
-
-        # 4. 피처 검증
-        total_cols = len(base_df.columns)
-        unique_cols = len(set(base_df.columns))
-        print(f"[디버그] 전체 피처: {total_cols}, 고유 피처: {unique_cols}")
-
-        duplicates = base_df.columns[base_df.columns.duplicated()].tolist()
-        if duplicates:
-            print(f"🚨 중복 피처명: {duplicates}")
-            base_df = base_df.loc[:, ~base_df.columns.duplicated(keep='last')]
-
-        # 5. 피처 순서 검증
-        try:
-            with open("trained_feature_order.json") as f:
-                trained_order = json.load(f)
-                current_order = base_df.columns.tolist()
-                if current_order != trained_order:
-                    print("🚨 피처 순서 불일치 → 재정렬 시도")
-                    base_df = base_df[trained_order]
-        except:
-            print("⚠️ 피처 순서 검증 실패")
-
-        # 6. 결측값 체크
-        if base_df.isna().any().any():
-            print("🚨 결측값 발견 → 건너뛰기")
-            print(base_df.isna().sum()[base_df.isna().sum() > 0])
+        # Validate timeframe data
+        if not self._validate_timeframe_data(tf_data):
             return None
 
-        print(f"[디버그] ✅ 최종 상태 형태: {base_df.shape}")
-        return base_df
+        # Collect external features
+        try:
+            btc_row = self.collect_btc_features().iloc[0]
+            dune_row = self.collect_dune_features().iloc[0]
+        except Exception as e:
+            print(f"🚨 외부 피처 수집 실패: {e}")
+            return None
+
+        print(f"[디버그] ✅ MTF 데이터 수집 완료")
+        
+        # Return dictionary with independent sequences
+        result = {}
+        for tf in TIMEFRAMES:
+            # Map timeframe names to match expected output format
+            output_key = "5m" if tf == "5min" else tf
+            result[output_key] = tf_data[tf].values.astype(np.float32)
+        
+        result["btc"] = btc_row.values.astype(np.float32)
+        result["dune"] = dune_row.values.astype(np.float32)
+
+        return result
