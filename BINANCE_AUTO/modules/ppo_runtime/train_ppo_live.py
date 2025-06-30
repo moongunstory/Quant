@@ -8,7 +8,7 @@ from modules.training.ppo.core.model import PPOPolicyNetwork
 from modules.training.ppo.core.core import (
     compute_ppo_loss, compute_value_loss, compute_explained_variance
 )
-from config import TIMEFRAMES  # Import timeframes configuration
+from modules.config import TIMEFRAMES  # Import timeframes configuration
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -46,9 +46,9 @@ def train_ppo_live(
 
     # Initialize model with appropriate input configuration
     if input_dims is not None:
-        model = PPOPolicyNetwork(input_dims=input_dims, hidden_dim=256).to(device)
+        model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=256).to(device)
     else:
-        model = PPOPolicyNetwork(input_dim=input_dim, hidden_dim=256).to(device)
+        model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=256).to(device)
     
     model.load_model(imitation_model_path)
     logger.info("📦 모방 학습 모델 로드 완료")
