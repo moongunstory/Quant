@@ -90,6 +90,14 @@ PPO_INPUT_DIM = 61  # 실전 피처 수 기준
 
 SEQ_LEN = 32
 
+# PPO 모델 공통 설정
+WINDOW_SIZE = 32
+HIDDEN_DIM = 128         # LSTM hidden state 크기
+ACTION_DIM = 2           # 행동 공간 (예: HOLD, ENTER)
+LEARNING_RATE = 0.0005   # 학습률
+EPOCHS = 10              # 학습 epoch 수
+BATCH_SIZE = 64          # 배치 사이즈
+
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
     "15min": [
