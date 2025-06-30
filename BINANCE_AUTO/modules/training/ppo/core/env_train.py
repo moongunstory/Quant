@@ -14,7 +14,7 @@ from modules.config import (
 
 class PPOTradingEnv:
     def __init__(self, data_path: str, direction: str = "long", seq_len: int = 32,
-                 reference_timeframe: str = "15min", hold_reward: float = 0.01):
+                reference_timeframe: str = "15min", hold_reward: float = 0.001):
         """
         MTF PPO Trading Environment
         
@@ -265,11 +265,11 @@ class PPOTradingEnv:
                 if hit_tp:
                     reward = 1.0
                 elif sl_hit:
-                    reward = -0.5
+                    reward = -1.0
                 else:
-                    reward = self.hold_reward
+                    reward = self.hold_reward * 0.1
             else:
-                reward = self.hold_reward
+                reward = self.hold_reward * 0.1
 
         # Move to next state
         self.ptr += 1

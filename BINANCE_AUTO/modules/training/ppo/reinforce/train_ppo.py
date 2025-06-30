@@ -147,7 +147,7 @@ def train_ppo(
             obs_tensor = convert_obs_to_tensor(obs, device)
             
             action, log_prob, value, _ = model.get_action(obs_tensor)
-            env_action = 1 if action.item() == 0 else 0  # 0→enter, 1→hold
+            env_action = action.item()  # 액션 그대로 전달
             next_obs, reward, done, _ = env.step(env_action)
 
             # MTF 관찰값을 CPU로 이동하여 버퍼에 저장
@@ -212,7 +212,7 @@ def train_ppo(
             old_logprob_batch = old_logprob_batch.to(device)
 
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
-            entropy = torch.clamp(entropy, min=0.01)
+            entropy = torch.clamp(entropy, min=0.005, max=2.0)  # 최대값도 제한
             policy_loss = compute_ppo_loss(log_probs, old_logprob_batch, adv_batch, clip_eps)
             value_loss = compute_value_loss(values, return_batch)
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
