@@ -5,7 +5,7 @@ import sys
 import joblib
 import lightgbm as lgb
 import optuna
-from sklearn.model_selection import TimeSeriesSplit
+import bisect
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 from typing import Dict, Tuple, List
 
@@ -68,65 +68,64 @@ def filter_features_by_timeframe(df: pd.DataFrame, timeframe: str) -> List[str]:
     return filtered_features
 
 def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame], 
-                        target_index: pd.DatetimeIndex) -> Dict[str, np.ndarray]:
-    """MTF 시퀀스 데이터 생성 (PPO와 동일한 방식)"""
+                         target_index: pd.DatetimeIndex) -> Tuple[Dict[str, np.ndarray], List[pd.Timestamp]]:
+    """MTF 시퀀스 데이터 생성 (고속/저메모리 최적화)"""
     mtf_sequences = {}
-    
+    final_valid_indices = None  # 공통으로 존재하는 인덱스만 유지
+
     for timeframe in TIMEFRAMES:
         if timeframe not in mtf_data:
             print(f"[경고] {timeframe} 데이터가 없습니다.")
             continue
-        
+
         df = mtf_data[timeframe].copy()
-        
-        # 타임프레임별 피처 필터링
+
+        # 피처 선택 및 전처리
         feature_cols = filter_features_by_timeframe(df, timeframe)
-        df_features = df[feature_cols]
-        
-        # NaN 처리
-        df_features = df_features.ffill().fillna(0)
-        
+        df = df[feature_cols].ffill().fillna(0)
+
         print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {SEQ_LEN}")
-        
-        # 시퀀스 생성
+
+        # 미리 인덱스 및 값 추출
+        index_list = df.index.to_list()
+        values = df.values
         sequences = []
         valid_indices = []
-        
-        for target_time in target_index:
-            # 시퀀스 종료 시점을 target_time으로 설정
-            end_time = pd.Timestamp(target_time)
 
-            # 인덱스 타입 일치 보장
-            if df_features.index.tz is None:
-                end_time = end_time.tz_localize(None)
+        for t in target_index:
+            if df.index.tz is not None:
+                t = t.tz_convert(df.index.tz)
             else:
-                end_time = end_time.tz_convert(df_features.index.tz)
+                t = t.tz_localize(None)
 
-            # 해당 시점 이전의 SEQ_LEN개 데이터 추출
-            available_data = df_features[df_features.index <= end_time]
-  
-            if len(available_data) >= SEQ_LEN:
-                sequence = available_data.iloc[-SEQ_LEN:].values  # 마지막 SEQ_LEN개
-                sequences.append(sequence)
-                valid_indices.append(target_time)
-            else:
-                # 데이터가 부족한 경우 패딩
-                padding_needed = SEQ_LEN - len(available_data)
-                if len(available_data) > 0:
-                    padded_sequence = np.vstack([
-                        np.zeros((padding_needed, len(feature_cols))),
-                        available_data.values
-                    ])
-                    sequences.append(padded_sequence)
-                    valid_indices.append(target_time)
-        
+            pos = bisect.bisect_right(index_list, t)
+
+            if pos >= SEQ_LEN:
+                seq = values[pos - SEQ_LEN:pos]
+                sequences.append(seq)
+                valid_indices.append(index_list[pos - 1])
+            elif pos > 0:
+                pad_len = SEQ_LEN - pos
+                padded = np.vstack([
+                    np.zeros((pad_len, values.shape[1])),
+                    values[:pos]
+                ])
+                sequences.append(padded)
+                valid_indices.append(index_list[pos - 1])
+            # else: 데이터가 하나도 없는 경우 무시
+
         if sequences:
-            mtf_sequences[timeframe] = np.array(sequences)  # Shape: (N, SEQ_LEN, features)
+            mtf_sequences[timeframe] = np.array(sequences)
             print(f"[✅ {timeframe}] 시퀀스 생성 완료: {mtf_sequences[timeframe].shape}")
+
+            if final_valid_indices is None:
+                final_valid_indices = valid_indices
+            else:
+                final_valid_indices = list(set(final_valid_indices) & set(valid_indices))
         else:
             print(f"[❌ {timeframe}] 유효한 시퀀스가 없습니다.")
-    
-    return mtf_sequences, valid_indices
+
+    return mtf_sequences, sorted(final_valid_indices)
 
 def flatten_mtf_sequences(mtf_sequences: Dict[str, np.ndarray]) -> np.ndarray:
     """MTF 시퀀스를 LGBM용 평면 피처로 변환"""
