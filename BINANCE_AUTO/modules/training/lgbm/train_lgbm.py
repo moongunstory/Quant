@@ -5,8 +5,9 @@ import sys
 import joblib
 import lightgbm as lgb
 import optuna
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
+from typing import Dict, Tuple, List
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,46 +15,166 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
 
 sys.path.append(PROJECT_ROOT)
 
-from modules.config import TRAIN_LABEL_PATHS, LGBM_THRESHOLD, LGBM_MODEL_PATHS
+from modules.config import (
+    TRAIN_LABEL_PATHS, 
+    LGBM_THRESHOLD, 
+    LGBM_MODEL_PATHS,
+    TIMEFRAMES,
+    FEATURE_CATEGORIES_BY_TF,
+    SEQ_LEN,
+    RAW_DATA_PATH
+)
 
-def load_data(data_type="long"):
-    """Long/Short 이진분류 데이터 로딩"""
-    if data_type == "long":
-        data_path = TRAIN_LABEL_PATHS["long"]
-    else:  # short
-        data_path = TRAIN_LABEL_PATHS["short"]
+def load_mtf_data() -> Dict[str, pd.DataFrame]:
+    """MTF 개별 pickle 파일들을 로드"""
+    save_dir = os.path.dirname(os.path.join(PROJECT_ROOT, RAW_DATA_PATH))
+    mtf_data = {}
     
+    # 각 타임프레임 + BTC/DUNE 데이터 로드
+    data_keys = TIMEFRAMES + ["btc", "dune"]
+    
+    for key in data_keys:
+        file_path = os.path.join(save_dir, f"market_data_{key}.pkl")
+        if os.path.exists(file_path):
+            df = pd.read_pickle(file_path)
+            mtf_data[key] = df
+            print(f"[로드] {key}: {len(df)} rows, {len(df.columns)} columns")
+        else:
+            print(f"[경고] {key} 파일 없음: {file_path}")
+    
+    return mtf_data
+
+def load_labeled_data(data_type: str = "long") -> pd.DataFrame:
+    """Long/Short 이진분류 데이터 로딩"""
+    data_path = TRAIN_LABEL_PATHS[data_type]
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
-    print(f"[📊 {data_type.upper()} 데이터 로딩 완료] 행: {len(df)}, 컬럼: {len(df.columns)}")
+    print(f"[📊 {data_type.upper()} 라벨 데이터 로딩 완료] 행: {len(df)}, 컬럼: {len(df.columns)}")
     return df
 
-def generate_flatten_features(df, window=32):
-    print(f"[🔄 Flatten 피처 생성 시작] window={window}")
-
-    # ✅ 결측값 먼저 채우기 (ffill)
-    df = df.ffill()
-
-    # ✅ 미래 정보 포함 가능성 있는 열 제거
+def filter_features_by_timeframe(df: pd.DataFrame, timeframe: str) -> List[str]:
+    """타임프레임별 피처 필터링"""
+    if timeframe in FEATURE_CATEGORIES_BY_TF:
+        allowed_features = FEATURE_CATEGORIES_BY_TF[timeframe]
+        available_features = [col for col in df.columns if any(feat in col for feat in allowed_features)]
+    else:
+        # 모든 피처 사용 (타임프레임별 카테고리가 정의되지 않은 경우)
+        available_features = df.columns.tolist()
+    
+    # 미래 정보 제거
     future_keywords = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
-    feature_cols = [col for col in df.columns if not any(keyword in col.lower() for keyword in future_keywords)]
+    filtered_features = [col for col in available_features 
+                        if not any(keyword in col.lower() for keyword in future_keywords)]
+    
+    return filtered_features
 
-    flatten_dfs = []
-    for col in feature_cols:
-        for i in range(window):  # 0부터 시작
-            shifted_col = df[col].shift(i + 1)  # ✅ t-1 ~ t-32 로 변경
-            new_col_name = f"{col}_t-{i+1}"     # ✅ 이름도 시점 반영
-            flatten_dfs.append(shifted_col.rename(new_col_name))
+def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame], 
+                        target_index: pd.DatetimeIndex) -> Dict[str, np.ndarray]:
+    """MTF 시퀀스 데이터 생성 (PPO와 동일한 방식)"""
+    mtf_sequences = {}
+    
+    for timeframe in TIMEFRAMES:
+        if timeframe not in mtf_data:
+            print(f"[경고] {timeframe} 데이터가 없습니다.")
+            continue
+        
+        df = mtf_data[timeframe].copy()
+        
+        # 타임프레임별 피처 필터링
+        feature_cols = filter_features_by_timeframe(df, timeframe)
+        df_features = df[feature_cols]
+        
+        # NaN 처리
+        df_features = df_features.ffill().fillna(0)
+        
+        print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {SEQ_LEN}")
+        
+        # 시퀀스 생성
+        sequences = []
+        valid_indices = []
+        
+        for target_time in target_index:
+            # 시퀀스 종료 시점을 target_time으로 설정
+            end_time = target_time
+            
+            # 해당 시점 이전의 SEQ_LEN개 데이터 추출
+            available_data = df_features[df_features.index <= end_time]
+            
+            if len(available_data) >= SEQ_LEN:
+                sequence = available_data.iloc[-SEQ_LEN:].values  # 마지막 SEQ_LEN개
+                sequences.append(sequence)
+                valid_indices.append(target_time)
+            else:
+                # 데이터가 부족한 경우 패딩
+                padding_needed = SEQ_LEN - len(available_data)
+                if len(available_data) > 0:
+                    padded_sequence = np.vstack([
+                        np.zeros((padding_needed, len(feature_cols))),
+                        available_data.values
+                    ])
+                    sequences.append(padded_sequence)
+                    valid_indices.append(target_time)
+        
+        if sequences:
+            mtf_sequences[timeframe] = np.array(sequences)  # Shape: (N, SEQ_LEN, features)
+            print(f"[✅ {timeframe}] 시퀀스 생성 완료: {mtf_sequences[timeframe].shape}")
+        else:
+            print(f"[❌ {timeframe}] 유효한 시퀀스가 없습니다.")
+    
+    return mtf_sequences, valid_indices
 
-    X_flatten = pd.concat(flatten_dfs, axis=1)
-    X_flatten = X_flatten.dropna()
+def flatten_mtf_sequences(mtf_sequences: Dict[str, np.ndarray]) -> np.ndarray:
+    """MTF 시퀀스를 LGBM용 평면 피처로 변환"""
+    flattened_features = []
+    feature_names = []
+    
+    for timeframe in TIMEFRAMES:
+        if timeframe not in mtf_sequences:
+            continue
+        
+        sequences = mtf_sequences[timeframe]  # Shape: (N, SEQ_LEN, features)
+        n_samples, seq_len, n_features = sequences.shape
+        
+        # 시퀀스를 평면화 (각 타임스텝과 피처를 별도 컬럼으로)
+        flat_data = sequences.reshape(n_samples, -1)  # Shape: (N, SEQ_LEN * features)
+        flattened_features.append(flat_data)
+        
+        # 피처명 생성
+        for t in range(seq_len):
+            for f in range(n_features):
+                feature_names.append(f"{timeframe}_t{t}_f{f}")
+    
+    if flattened_features:
+        X_flat = np.concatenate(flattened_features, axis=1)
+        print(f"[🔄 MTF 평면화 완료] Shape: {X_flat.shape}, 피처 수: {len(feature_names)}")
+        return X_flat, feature_names
+    else:
+        raise ValueError("평면화할 MTF 시퀀스가 없습니다.")
 
-    print(f"  - Flatten 후 피처 수: {len(X_flatten.columns)}개")
-    print(f"  - Flatten 후 데이터 행: {len(X_flatten)}개")
-    print(f"  - 피처명 예시: {X_flatten.columns[:5].tolist()}")
+def create_time_based_split(X: np.ndarray, y: np.ndarray, 
+                           timestamps: pd.DatetimeIndex, 
+                           train_ratio: float = 0.8) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """시간 기반 train/validation 분할 (셔플 금지)"""
+    n_samples = len(X)
+    train_size = int(n_samples * train_ratio)
+    
+    # 시간 순서를 유지하며 분할
+    X_train = X[:train_size]
+    X_val = X[train_size:]
+    y_train = y[:train_size]
+    y_val = y[train_size:]
+    
+    train_period = f"{timestamps[0].strftime('%Y-%m-%d')} ~ {timestamps[train_size-1].strftime('%Y-%m-%d')}"
+    val_period = f"{timestamps[train_size].strftime('%Y-%m-%d')} ~ {timestamps[-1].strftime('%Y-%m-%d')}"
+    
+    print(f"[📊 시간 기반 분할]")
+    print(f"  - 훈련: {len(X_train)}개 ({train_period})")
+    print(f"  - 검증: {len(X_val)}개 ({val_period})")
+    
+    return X_train, X_val, y_train, y_val
 
-    return X_flatten
-
-def optimize_model(X_train, y_train, X_val, y_val, data_type="long"):
+def optimize_model(X_train: np.ndarray, y_train: np.ndarray, 
+                  X_val: np.ndarray, y_val: np.ndarray, 
+                  data_type: str = "long") -> Tuple:
     """Optuna 하이퍼파라미터 최적화"""
     print(f"[🔧 {data_type.upper()} 하이퍼파라미터 최적화 시작] (threshold={LGBM_THRESHOLD} 고정)")
     
@@ -64,10 +185,13 @@ def optimize_model(X_train, y_train, X_val, y_val, data_type="long"):
             "objective": "binary",
             "boosting_type": "gbdt",
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05),
-            "num_leaves": trial.suggest_int("num_leaves", 8, 48),
-            "max_depth": trial.suggest_int("max_depth", 3, 7),
-            "min_child_samples": trial.suggest_int("min_child_samples", 40, 100),
-            "n_estimators": 1500,
+            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
+            "max_depth": trial.suggest_int("max_depth", 4, 10),
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.7, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.7, 1.0),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
+            "n_estimators": 2000,
             "random_state": 42,
             "class_weight": "balanced",
             "verbosity": -1,
@@ -78,7 +202,7 @@ def optimize_model(X_train, y_train, X_val, y_val, data_type="long"):
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             eval_metric="binary_logloss",
-            callbacks=[lgb.early_stopping(50, verbose=False)]
+            callbacks=[lgb.early_stopping(100, verbose=False)]
         )
         
         # 평가
@@ -103,27 +227,29 @@ def optimize_model(X_train, y_train, X_val, y_val, data_type="long"):
         return f1
     
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=100, show_progress_bar=False)
+    study.optimize(objective, n_trials=15, show_progress_bar=False)
     
     print(f"[✅ {data_type.upper()} 최적화 완료] 최고 F1: {study.best_value:.4f}")
     print(f"  최적 파라미터: {study.best_params}")
     
     return study, results
 
-def train_model(X_train, y_train, X_valid, y_valid, data_type="long", use_optuna=False):
-    """LGBM 모델 학습 (Optuna 옵션)"""
+def train_model(X_train: np.ndarray, y_train: np.ndarray, 
+               X_val: np.ndarray, y_val: np.ndarray, 
+               data_type: str = "long", use_optuna: bool = True) -> lgb.LGBMClassifier:
+    """LGBM 모델 학습"""
     if use_optuna:
         print(f"[🚀 {data_type.upper()} LGBM 모델 학습 시작] (Optuna 최적화 포함)")
         
         # Optuna 최적화
-        study, optuna_results = optimize_model(X_train, y_train, X_valid, y_valid, data_type)
+        study, optuna_results = optimize_model(X_train, y_train, X_val, y_val, data_type)
         
         # 최적 파라미터로 최종 모델 학습
         best_params = study.best_params
         best_params.update({
             "objective": "binary",
             "boosting_type": "gbdt", 
-            "n_estimators": 1500,
+            "n_estimators": 2000,
             "class_weight": "balanced",
             "random_state": 42,
             "verbosity": -1
@@ -135,8 +261,10 @@ def train_model(X_train, y_train, X_valid, y_valid, data_type="long", use_optuna
         print(f"[🚀 {data_type.upper()} LGBM 모델 학습 시작] (기본 파라미터)")
         
         model = lgb.LGBMClassifier(
-            n_estimators=100,
+            n_estimators=1000,
             learning_rate=0.05,
+            max_depth=6,
+            num_leaves=31,
             class_weight="balanced",
             random_state=42,
             verbosity=-1
@@ -144,28 +272,29 @@ def train_model(X_train, y_train, X_valid, y_valid, data_type="long", use_optuna
     
     model.fit(
         X_train, y_train,
-        eval_set=[(X_valid, y_valid)],
+        eval_set=[(X_val, y_val)],
         eval_metric="binary_logloss",
-        callbacks=[lgb.early_stopping(10, verbose=False)]
+        callbacks=[lgb.early_stopping(100, verbose=False)]
     )
     
     print(f"[✅ {data_type.upper()} 모델 학습 완료]")
     return model
 
-def evaluate_model(model, X_valid, y_valid, data_type="long"):
+def evaluate_model(model: lgb.LGBMClassifier, X_val: np.ndarray, y_val: np.ndarray, 
+                  data_type: str = "long") -> Dict:
     """모델 평가"""
     print(f"[🧪 {data_type.upper()} 모델 평가 중...]")
     
     # 확률 예측
-    y_prob = model.predict_proba(X_valid)[:, 1]
+    y_prob = model.predict_proba(X_val)[:, 1]
     
     # Threshold 기반 예측
     y_pred = (y_prob >= LGBM_THRESHOLD).astype(int)
     
     # 메트릭 계산
-    f1 = f1_score(y_valid, y_pred)
-    precision = precision_score(y_valid, y_pred, zero_division=0)
-    recall = recall_score(y_valid, y_pred, zero_division=0)
+    f1 = f1_score(y_val, y_pred)
+    precision = precision_score(y_val, y_pred, zero_division=0)
+    recall = recall_score(y_val, y_pred, zero_division=0)
     signal_rate = (y_prob >= LGBM_THRESHOLD).mean()
     
     signal_label = "Long" if data_type == "long" else "Short"
@@ -177,7 +306,7 @@ def evaluate_model(model, X_valid, y_valid, data_type="long"):
     print(f"  - 신호율: {signal_rate:.2%}")
     
     # 분류 리포트
-    report = classification_report(y_valid, y_pred, target_names=['Hold', signal_label])
+    report = classification_report(y_val, y_pred, target_names=['Hold', signal_label])
     print(f"[📋 {data_type.upper()} 분류 리포트]\n{report}")
     
     # 확률 분포 확인
@@ -194,86 +323,104 @@ def evaluate_model(model, X_valid, y_valid, data_type="long"):
         'signal_rate': signal_rate
     }
 
-def save_model(model, metrics, data_type="long"):
-    """모델만 저장 (메타데이터는 로그 출력)"""
+def save_model(model: lgb.LGBMClassifier, metrics: Dict, data_type: str = "long"):
+    """모델 저장"""
     model_path = LGBM_MODEL_PATHS[data_type]
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump(model, model_path)
 
     print(f"[💾 {data_type.upper()} 모델 저장 완료] {model_path}")
     
-    # 메타데이터는 로그로만 출력
+    # 메타데이터 로깅
     print(f"[📋 {data_type.upper()} 모델 메타데이터]")
     print(f"  - Threshold: {LGBM_THRESHOLD}")
     print(f"  - F1-Score: {metrics['f1']:.4f}")
     print(f"  - Precision: {metrics['precision']:.4f}")
     print(f"  - Recall: {metrics['recall']:.4f}")
     print(f"  - Signal Rate: {metrics['signal_rate']:.2%}")
+    print(f"  - Timeframes: {TIMEFRAMES}")
+    print(f"  - Sequence Length: {SEQ_LEN}")
 
-def show_feature_importance(model, feature_names, data_type="long"):
-    """피처 중요도 로그 출력"""
+def show_feature_importance(model: lgb.LGBMClassifier, feature_names: List[str], 
+                           data_type: str = "long", top_k: int = 20):
+    """피처 중요도 분석"""
     importance_df = pd.DataFrame({
         'feature': feature_names,
         'importance': model.feature_importances_
     }).sort_values('importance', ascending=False)
     
-    print(f"[🎯 {data_type.upper()} 상위 10개 중요 피처]")
-    for i, (_, row) in enumerate(importance_df.head(10).iterrows()):
+    print(f"[🎯 {data_type.upper()} 상위 {top_k}개 중요 피처]")
+    for i, (_, row) in enumerate(importance_df.head(top_k).iterrows()):
         print(f"  {i+1:2d}. {row['feature']}: {row['importance']:.4f}")
+    
+    # 타임프레임별 중요도 집계
+    tf_importance = {}
+    for tf in TIMEFRAMES:
+        tf_features = importance_df[importance_df['feature'].str.startswith(tf)]
+        tf_importance[tf] = tf_features['importance'].sum()
+    
+    print(f"\n[📊 {data_type.upper()} 타임프레임별 피처 중요도]")
+    for tf, importance in sorted(tf_importance.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {tf}: {importance:.4f}")
 
-def train_pipeline(data_type="long", use_optuna=True):
-    """LGBM 학습 파이프라인 (Long 또는 Short)"""
+def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
+    """MTF LGBM 학습 파이프라인"""
     print(f"\n{'='*60}")
-    print(f"🚀 {data_type.upper()} 모델 학습 시작")
-    print(f"🔧 Optuna 하이퍼파라미터 최적화 활성화")
+    print(f"🚀 {data_type.upper()} MTF LGBM 모델 학습 시작")
+    print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
+    print(f"📏 Sequence Length: {SEQ_LEN}")
     print(f"{'='*60}")
     
-    # 1. 데이터 로딩
-    df = load_data(data_type)
+    # 1. MTF 데이터 로딩
+    mtf_data = load_mtf_data()
     
-    # 2. Flatten 피처 생성 (NaN 처리 포함)
-    X = generate_flatten_features(df, window=32)
-    y = df.loc[X.index, 'label']
+    # 2. 라벨 데이터 로딩
+    labeled_df = load_labeled_data(data_type)
     
-    # 3. 피처 준비 완료 로그
-    print(f"[🔧 {data_type.upper()} 피처 준비 완료]")
-    print(f"  - 전체 피처 수: {len(X.columns)}개")
-    print(f"  - 피처 예시: {X.columns[:10].tolist()}")
-    print(f"  - 라벨 분포: {data_type}={sum(y)}, hold={len(y)-sum(y)}")
+    # 3. MTF 시퀀스 생성 (PPO와 동일한 방식)
+    mtf_sequences, valid_indices = create_mtf_sequences(mtf_data, labeled_df.index)
     
-    # 4. 데이터 분할
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X, y, 
-        test_size=0.2, 
-        stratify=y, 
-        random_state=42,
-        shuffle=True
+    # 4. 유효한 인덱스에 맞춰 라벨 정렬
+    valid_timestamps = pd.DatetimeIndex(valid_indices)
+    aligned_labels = labeled_df.loc[valid_timestamps, 'label'].values
+    
+    print(f"[🔧 {data_type.upper()} 데이터 정렬 완료]")
+    print(f"  - 유효 샘플 수: {len(aligned_labels)}")
+    print(f"  - 라벨 분포: {data_type}={sum(aligned_labels)}, hold={len(aligned_labels)-sum(aligned_labels)}")
+    
+    # 5. MTF 시퀀스를 LGBM용 평면 피처로 변환
+    X_flat, feature_names = flatten_mtf_sequences(mtf_sequences)
+    y = aligned_labels
+    
+    # 6. 시간 기반 train/validation 분할 (셔플 금지)
+    X_train, X_val, y_train, y_val = create_time_based_split(
+        X_flat, y, valid_timestamps, train_ratio=0.8
     )
     
-    print(f"[📊 {data_type.upper()} 데이터 분할] 학습: {len(X_train)}, 검증: {len(X_valid)}")
+    # 7. 모델 학습
+    model = train_model(X_train, y_train, X_val, y_val, data_type, use_optuna)
     
-    # 5. 모델 학습 (Optuna 최적화)
-    model = train_model(X_train, y_train, X_valid, y_valid, data_type, use_optuna)
+    # 8. 모델 평가
+    metrics = evaluate_model(model, X_val, y_val, data_type)
     
-    # 6. 모델 평가
-    metrics = evaluate_model(model, X_valid, y_valid, data_type)
+    # 9. 피처 중요도 분석
+    show_feature_importance(model, feature_names, data_type)
     
-    # 7. 피처 중요도 분석
-    show_feature_importance(model, X.columns.tolist(), data_type)
-    
-    # 8. 모델 저장
+    # 10. 모델 저장
     save_model(model, metrics, data_type)
     
-    print(f"\n[🎉 {data_type.upper()} 학습 완료]")
+    print(f"\n[🎉 {data_type.upper()} MTF LGBM 학습 완료]")
     print(f"   F1-Score: {metrics['f1']:.4f}")
     print(f"   {data_type.title()} 신호율: {metrics['signal_rate']:.2%}")
     
     return model, metrics
 
 def main():
-    """메인 실행 함수 - Long/Short 모델 모두 학습"""
+    """메인 실행 함수 - Long/Short MTF LGBM 모델 모두 학습"""
     print("=" * 80)
-    print("🚀 LGBM Long/Short 이진분류 모델 학습 시작")
+    print("🚀 MTF LGBM Long/Short 이진분류 모델 학습 시작")
+    print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
+    print(f"📏 Sequence Length: {SEQ_LEN}")
     print("=" * 80)
     
     results = {}
@@ -290,17 +437,21 @@ def main():
     
     # 전체 요약
     print(f"\n{'=' * 80}")
-    print(f"🎉 LGBM Long/Short 모델 학습 완료 요약")
+    print(f"🎉 MTF LGBM Long/Short 모델 학습 완료 요약")
     print(f"{'=' * 80}")
     print(f"📊 Long 모델  - F1: {long_metrics['f1']:.4f}, 신호율: {long_metrics['signal_rate']:.2%}")
     print(f"📊 Short 모델 - F1: {short_metrics['f1']:.4f}, 신호율: {short_metrics['signal_rate']:.2%}")
     print(f"\n💾 저장된 모델:")
     print(f"   ✅ {LGBM_MODEL_PATHS['long']}")
     print(f"   ✅ {LGBM_MODEL_PATHS['short']}")
+    print(f"\n🔧 MTF 설정:")
+    print(f"   📊 Timeframes: {TIMEFRAMES}")
+    print(f"   📏 Sequence Length: {SEQ_LEN}")
+    print(f"   🎯 Threshold: {LGBM_THRESHOLD}")
     print(f"{'=' * 80}")
     
     return results
 
 if __name__ == "__main__":
-    # LGBM Long/Short 이진분류 모델 학습 (Optuna 최적화 포함)
+    # MTF LGBM Long/Short 이진분류 모델 학습
     results = main()
