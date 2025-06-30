@@ -178,7 +178,10 @@ class PPOTradingEnv:
 
     def step(self, action):
         """
-        Take a step in the environment
+        Take a step in the environment.
+
+        Reward calculation mirrors the labeling logic by checking
+        5-minute high/low prices over ``LABEL_HORIZON`` for TP/SL hits.
         
         Args:
             action: 0 (Hold), 1 (Trade)
@@ -216,33 +219,53 @@ class PPOTradingEnv:
         if action == 0:  # Hold
             reward = 0.0
         else:  # Trade
-            # Calculate returns over horizon
+            # Determine TP/SL using 5-minute extremes over LABEL_HORIZON
             horizon_limit = min(entry_idx + self.horizon, len(ref_df) - 1)
-            
-            if horizon_limit > entry_idx:
-                future_prices = ref_df.iloc[entry_idx + 1:horizon_limit + 1][close_col].values
-                returns = (future_prices - entry_price) / entry_price
-                
-                # Reverse returns for short direction
-                if self.direction == "short":
-                    if not self._logged_direction:
-                        print(f"[STEP] direction = {self.direction}, action = {action}")
-                        print("🟥 SHORT reward reversal applied")
-                        self._logged_direction = True
-                    returns = -returns
-                else:
-                    if not self._logged_direction:
-                        print("🟩 LONG reward structure applied")
-                        self._logged_direction = True
-                
-                # Check TP/SL conditions
-                tp_hit = np.any(returns >= self.tp_ratio)
-                sl_hit = np.any(returns <= self.sl_ratio)
 
-                if sl_hit:
-                    reward = -0.5
-                elif tp_hit:
+            if horizon_limit > entry_idx and "5min" in self.mtf_data:
+                df_5m = self.mtf_data["5min"]
+
+                # Locate high/low columns in 5m timeframe
+                high_col = low_col = None
+                for col in self.feature_cols.get("5min", []):
+                    if "high" in col.lower():
+                        high_col = col
+                    elif "low" in col.lower():
+                        low_col = col
+                if high_col is None or low_col is None:
+                    raise ValueError("No 'high' or 'low' column found in 5min timeframe")
+
+                entry_time = ref_df.index[entry_idx]
+                end_time = ref_df.index[horizon_limit]
+
+                future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
+
+                if self.direction == "long":
+                    tp_price = entry_price * (1 + self.tp_ratio)
+                    sl_price = entry_price * (1 + self.sl_ratio)
+                    tp_reached = future_5m[high_col] >= tp_price
+                    sl_reached = future_5m[low_col] <= sl_price
+                else:
+                    tp_price = entry_price * (1 + self.sl_ratio)
+                    sl_price = entry_price * (1 + self.tp_ratio)
+                    tp_reached = future_5m[low_col] <= tp_price
+                    sl_reached = future_5m[high_col] >= sl_price
+
+                tp_first_idx = future_5m[tp_reached].index.min() if tp_reached.any() else pd.NaT
+                sl_first_idx = future_5m[sl_reached].index.min() if sl_reached.any() else pd.NaT
+
+                tp_hit = pd.notna(tp_first_idx)
+                sl_hit = pd.notna(sl_first_idx)
+
+                if tp_hit and sl_hit:
+                    hit_tp = tp_first_idx < sl_first_idx
+                else:
+                    hit_tp = tp_hit and not sl_hit
+
+                if hit_tp:
                     reward = 1.0
+                elif sl_hit:
+                    reward = -0.5
                 else:
                     reward = self.hold_reward
             else:
