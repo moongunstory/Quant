@@ -396,8 +396,19 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     
     # 5. MTF 시퀀스를 LGBM용 평면 피처로 변환
     X_flat, feature_names = flatten_mtf_sequences(mtf_sequences)
-    X_flat = X_flat[:len(aligned_labels)]  # ❗ 시퀀스 개수 = 라벨 개수로 강제 일치
+
+    # 라벨 데이터프레임의 인덱스에서 valid_timestamps가 위치한 행을 찾아
+    # 해당 위치의 피처만 선택한다. get_indexer는 각 타임스탬프의 위치를
+    # 반환하며, 존재하지 않는 경우 -1을 반환하므로 필터링 전에 검증한다.
+    valid_indices_pos = labeled_df.index.get_indexer(valid_timestamps)
+    if (valid_indices_pos < 0).any():
+        raise ValueError("일부 유효 타임스탬프가 라벨 데이터프레임에 존재하지 않습니다.")
+
+    X_flat = X_flat[valid_indices_pos]
     y = aligned_labels
+
+    # 피처와 라벨의 행 수가 일치하는지 확인
+    assert X_flat.shape[0] == len(aligned_labels), "Features and labels size mismatch"
     
     # 6. 시간 기반 train/validation 분할 (셔플 금지)
     X_train, X_val, y_train, y_val = create_time_based_split(
