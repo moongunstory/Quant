@@ -35,9 +35,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 RAW_DATA_PATH = "data/raw/market_raw_data.csv"
 
-TRAIN_LABEL_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.csv"),
-    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.csv"),
+TRAIN_PICKLE_PATHS = {
+    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.pkl"),
+    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.pkl"),
 }
 
 LGBM_MODEL_PATHS = {
@@ -84,11 +84,20 @@ LGBM_THRESHOLD = 0.6
 LONG_THRESHOLD = 0.685
 SHORT_THRESHOLD = 0.685
 
+# === PPO 학습 설정 ===
+SEQ_LEN = 32               # 시계열 길이 (window size)
+HIDDEN_DIM = 128           # LSTM hidden dim
+LEARNING_RATE = 3e-4       # PPO optimizer 학습률
+PPO_EPOCHS = 5            # 학습 epoch 수 (보통 3~10)
+PPO_BATCH_SIZE = 64        # 미니배치 사이즈
+PPO_MAX_STEPS = 2048       # 수집할 step 수 (GAE 계산용)
+GAMMA = 0.99               # 할인율 (보통 0.99)
+LAMBDA = 0.95              # GAE lambda (보통 0.95)
+CLIP_EPS = 0.2             # 클리핑 범위 (보통 0.1~0.3)
+VALUE_COEF = 0.5           # value loss 가중치
+ENTROPY_COEF = 0.01        # entropy 가중치
 PPO_BUFFER_SIZE = 256
-PPO_EPOCHS = 5
 PPO_INPUT_DIM = 61  # 실전 피처 수 기준
-
-SEQ_LEN = 32
 
 # PPO 모델 공통 설정
 WINDOW_SIZE = 32

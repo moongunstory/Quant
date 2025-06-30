@@ -16,13 +16,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../../../"))
 sys.path.insert(0, PROJECT_ROOT)
 
 from modules.config import (
-    TRAIN_LABEL_PATHS,
+    TRAIN_PICKLE_PATHS,
     PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_FINAL_MODEL_PATHS,
-    TP_THRESHOLD,
-    SL_THRESHOLD,
-    LABEL_HORIZON,
     TIMEFRAMES,
     SEQ_LEN,
     HIDDEN_DIM,
@@ -104,14 +101,11 @@ def train_ppo(
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
     env = PPOTradingEnv(
-        csv_path=csv_path,
+        data_path=csv_path,  
         direction=direction,
-        seq_len=SEQ_LEN,
-        tp_ratio=TP_THRESHOLD,
-        sl_ratio=SL_THRESHOLD,
-        horizon=LABEL_HORIZON,
+        seq_len=SEQ_LEN
     )
-    
+
     # MTF 입력 차원 정보 가져오기
     input_dims = env.get_input_dims()  # Returns Dict[str, int]
     logger.info(f"📊 [{direction.upper()}] 환경 생성 완료: input_dims={input_dims}")
@@ -301,7 +295,7 @@ if __name__ == "__main__":
     for direction in ["long", "short"]:
         result = train_ppo(
             direction=direction,
-            csv_path=TRAIN_LABEL_PATHS[direction],
+            csv_path=TRAIN_PICKLE_PATHS[direction],
             imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
             value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
             save_path=PPO_FINAL_MODEL_PATHS[direction],
