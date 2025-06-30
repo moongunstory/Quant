@@ -78,7 +78,7 @@ SL_THRESHOLD = -0.008  # -0.8%
 LABEL_HORIZON = 4
 
 # 지도 학습 전용 확신도
-LGBM_THRESHOLD = 0.5
+LGBM_THRESHOLD = 0.6
 
 # 실제 매매 전용 확신도
 LONG_THRESHOLD = 0.685
