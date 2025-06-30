@@ -50,7 +50,7 @@ def train_ppo_live(
     else:
         model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=256).to(device)
     
-    model.load_model(imitation_model_path)
+    model.load_model(imitation_model_path, allow_partial=True)
     logger.info("📦 모방 학습 모델 로드 완료")
 
     # 가치망 초기화
