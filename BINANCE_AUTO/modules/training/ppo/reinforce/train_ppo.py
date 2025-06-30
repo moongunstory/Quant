@@ -112,7 +112,7 @@ def train_ppo(
 
     # MTF 지원 PPO 모델 초기화
     model = PPOPolicyNetwork(
-        input_dims=input_dims,
+        timeframe_dims=input_dims,
         hidden_dim=HIDDEN_DIM
     ).to(device)
 
