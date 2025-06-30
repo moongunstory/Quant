@@ -70,7 +70,7 @@ class PPOTradingEnv:
             raise ValueError(f"Reference timeframe '{self.reference_timeframe}' must have 'label' column")
         
         # Find valid entry indices from reference timeframe
-        self.valid_indices = ref_df[ref_df["label"] == 1].index.to_series().reset_index(drop=True).index.tolist()
+        self.valid_indices = np.where(ref_df["label"] == 1)[0].tolist()
         
         # Prepare sequences for each timeframe
         self.sequences = {}

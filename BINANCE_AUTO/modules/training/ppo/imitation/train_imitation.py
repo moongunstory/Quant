@@ -19,7 +19,7 @@ sys.path.append(PROJECT_ROOT)
 
 from modules.config import (
     LGBM_MODEL_PATHS,
-    TRAIN_LABEL_PATHS,
+    TRAIN_PICKLE_PATHS,
     PPO_IMITATION_MODEL_PATHS,
     TIMEFRAMES,
     WINDOW_SIZE,
@@ -230,7 +230,7 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     
     # 파일 경로 설정
     lgbm_model_path = LGBM_MODEL_PATHS[direction]
-    train_data_path = TRAIN_LABEL_PATHS[direction]
+    train_data_path = TRAIN_PICKLE_PATHS[direction]
     output_model_path = PPO_IMITATION_MODEL_PATHS[direction]
 
     # 출력 디렉토리 생성

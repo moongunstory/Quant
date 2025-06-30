@@ -316,8 +316,16 @@ class RealTimeDataCollector:
             # Map timeframe names to match expected output format
             output_key = "5m" if tf == "5min" else tf
             result[output_key] = tf_data[tf].values.astype(np.float32)
-        
+
         result["btc"] = btc_row.values.astype(np.float32)
         result["dune"] = dune_row.values.astype(np.float32)
 
         return result
+
+    def get_recent_market_df(self, tf: str = "5min") -> pd.DataFrame:
+        """Return latest cached market dataframe for the specified timeframe."""
+        path = os.path.join(self.cache_dir, f"{self.symbol}_{tf}.pkl")
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        df = pd.read_pickle(path)
+        return df.sort_index()

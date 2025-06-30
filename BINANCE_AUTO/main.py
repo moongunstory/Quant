@@ -24,6 +24,7 @@ from modules.config import (
     SEQ_LEN,
     LONG_THRESHOLD,
     SHORT_THRESHOLD,
+    FEATURE_CATEGORIES_BY_TF,
 )
 
 def convert_state_to_tensor_dict(state: Dict[str, np.ndarray], device: str = 'cpu') -> Dict[str, torch.Tensor]:
@@ -84,7 +85,9 @@ def get_current_price_from_state(state: Dict[str, np.ndarray]) -> float:
 def main():
     # MTF 지원 컴포넌트 초기화
     collector = RealTimeDataCollector()
-    predictor = Predictor()  # MTF 지원 버전
+    timeframe_dims = {tf: len(FEATURE_CATEGORIES_BY_TF.get(tf, [])) for tf in TIMEFRAMES}
+    timeframe_dims.update({"btc": 12, "dune": 6})
+    predictor = Predictor(timeframe_dims=timeframe_dims)  # MTF 지원 버전
     executors = {
         "long": FuturesTradeExecutor(),
         "short": FuturesTradeExecutor()
@@ -154,10 +157,10 @@ def main():
 
                 # 3. 환경에서 정책 행동 평가 (진입 여부와 무관)
                 market_df = collector.get_recent_market_df(tf='5min')
-                env = LivePPOEnv(market_df)  # MTF 지원 환경
-                
-                # MTF 상태를 환경에 전달
-                _, reward, done, _ = env.step(policy_action, mtf_obs=state)
+                env = LivePPOEnv({"5min": market_df}, reference_timeframe="5min")
+
+                # 정책 행동을 환경에 전달
+                _, reward, done, _ = env.step(policy_action)
                 
                 log_mtf_shapes(state, f"[{direction.upper()}] Environment Input")
 
