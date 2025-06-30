@@ -236,9 +236,6 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     # 출력 디렉토리 생성
     os.makedirs(os.path.dirname(output_model_path), exist_ok=True)
     
-    # 1. LGBM 모델 로딩
-    lgbm_model = load_lgbm_model(lgbm_model_path)
-    
     # 2. 훈련 데이터 로딩
     logger.info(f"훈련 데이터 로딩: {train_data_path}")
     if not os.path.exists(train_data_path):
@@ -249,14 +246,18 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     # 3. MTF 방식으로 피처 생성
     mtf_features_df = generate_mtf_features(df)
 
+    # ✅ 기존 LGBM 예측 대신, label 컬럼 직접 사용
+    if "label" not in df.columns:
+        raise ValueError("입력 데이터에 'label' 컬럼이 없습니다. MTF 기반 LGBM으로 생성된 라벨이 필요합니다.")
+    min_len = min([features.shape[0] for features in mtf_features_df.values()])
+    labels = df["label"].values[-min_len:].astype(int)
+
+
     # 4. 각 타임프레임별로 정규화 및 시계열 복원
     mtf_features_array = {}
     input_dims = {}
-    
+
     for timeframe, features_df in mtf_features_df.items():
-        # LGBM 예측을 위해 첫 번째 타임프레임 사용 (기존 방식과 호환)
-        if timeframe == TIMEFRAMES[0]:
-            labels = lgbm_model.predict(features_df)
         
         # 정규화 적용
         X_values = features_df.values
@@ -298,7 +299,7 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     
     # 7. PPOPolicyNetwork 모델 초기화 (MTF 지원)
     model = PPOPolicyNetwork(
-        input_dims=input_dims,
+        timeframe_dims=input_dims,
         hidden_dim=HIDDEN_DIM,
         action_dim=ACTION_DIM
     )
