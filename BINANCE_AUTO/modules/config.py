@@ -88,6 +88,8 @@ PPO_BUFFER_SIZE = 256
 PPO_EPOCHS = 5
 PPO_INPUT_DIM = 61  # 실전 피처 수 기준
 
+SEQ_LEN = 32
+
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
     "15min": [
