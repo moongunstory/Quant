@@ -41,8 +41,9 @@ class PPOPolicyNetwork(nn.Module):
                 self.lstm_layers[tf_name] = nn.LSTM(
                     input_size=input_dim, 
                     hidden_size=hidden_dim, 
+                    num_layers=2,  # 1에서 2로 증가
                     batch_first=True,
-                    dropout=0.1 if hidden_dim > 64 else 0
+                    dropout=0.1    # num_layers=2이므로 dropout 정상 작동
                 )
                 total_feature_dim += hidden_dim
         
@@ -125,42 +126,17 @@ class PPOPolicyNetwork(nn.Module):
         return logits, value
 
     def get_action(self, x: Dict[str, torch.Tensor]):
-        """
-        행동 샘플링: 정책 분포에서 하나 선택 + log_prob + 가치 예측 + 확신도 벡터 반환
-        
-        Args:
-            x: Dictionary of timeframe tensors
-            
-        Returns:
-            action: Sampled action (0: enter, 1: hold)
-            log_prob: Log probability of the action
-            value: State value prediction
-            probs: Action probabilities [enter, hold]
-        """
         logits, value = self.forward(x)
-        # Reorder probabilities so index 0 corresponds to "enter" and 1 to "hold"
-        probs = torch.softmax(logits, dim=-1)[:, [1, 0]]
+        # 순서 변경 없이 그대로 사용: 0=hold, 1=enter
+        probs = torch.softmax(logits, dim=-1)
         dist = Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob, value, probs
 
     def evaluate_action(self, x: Dict[str, torch.Tensor], action: torch.Tensor):
-        """
-        PPO 학습 시: 행동의 log_prob, entropy, value 예측
-        
-        Args:
-            x: Dictionary of timeframe tensors
-            action: Actions to evaluate
-            
-        Returns:
-            log_prob: Log probabilities of actions
-            entropy: Policy entropy
-            value: State value predictions
-        """
         logits, value = self.forward(x)
-        # Use same [enter, hold] ordering during evaluation
-        logits = logits[:, [1, 0]]
+        # 순서 변경 없이 그대로 사용: 0=hold, 1=enter
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
