@@ -167,7 +167,8 @@ def create_time_based_split(X: np.ndarray, y: np.ndarray,
     X_val = X[train_size:]
     y_train = y[:train_size]
     y_val = y[train_size:]
-    
+
+    timestamps = timestamps[:len(X)]
     train_period = f"{timestamps[0].strftime('%Y-%m-%d')} ~ {timestamps[train_size-1].strftime('%Y-%m-%d')}"
     val_period = f"{timestamps[train_size].strftime('%Y-%m-%d')} ~ {timestamps[-1].strftime('%Y-%m-%d')}"
     
@@ -395,6 +396,7 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     
     # 5. MTF 시퀀스를 LGBM용 평면 피처로 변환
     X_flat, feature_names = flatten_mtf_sequences(mtf_sequences)
+    X_flat = X_flat[:len(aligned_labels)]  # ❗ 시퀀스 개수 = 라벨 개수로 강제 일치
     y = aligned_labels
     
     # 6. 시간 기반 train/validation 분할 (셔플 금지)
