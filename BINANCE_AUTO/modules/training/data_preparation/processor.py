@@ -153,7 +153,7 @@ def create_labels(df_dict: Dict[str, pd.DataFrame], label_horizon: int = 4) -> p
     
     return df_15m
 
-def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataFrame, 
+def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataFrame,
                          label_horizon: int = 4) -> Dict[str, pd.DataFrame]:
     """미래 5분봉 high/low 값 마스킹 - 데이터 누출 방지"""
     if "5min" not in df_dict:
@@ -190,8 +190,35 @@ def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataF
     
     df_dict_masked["5min"] = df_5m
     print(f"[MASK] 미래 5분봉 high/low 값 마스킹 완료")
-    
+
     return df_dict_masked
+
+def prepare_ppo_data(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataFrame,
+                     mask_for_inference: bool = False) -> Dict[str, pd.DataFrame]:
+    """Prepare PPO dataset with optional future masking for inference."""
+    if mask_for_inference:
+        return mask_future_5m_values(df_dict, df_labeled, LABEL_HORIZON)
+    return df_dict
+
+def create_balanced_ppo_dataset(df_labeled: pd.DataFrame, success_label: str) -> pd.DataFrame:
+    """Create a balanced PPO dataset with success, fail and hold scenarios."""
+    fail_label = "short" if success_label == "long" else "long"
+
+    success_df = df_labeled[df_labeled["label"] == success_label]
+    fail_df = df_labeled[df_labeled["label"] == fail_label]
+    hold_df = df_labeled[df_labeled["label"] == "hold"]
+
+    total_n = len(df_labeled)
+    target_success = int(total_n * 0.3)
+    target_fail = int(total_n * 0.3)
+    target_hold = int(total_n * 0.4)
+
+    success_sample = success_df.sample(min(len(success_df), target_success), random_state=42)
+    fail_sample = fail_df.sample(min(len(fail_df), target_fail), random_state=42)
+    hold_sample = hold_df.sample(min(len(hold_df), target_hold), random_state=42)
+
+    balanced_df = pd.concat([success_sample, fail_sample, hold_sample]).sort_index()
+    return balanced_df
 
 def load_mtf_data() -> Dict[str, pd.DataFrame]:
     """MTF 개별 pickle 파일들을 로드"""
@@ -243,18 +270,14 @@ def main():
     label_counts = df_labeled_15m['label'].value_counts()
     print(f"[📊 라벨 분포] {dict(label_counts)}")
     
-    # 5. 미래 정보 마스킹 (데이터 누출 방지)
-    mtf_data_masked = mask_future_5m_values(mtf_data, df_labeled_15m, LABEL_HORIZON)
+    # 5. PPO 학습용 데이터 준비 (마스킹은 inference에서만 적용)
+    mtf_data_prepared = prepare_ppo_data(mtf_data, df_labeled_15m, mask_for_inference=False)
     
-    # 6. 이진분류용 데이터 준비 (라벨링된 15분봉 DataFrame 직접 사용)
-    # Long 모델용: long + hold (short 제외)
-    df_long_binary = df_labeled_15m[df_labeled_15m['label'].isin(['long', 'hold'])].copy()
-    # 라벨 변환: long=1, hold=0
+    # 6. PPO 학습을 위한 균형 데이터셋 구성
+    df_long_binary = create_balanced_ppo_dataset(df_labeled_15m, "long")
     df_long_binary['label'] = (df_long_binary['label'] == 'long').astype(int)
-    
-    # Short 모델용: short + hold (long 제외)  
-    df_short_binary = df_labeled_15m[df_labeled_15m['label'].isin(['short', 'hold'])].copy()
-    # 라벨 변환: short=1, hold=0
+
+    df_short_binary = create_balanced_ppo_dataset(df_labeled_15m, "short")
     df_short_binary['label'] = (df_short_binary['label'] == 'short').astype(int)
     
     print(f"[🎯 이진분류 데이터 준비]")
@@ -270,17 +293,17 @@ def main():
     
     # ✅ long
     with open(long_path, "wb") as f:
-        pickle.dump({**mtf_data_masked, "15min": df_long_binary}, f)
+        pickle.dump({**mtf_data_prepared, "15min": df_long_binary}, f)
 
     # ✅ short
     with open(short_path, "wb") as f:
-        pickle.dump({**mtf_data_masked, "15min": df_short_binary}, f)
+        pickle.dump({**mtf_data_prepared, "15min": df_short_binary}, f)
 
     print(f"[💾 저장 완료]")
     print(f"  - Long 이진분류 데이터: {len(df_long_binary)}행 → {long_path}")
     print(f"  - Short 이진분류 데이터: {len(df_short_binary)}행 → {short_path}")
     
-    return df_labeled_15m, mtf_data_masked
+    return df_labeled_15m, mtf_data_prepared
 
 if __name__ == "__main__":
     labeled_df, masked_mtf_data = main()

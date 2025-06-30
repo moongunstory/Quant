@@ -14,7 +14,8 @@ from modules.config import (
 
 class PPOTradingEnv:
     def __init__(self, data_path: str, direction: str = "long", seq_len: int = 32,
-                reference_timeframe: str = "15min", hold_reward: float = 0.001):
+                 reference_timeframe: str = "15min", hold_reward: float = 0.001,
+                 include_all_scenarios: bool = True, reward_scale: float = 1.0):
         """
         MTF PPO Trading Environment
         
@@ -32,6 +33,8 @@ class PPOTradingEnv:
         self.sl_ratio = SL_THRESHOLD
         self.horizon = LABEL_HORIZON
         self.hold_reward = hold_reward
+        self.include_all = include_all_scenarios
+        self.reward_scale = reward_scale
         self._logged_direction = False
         
         print(f"[ENV INIT] direction='{self.direction}', ref_tf='{reference_timeframe}', hold_reward={hold_reward}")
@@ -63,14 +66,16 @@ class PPOTradingEnv:
 
     def _prepare_data(self):
         """Prepare MTF sequences and find valid entry points"""
-        # Use reference timeframe to find entry points (where label == 1)
+        # Use reference dataframe
         ref_df = self.mtf_data[self.reference_timeframe]
-        
+
         if 'label' not in ref_df.columns:
             raise ValueError(f"Reference timeframe '{self.reference_timeframe}' must have 'label' column")
-        
-        # Find valid entry indices from reference timeframe
-        self.valid_indices = np.where(ref_df["label"] == 1)[0].tolist()
+
+        if self.include_all:
+            self.valid_indices = list(range(len(ref_df)))
+        else:
+            self.valid_indices = np.where(ref_df["label"] == 1)[0].tolist()
         
         # Prepare sequences for each timeframe
         self.sequences = {}
@@ -216,60 +221,62 @@ class PPOTradingEnv:
         
         entry_price = ref_df.iloc[entry_idx][close_col]
 
-        if action == 0:  # Hold
-            reward = 0.0
-        else:  # Trade
-            # Determine TP/SL using 5-minute extremes over LABEL_HORIZON
-            horizon_limit = min(entry_idx + self.horizon, len(ref_df) - 1)
+        horizon_limit = min(entry_idx + self.horizon, len(ref_df) - 1)
 
-            if horizon_limit > entry_idx and "5min" in self.mtf_data:
-                df_5m = self.mtf_data["5min"]
+        if horizon_limit > entry_idx and "5min" in self.mtf_data:
+            df_5m = self.mtf_data["5min"]
 
-                # Locate high/low columns in 5m timeframe
-                high_col = low_col = None
-                for col in self.feature_cols.get("5min", []):
-                    if "high" in col.lower():
-                        high_col = col
-                    elif "low" in col.lower():
-                        low_col = col
-                if high_col is None or low_col is None:
-                    raise ValueError("No 'high' or 'low' column found in 5min timeframe")
+            high_col = low_col = None
+            for col in self.feature_cols.get("5min", []):
+                if "high" in col.lower():
+                    high_col = col
+                elif "low" in col.lower():
+                    low_col = col
+            if high_col is None or low_col is None:
+                raise ValueError("No 'high' or 'low' column found in 5min timeframe")
 
-                entry_time = ref_df.index[entry_idx]
-                end_time = ref_df.index[horizon_limit]
+            entry_time = ref_df.index[entry_idx]
+            end_time = ref_df.index[horizon_limit]
 
-                future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
+            future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
 
-                if self.direction == "long":
-                    tp_price = entry_price * (1 + self.tp_ratio)
-                    sl_price = entry_price * (1 + self.sl_ratio)
-                    tp_reached = future_5m[high_col] >= tp_price
-                    sl_reached = future_5m[low_col] <= sl_price
-                else:
-                    tp_price = entry_price * (1 + self.sl_ratio)
-                    sl_price = entry_price * (1 + self.tp_ratio)
-                    tp_reached = future_5m[low_col] <= tp_price
-                    sl_reached = future_5m[high_col] >= sl_price
-
-                tp_first_idx = future_5m[tp_reached].index.min() if tp_reached.any() else pd.NaT
-                sl_first_idx = future_5m[sl_reached].index.min() if sl_reached.any() else pd.NaT
-
-                tp_hit = pd.notna(tp_first_idx)
-                sl_hit = pd.notna(sl_first_idx)
-
-                if tp_hit and sl_hit:
-                    hit_tp = tp_first_idx < sl_first_idx
-                else:
-                    hit_tp = tp_hit and not sl_hit
-
-                if hit_tp:
-                    reward = 1.0
-                elif sl_hit:
-                    reward = -1.0
-                else:
-                    reward = self.hold_reward * 0.1
+            if self.direction == "long":
+                tp_price = entry_price * (1 + self.tp_ratio)
+                sl_price = entry_price * (1 + self.sl_ratio)
+                tp_reached = future_5m[high_col] >= tp_price
+                sl_reached = future_5m[low_col] <= sl_price
             else:
-                reward = self.hold_reward * 0.1
+                tp_price = entry_price * (1 + self.sl_ratio)
+                sl_price = entry_price * (1 + self.tp_ratio)
+                tp_reached = future_5m[low_col] <= tp_price
+                sl_reached = future_5m[high_col] >= sl_price
+
+            tp_first_idx = future_5m[tp_reached].index.min() if tp_reached.any() else pd.NaT
+            sl_first_idx = future_5m[sl_reached].index.min() if sl_reached.any() else pd.NaT
+
+            tp_hit = pd.notna(tp_first_idx)
+            sl_hit = pd.notna(sl_first_idx)
+        else:
+            tp_hit = False
+            sl_hit = False
+
+        if action == 0:  # Hold
+            if sl_hit and not tp_hit:
+                reward = 0.1 * self.reward_scale
+            else:
+                reward = -0.01 * self.reward_scale
+        else:  # Trade
+            if tp_hit and sl_hit:
+                hit_tp = tp_first_idx < sl_first_idx
+            else:
+                hit_tp = tp_hit and not sl_hit
+
+            if hit_tp:
+                reward = 1.0 * self.reward_scale
+            elif sl_hit:
+                reward = -1.0 * self.reward_scale
+            else:
+                reward = -0.01 * self.reward_scale
 
         # Move to next state
         self.ptr += 1

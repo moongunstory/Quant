@@ -98,13 +98,18 @@ CLIP_EPS = 0.2             # 클리핑 범위 (보통 0.1~0.3)
 VALUE_COEF = 0.5           # value loss 가중치
 ENTROPY_COEF = 0.02        # entropy 가중치
 
-# PPO 모델 공통 설정
-WINDOW_SIZE = 32
-HIDDEN_DIM = 128         # LSTM hidden state 크기
-ACTION_DIM = 2           # 행동 공간 (예: HOLD, ENTER)
-LEARNING_RATE = 0.0005   # 학습률
-EPOCHS = 10              # 학습 epoch 수
-BATCH_SIZE = 64          # 배치 사이즈
+
+# Consolidated PPO configuration
+PPO_CONFIG = {
+    'learning_rate': 1e-4,
+    'epochs': 20,
+    'batch_size': 256,
+    'entropy_coef': 0.02,
+    'value_coef': 0.5,
+    'clip_eps': 0.2,
+    'gamma': 0.99,
+    'lambda': 0.95
+}
 
 # 타임프레임별 피처 구성
 FEATURE_CATEGORIES_BY_TF = {
