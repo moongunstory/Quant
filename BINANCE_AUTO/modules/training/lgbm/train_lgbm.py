@@ -94,11 +94,17 @@ def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame],
         
         for target_time in target_index:
             # 시퀀스 종료 시점을 target_time으로 설정
-            end_time = target_time
-            
+            end_time = pd.Timestamp(target_time)
+
+            # 인덱스 타입 일치 보장
+            if df_features.index.tz is None:
+                end_time = end_time.tz_localize(None)
+            else:
+                end_time = end_time.tz_convert(df_features.index.tz)
+
             # 해당 시점 이전의 SEQ_LEN개 데이터 추출
             available_data = df_features[df_features.index <= end_time]
-            
+  
             if len(available_data) >= SEQ_LEN:
                 sequence = available_data.iloc[-SEQ_LEN:].values  # 마지막 SEQ_LEN개
                 sequences.append(sequence)
