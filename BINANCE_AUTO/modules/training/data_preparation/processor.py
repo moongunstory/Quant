@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Dict
 import pickle
+import logging
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,19 @@ from modules.config import (
     TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON,
     TIMEFRAMES
 )
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def log_ohlcv_nans(df: pd.DataFrame, tf: str, stage: str = "") -> None:
+    """Log NaN counts for OHLCV columns."""
+    prefix = f"[{tf}]"
+    if stage:
+        prefix += f" {stage}"
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            logger.info(f"{prefix} {col} NaNs: {df[col].isna().sum()}")
 
 def create_dune_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """DUNE 파생 피처 생성 - DUNE DataFrame만 처리"""
@@ -56,6 +70,7 @@ def create_dune_derived_features(df: pd.DataFrame) -> pd.DataFrame:
 def apply_feature_processing(df: pd.DataFrame, data_type: str) -> pd.DataFrame:
     """피처별 처리 정책 적용 - BTC/DUNE DataFrame만 처리"""
     df_processed = df.copy()
+    log_ohlcv_nans(df_processed, data_type, stage="before_process")
     
     if data_type == "btc":
         # BTC 피처 .ffill() 적용
@@ -71,6 +86,7 @@ def apply_feature_processing(df: pd.DataFrame, data_type: str) -> pd.DataFrame:
                 df_processed[col] = df_processed[col].ffill()
         # DUNE flag 피처는 .ffill() 금지 (그대로 유지)
     
+    log_ohlcv_nans(df_processed, data_type, stage="after_process")
     return df_processed
 
 def create_labels(df_dict: Dict[str, pd.DataFrame], label_horizon: int = 4) -> pd.DataFrame:
@@ -171,7 +187,7 @@ def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataF
             low_col = col
     
     if high_col is None or low_col is None:
-        print("[WARNING] No high/low columns found in 5min data for masking")
+        logger.warning("[WARNING] No high/low columns found in 5min data for masking")
         return df_dict_masked
     
     # 각 15분봉 라벨링 시점에 대해 미래 5분봉 값 마스킹
@@ -187,9 +203,15 @@ def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataF
         # 미래 5분봉 구간 마스킹
         future_mask = (df_5m.index > entry_time) & (df_5m.index <= end_time)
         df_5m.loc[future_mask, [high_col, low_col]] = np.nan
-    
+
+    log_ohlcv_nans(df_5m, "5min", stage="future_masked")
+
+    # Remove rows with masked NaNs to keep dataset clean
+    df_5m = df_5m.dropna(subset=[high_col, low_col])
+    log_ohlcv_nans(df_5m, "5min", stage="post_mask_drop")
+
     df_dict_masked["5min"] = df_5m
-    print(f"[MASK] 미래 5분봉 high/low 값 마스킹 완료")
+    logger.info("[MASK] 미래 5분봉 high/low 값 마스킹 완료")
 
     return df_dict_masked
 
@@ -233,9 +255,10 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
         if os.path.exists(file_path):
             df = pd.read_pickle(file_path)
             mtf_data[key] = df
-            print(f"[로드] {key}: {len(df)} rows, {len(df.columns)} columns")
+            logger.info(f"[로드] {key}: {len(df)} rows, {len(df.columns)} columns")
+            log_ohlcv_nans(df, key, stage="loaded")
         else:
-            print(f"[경고] {key} 파일 없음: {file_path}")
+            logger.warning(f"[경고] {key} 파일 없음: {file_path}")
     
     return mtf_data
 
