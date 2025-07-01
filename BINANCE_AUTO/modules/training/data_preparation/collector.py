@@ -6,6 +6,7 @@ import pandas_ta as ta
 import os
 import sys
 from datetime import timedelta
+import logging
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,6 +19,19 @@ from modules.config import (
     FEATURE_CATEGORIES_BY_TF, DUNE_QUERY_PARTS,
     RAW_DATA_PATH, BINANCE_INTERVAL_MAP, FUTURES_SYMBOL
 )
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def log_ohlcv_nans(df: pd.DataFrame, tf: str, stage: str = "") -> None:
+    """Log NaN counts for OHLCV columns."""
+    prefix = f"[{tf}]"
+    if stage:
+        prefix += f" {stage}"
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            logger.info(f"{prefix} {col} NaNs: {df[col].isna().sum()}")
 
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
 
@@ -110,8 +124,11 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     df.index = df.index.tz_convert("UTC")
-    
-    return df.astype(float).dropna()
+
+    df = df.astype(float)
+    log_ohlcv_nans(df, interval, stage="loaded")
+    df = df.dropna()
+    return df
 
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     """기술적 지표 추가 + OHLCV 컬럼 포함"""
@@ -186,11 +203,21 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
         if "stochk_range_6" in features and prefix + "stochastic_k" in result_df.columns:
             result_df[prefix + "stochk_range_6"] = result_df[prefix + "stochastic_k"].rolling(6).apply(lambda x: x.max() - x.min(), raw=True)
 
+    # Log warm-up NaNs before clipping
+    log_ohlcv_nans(result_df, tf, stage="warmup")
+
+    # Drop warm-up rows where indicators produced NaNs
+    result_df = result_df.dropna()
+
+    # Log after drop to confirm cleanliness
+    log_ohlcv_nans(result_df, tf, stage="post_drop")
+
     return result_df
 
 def fetch_btc_historical_features(start_date: str, end_date: str, interval: str = "1h") -> pd.DataFrame:
     """BTC 피처 수집"""
     btc_df = fetch_ohlcv_with_extended_period("BTCUSDT", interval, start_date, end_date)
+    log_ohlcv_nans(btc_df, "btc", stage="after_load")
     
     btc_features = pd.DataFrame(index=btc_df.index)
     
@@ -222,10 +249,12 @@ def fetch_btc_historical_features(start_date: str, end_date: str, interval: str 
                                    (btc_features["btc_bearish"] == 1.0)).astype(float)
     btc_features["btc_correction"] = ((btc_features["btc_return_1h"] < 0) & 
                                      (btc_features["btc_bullish"] == 1.0)).astype(float)
-    btc_features["btc_sideways"] = ((btc_features["btc_uptrend"] + btc_features["btc_downtrend"] + 
+    btc_features["btc_sideways"] = ((btc_features["btc_uptrend"] + btc_features["btc_downtrend"] +
                                     btc_features["btc_recovery"] + btc_features["btc_correction"]) == 0).astype(float)
-    
-    return btc_features.fillna(0)
+
+    btc_features = btc_features.fillna(0)
+    log_ohlcv_nans(btc_df, "btc", stage="post_indicator")
+    return btc_features
 
 def collect_all_market_data() -> dict:
     """전체 마켓 데이터 수집 - MTF 독립 구조"""
@@ -236,7 +265,9 @@ def collect_all_market_data() -> dict:
         print(f"[수집] {tf} 타임프레임 데이터...")
         interval = BINANCE_INTERVAL_MAP[tf]
         eth_df = fetch_ohlcv_with_extended_period(FUTURES_SYMBOL, interval, START_DATE, END_DATE)
+        log_ohlcv_nans(eth_df, tf, stage="after_load")
         eth_indicators = add_indicators_with_validation(eth_df, tf)
+        log_ohlcv_nans(eth_indicators, tf, stage="post_indicator")
         
         # 시작 날짜부터 필터링
         target_start_dt = pd.to_datetime(START_DATE, utc=True)
