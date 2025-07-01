@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, f1_score
 from collections import Counter
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 import random
 import logging
 import warnings
@@ -151,12 +151,12 @@ def calculate_tp_sl_hits_optimized(entry_df: pd.DataFrame, eval_df: pd.DataFrame
             tp_price = entry_price * (1 - tp_thresh)
             sl_price = entry_price * (1 + sl_thresh)
         
-        # 미래 데이터 선택 (15분 봉 1개 = 5분 봉 3개)
-        future_start = entry_time + pd.Timedelta(minutes=5)  # 다음 5분 봉부터
-        future_end = entry_time + pd.Timedelta(minutes=15 * LABEL_HORIZON)  # LABEL_HORIZON개의 15분 봉
+        # 미래 데이터 선택 (라벨링 로직과 동일하게 첫 5분봉부터)
+        future_start = entry_time  # 직후 5분 봉부터 포함
+        future_end = entry_time + pd.Timedelta(minutes=15 * LABEL_HORIZON)
         
         # loc 사용하여 안전하게 슬라이싱
-        future_mask = (eval_df.index > future_start) & (eval_df.index <= future_end)
+        future_mask = (eval_df.index >= future_start) & (eval_df.index <= future_end)
         future_data = eval_df.loc[future_mask]
         
         if len(future_data) == 0:
