@@ -75,7 +75,7 @@ ONCHAIN_CACHE_DIR = os.path.join(CACHE_DIR, "onchain")
 # 손익절 값 4봉 기준
 TP_THRESHOLD = 0.008  # +0.8%
 SL_THRESHOLD = -0.008  # -0.8%
-LABEL_HORIZON = 4
+LABEL_HORIZON = 20
 
 # 지도 학습 전용 확신도
 LGBM_THRESHOLD = 0.6
