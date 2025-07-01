@@ -65,16 +65,26 @@ class PPOPolicyNetwork(nn.Module):
             nn.Linear(hidden_dim, action_dim)  # action_dim = 2 (Enter vs Hold)
         )
 
-        # Value head (LayerNorm 포함)
+        # Value head with LayerNorm and Dropout
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.LayerNorm(hidden_dim // 2),
             nn.Linear(hidden_dim // 2, 1)
         )
+
+        self._init_value_head()
+
+    def _init_value_head(self):
+        """Initialize value head weights using Xavier uniform."""
+        for m in self.value_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: Dict[str, torch.Tensor]):
         """

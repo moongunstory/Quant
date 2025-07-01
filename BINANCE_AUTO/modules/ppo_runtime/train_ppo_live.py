@@ -2,6 +2,7 @@ import os
 import torch
 import torch.optim as optim
 import logging
+import numpy as np
 from typing import Dict
 from modules.ppo_runtime.rollout_updater import RolloutBuffer
 from modules.training.ppo.core.model import PPOPolicyNetwork
@@ -24,8 +25,8 @@ def train_ppo_live(
     gamma: float = 0.99,
     lam: float = 0.95,
     clip_eps: float = 0.2,
-    value_coef: float = 0.5,
-    entropy_coef: float = 0.01,
+    value_coef: float = 0.05,
+    entropy_coef: float = 0.02,
     lr: float = 2.5e-4,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ):
@@ -60,9 +61,15 @@ def train_ppo_live(
     buffer.compute_returns_and_advantages(last_value=0.0, gamma=gamma, lam=lam)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    initial_entropy_coef = entropy_coef
+    min_entropy_coef = 0.005
 
     for epoch in range(total_epochs):
+        entropy_coef = max(initial_entropy_coef * (1 - epoch / total_epochs), min_entropy_coef)
         model.train()
+        epoch_returns = []
+        epoch_values = []
+        evs = []
         for obs_batch, action_batch, return_batch, adv_batch, old_logprob_batch in buffer.get_batches(batch_size):
             
             # Convert obs_batch to device-aware format
@@ -90,6 +97,16 @@ def train_ppo_live(
             loss.backward()
             optimizer.step()
 
+            epoch_returns.append(return_batch.mean().item())
+            epoch_values.append(values.mean().item())
+            evs.append(compute_explained_variance(values.detach(), return_batch.detach()).item())
+
+        avg_return = np.mean(epoch_returns) if epoch_returns else 0.0
+        avg_value = np.mean(epoch_values) if epoch_values else 0.0
+        ev = np.mean(evs) if evs else 0.0
+        logger.info(
+            f"📈 Epoch {epoch+1}: Avg Return={avg_return:.3f}, Avg Value={avg_value:.3f}, EV={ev:.3f}"
+        )
         logger.info(f"✅ Epoch {epoch+1}/{total_epochs} 완료")
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
