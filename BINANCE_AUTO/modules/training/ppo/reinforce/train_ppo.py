@@ -143,7 +143,7 @@ def train_ppo(
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     initial_entropy_coef = entropy_coef
-    min_entropy_coef = 0.01  # Prevent collapse to fully deterministic policy
+    min_entropy_coef = 0.005  # Prevent collapse to fully deterministic policy
     all_epoch_rewards = []
     early_stop = False
 
@@ -282,6 +282,11 @@ def train_ppo(
         avg_value_loss = np.mean(value_losses)
         avg_entropy = np.mean(entropies)
         all_epoch_rewards.append(avg_reward)
+
+        logger.info(
+            f"📈 Epoch {epoch+1}: Avg Return={avg_return:.3f}, "
+            f"Avg Value={avg_value:.3f}, EV={ev:.3f}"
+        )
 
         # 핵심 로그 출력
         logger.info(

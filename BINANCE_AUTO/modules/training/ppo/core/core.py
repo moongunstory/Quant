@@ -24,14 +24,7 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95, normal
 
 
 def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
-    """Compute PPO clipped surrogate loss with additional safety checks."""
-
-    # Min-max scale advantages to [-1, 1] regardless of normalization state
-    adv_max = advantages.max()
-    adv_min = advantages.min()
-    if (adv_max - adv_min) > 1e-8:
-        advantages = 2 * (advantages - adv_min) / (adv_max - adv_min) - 1
-    advantages = torch.clamp(advantages, -1.0, 1.0)
+    """Compute PPO clipped surrogate loss."""
 
     ratio = torch.exp(new_log_probs - old_log_probs)
 

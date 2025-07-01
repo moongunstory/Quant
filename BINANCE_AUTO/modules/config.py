@@ -105,7 +105,7 @@ PPO_CONFIG = {
     'epochs': 20,
     'batch_size': 256,
     'entropy_coef': 0.02,
-    'value_coef': 0.5,
+    'value_coef': 0.05,
     'clip_eps': 0.2,
     'gamma': 0.99,
     'lambda': 0.95
