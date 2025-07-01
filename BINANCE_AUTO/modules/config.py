@@ -99,6 +99,16 @@ VALUE_COEF = 0.5           # value loss 가중치
 ENTROPY_COEF = 0.02        # entropy 가중치
 
 
+WINDOW_SIZE = 32
+# 행동 공간 차원 (2 → enter/hold 분류)
+ACTION_DIM = 2
+# 모방 학습용 에폭 수
+EPOCHS = 10
+# 배치 크기
+BATCH_SIZE = 64
+# 가치망 손실 가중치 (value_loss_coef)
+VALUE_LOSS_COEF = 0.2  # 일반적으로 0.1 ~ 0.5 사이
+
 # Consolidated PPO configuration
 PPO_CONFIG = {
     'learning_rate': 1e-4,
