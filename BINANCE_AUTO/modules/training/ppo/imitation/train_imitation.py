@@ -219,7 +219,7 @@ def calculate_tp_sl_hits_optimized(entry_df: pd.DataFrame, eval_df: pd.DataFrame
             
             # 타임존 안전한 슬라이싱
             future_end = entry_time + pd.Timedelta(minutes=60)
-            future_mask = (eval_df.index >= entry_time) & (eval_df.index <= future_end)
+            future_mask = (eval_df.index > entry_time) & (eval_df.index <= future_end)
             future_data = eval_df.loc[future_mask]
             
             if len(future_data) > 0:
