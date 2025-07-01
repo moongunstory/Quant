@@ -69,8 +69,11 @@ class PPOPolicyNetwork(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim // 2, 1)
         )
 
     def forward(self, x: Dict[str, torch.Tensor]):
