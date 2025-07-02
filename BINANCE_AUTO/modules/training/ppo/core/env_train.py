@@ -334,14 +334,22 @@ class PPOTradingEnv:
             else:  # Hold
                 reward = base_reward - abs(shaped_reward) * 0.1  # Hold시 기회비용
 
-        if logger.isEnabledFor(logging.DEBUG) and action == 1 and abs(reward) >= 0.3:
-            logger.debug(
-                f"[REWARD] idx={self.step_count}, action={action}, "
-                f"base={base_reward:.3f}, shaped={shaped_reward:.3f}, total={reward:.3f}"
+        if logger.isEnabledFor(logging.DEBUG):
+            should_log = (
+                shaped_reward >= 0.05
+                or shaped_reward <= -0.05
+                or base_reward == 0.5
+                or base_reward == -0.5
+                or (action == 1 and reward < 0)
             )
-            logger.debug(
-                f"→ TP={tp_hit}, SL={sl_hit}, price_change={price_change:.4f}"
-            )
+            if should_log and self.step_count % 500 == 0:
+                logger.debug(
+                    f"[REWARD] idx={self.step_count}, action={action}, "
+                    f"base={base_reward:.3f}, shaped={shaped_reward:.3f}, total={reward:.3f}"
+                )
+                logger.debug(
+                    f"→ TP={tp_hit}, SL={sl_hit}, price_change={price_change:.4f}"
+                )
 
         # Move to next state
         self.ptr += 1
