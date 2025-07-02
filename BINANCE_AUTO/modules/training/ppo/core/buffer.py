@@ -47,34 +47,26 @@ class RolloutBuffer:
         self.log_probs.append(log_prob)
         self.values.append(value)
 
-    def compute_returns_and_advantages(self, last_value: torch.Tensor, gamma: float = 0.99, 
-                                     lam: float = 0.95, normalize: bool = True):
-        """
-        Compute returns and advantages using GAE
-        
-        Args:
-            last_value: Value of the last state
-            gamma: Discount factor
-            lam: GAE lambda parameter
-            normalize: Whether to normalize advantages
-        """
+    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99, 
+                                    lam: float = 0.95, normalize: bool = True):
+        # 모든 값을 float로 통일
         values = self.values + [last_value]
-        gae = 0
+        gae = 0.0
         self.returns = []
         self.advantages = []
 
         for t in reversed(range(len(self.rewards))):
-            # Convert done to float to prevent type errors
-            done_float = float(self.dones[t])
-            delta = self.rewards[t] + gamma * values[t + 1] * (1 - done_float) - values[t]
-            gae = delta + gamma * lam * (1 - done_float) * gae
+            done_float = 1.0 if self.dones[t] else 0.0  # bool을 명시적으로 float 변환
+            delta = self.rewards[t] + gamma * values[t + 1] * (1.0 - done_float) - values[t]
+            gae = delta + gamma * lam * (1.0 - done_float) * gae
             self.advantages.insert(0, gae)
             self.returns.insert(0, gae + values[t])
 
+        # 안정적인 정규화
         advantages = torch.tensor(self.advantages, dtype=torch.float32)
         returns = torch.tensor(self.returns, dtype=torch.float32)
 
-        if normalize:
+        if normalize and advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         self.advantages = advantages

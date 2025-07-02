@@ -88,7 +88,6 @@ def init_value_head_weights(model: PPOPolicyNetwork):
         model.value_head.apply(init_weights)
         logger.info("🧹 Single value head 랜덤 초기화 완료")
 
-
 def train_ppo(
     direction: str,
     csv_path: str,
@@ -98,16 +97,16 @@ def train_ppo(
     total_epochs: int = PPO_CONFIG["epochs"],
     batch_size: int = PPO_CONFIG["batch_size"],
     gamma: float = PPO_CONFIG["gamma"],
-    lam: float = PPO_CONFIG["lambda"],
+    lam: float = 0.85,  # ← 수정됨
     clip_eps: float = PPO_CONFIG["clip_eps"],
-    value_coef: float = PPO_CONFIG["value_coef"],
+    value_coef: float = 2.0,
     entropy_coef: float = PPO_CONFIG["entropy_coef"],
     lr: float = PPO_CONFIG["learning_rate"],
     max_steps: int = PPO_CONFIG["max_steps"],
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, Any]:
     logger.info(f"🔁 [{direction.upper()}] PPO 학습 시작 (MTF)")
-    logger.info(f"📁 [{direction.upper()}] CSV 파일: {csv_path}")
+    logger.info(f"📁 [{direction.upper()}] PKL 파일: {csv_path}")
     logger.info(
         f"🎯 [{direction.upper()}] epochs={total_epochs}, batch_size={batch_size}, lr={lr}, device={device}"
     )
@@ -115,8 +114,7 @@ def train_ppo(
 
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
-    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=PPO_CONFIG["seq_len"], reward_scale=10.0)
-
+    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=PPO_CONFIG["seq_len"], reward_scale=3.0)  # 10.0 → 3.0으로 감소
 
     # MTF 입력 차원 정보 가져오기
     input_dims = env.get_input_dims()  # Returns Dict[str, int]
@@ -160,7 +158,20 @@ def train_ppo(
 
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+        # Value function과 Policy function에 다른 학습률 적용
+    policy_params = []
+    value_params = []
+
+    for name, param in model.named_parameters():
+        if 'value_head' in name:
+            value_params.append(param)
+        else:
+            policy_params.append(param)
+
+    optimizer = optim.Adam([
+        {'params': policy_params, 'lr': lr},
+        {'params': value_params, 'lr': lr * 5.0}  # Value head는 5배 빠른 학습률
+    ])
     initial_entropy_coef = entropy_coef
     min_entropy_coef = 0.005  # Prevent collapse to fully deterministic policy
     all_epoch_rewards = []
@@ -209,7 +220,7 @@ def train_ppo(
             obs_tensor = convert_obs_to_tensor(obs, device)
             _, _, last_value, _ = model.get_action(obs_tensor)
 
-        buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=lam)
+        buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=0.90)  # lam 대신 0.90 직접 사용
 
         if logger.isEnabledFor(logging.DEBUG):
             rewards_arr = np.array(episode_rewards)
@@ -264,11 +275,13 @@ def train_ppo(
             old_logprob_batch = old_logprob_batch.to(device)
 
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
+            # Value 클리핑으로 극단값 방지
+            values = torch.clamp(values, -50.0, 50.0)
             entropy = torch.clamp(entropy, min=0.005, max=2.0)  # 최대값도 제한
             policy_loss = compute_ppo_loss(
                 log_probs, old_logprob_batch, adv_batch, clip_eps
             )
-            value_loss = compute_value_loss(values, return_batch)
+            value_loss = compute_value_loss(values, return_batch, normalize=True)
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
 
             optimizer.zero_grad()
