@@ -9,7 +9,7 @@ from modules.training.ppo.core.model import PPOPolicyNetwork
 from modules.training.ppo.core.core import (
     compute_ppo_loss, compute_value_loss, compute_explained_variance
 )
-from modules.config import TIMEFRAMES  # Import timeframes configuration
+from modules.config import TIMEFRAMES, PPO_CONFIG  # Import timeframes configuration
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -20,14 +20,14 @@ def train_ppo_live(
     imitation_model_path: str,
     value_model_path: str,
     save_path: str,
-    total_epochs: int = 5,
-    batch_size: int = 64,
-    gamma: float = 0.99,
-    lam: float = 0.95,
-    clip_eps: float = 0.2,
-    value_coef: float = 0.05,
-    entropy_coef: float = 0.02,
-    lr: float = 2.5e-4,
+    total_epochs: int = PPO_CONFIG["epochs"],
+    batch_size: int = PPO_CONFIG["batch_size"],
+    gamma: float = PPO_CONFIG["gamma"],
+    lam: float = PPO_CONFIG["lambda"],
+    clip_eps: float = PPO_CONFIG["clip_eps"],
+    value_coef: float = PPO_CONFIG["value_coef"],
+    entropy_coef: float = PPO_CONFIG["entropy_coef"],
+    lr: float = PPO_CONFIG["learning_rate"],
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ):
     logger.info(f"🚀 PPO 실전 학습 시작: {direction.upper()}")
@@ -47,9 +47,9 @@ def train_ppo_live(
 
     # Initialize model with appropriate input configuration
     if input_dims is not None:
-        model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=256).to(device)
+        model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"]).to(device)
     else:
-        model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=256).to(device)
+        model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=PPO_CONFIG["hidden_dim"]).to(device)
     
     model.load_model(imitation_model_path, allow_partial=True)
     logger.info("📦 모방 학습 모델 로드 완료")

@@ -21,8 +21,8 @@ from modules.config import (
     LGBM_MODEL_PATHS,
     TIMEFRAMES,
     FEATURE_CATEGORIES_BY_TF,
-    SEQ_LEN,
-    RAW_DATA_PATH
+    PPO_CONFIG,
+    RAW_DATA_PATH,
 )
 
 def load_mtf_data() -> Dict[str, pd.DataFrame]:
@@ -85,7 +85,7 @@ def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame],
         feature_cols = filter_features_by_timeframe(df, timeframe)
         df = df[feature_cols].ffill().fillna(0)
 
-        print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {SEQ_LEN}")
+        print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {PPO_CONFIG["seq_len"]}")
 
         # 미리 인덱스 및 값 추출
         index_list = df.index.to_list()
@@ -101,12 +101,12 @@ def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame],
 
             pos = bisect.bisect_right(index_list, t)
 
-            if pos >= SEQ_LEN:
-                seq = values[pos - SEQ_LEN:pos]
+            if pos >= PPO_CONFIG["seq_len"]:
+                seq = values[pos - PPO_CONFIG["seq_len"]:pos]
                 sequences.append(seq)
                 valid_indices.append(index_list[pos - 1])
             elif pos > 0:
-                pad_len = SEQ_LEN - pos
+                pad_len = PPO_CONFIG["seq_len"] - pos
                 padded = np.vstack([
                     np.zeros((pad_len, values.shape[1])),
                     values[:pos]
@@ -137,11 +137,11 @@ def flatten_mtf_sequences(mtf_sequences: Dict[str, np.ndarray]) -> np.ndarray:
         if timeframe not in mtf_sequences:
             continue
         
-        sequences = mtf_sequences[timeframe]  # Shape: (N, SEQ_LEN, features)
+        sequences = mtf_sequences[timeframe]  # Shape: (N, PPO_CONFIG["seq_len"], features)
         n_samples, seq_len, n_features = sequences.shape
         
         # 시퀀스를 평면화 (각 타임스텝과 피처를 별도 컬럼으로)
-        flat_data = sequences.reshape(n_samples, -1)  # Shape: (N, SEQ_LEN * features)
+        flat_data = sequences.reshape(n_samples, -1)  # Shape: (N, PPO_CONFIG["seq_len"] * features)
         flattened_features.append(flat_data)
         
         # 피처명 생성
@@ -346,7 +346,7 @@ def save_model(model: lgb.LGBMClassifier, metrics: Dict, data_type: str = "long"
     print(f"  - Recall: {metrics['recall']:.4f}")
     print(f"  - Signal Rate: {metrics['signal_rate']:.2%}")
     print(f"  - Timeframes: {TIMEFRAMES}")
-    print(f"  - Sequence Length: {SEQ_LEN}")
+    print(f"  - Sequence Length: {PPO_CONFIG["seq_len"]}")
 
 def show_feature_importance(model: lgb.LGBMClassifier, feature_names: List[str], 
                            data_type: str = "long", top_k: int = 20):
@@ -375,7 +375,7 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     print(f"\n{'='*60}")
     print(f"🚀 {data_type.upper()} MTF LGBM 모델 학습 시작")
     print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
-    print(f"📏 Sequence Length: {SEQ_LEN}")
+    print(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
     print(f"{'='*60}")
     
     # 1. MTF 데이터 로딩
@@ -439,7 +439,7 @@ def main():
     print("=" * 80)
     print("🚀 MTF LGBM Long/Short 이진분류 모델 학습 시작")
     print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
-    print(f"📏 Sequence Length: {SEQ_LEN}")
+    print(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
     print("=" * 80)
     
     results = {}
@@ -465,7 +465,7 @@ def main():
     print(f"   ✅ {LGBM_MODEL_PATHS['short']}")
     print(f"\n🔧 MTF 설정:")
     print(f"   📊 Timeframes: {TIMEFRAMES}")
-    print(f"   📏 Sequence Length: {SEQ_LEN}")
+    print(f"   📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
     print(f"   🎯 Threshold: {LGBM_THRESHOLD}")
     print(f"{'=' * 80}")
     

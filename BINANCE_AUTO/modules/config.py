@@ -71,31 +71,29 @@ LONG_THRESHOLD = 0.685
 SHORT_THRESHOLD = 0.685
 
 # === PPO Hyperparameters ===
-SEQ_LEN = 32
-HIDDEN_DIM = 128
-PPO_MAX_STEPS = 2048
-PPO_BUFFER_SIZE = 2048
-
-# Consolidated PPO configuration (override individual below)
 PPO_CONFIG = {
-    'learning_rate': 1e-4,
-    'epochs': 20,
-    'batch_size': 256,
-    'entropy_coef': 0.02,
-    'value_coef': 0.05,  # Only keep this
-    'clip_eps': 0.2,
-    'gamma': 0.99,
-    'lambda': 0.95
+    "seq_len": 32,
+    "hidden_dim": 128,
+    "max_steps": 2048,
+    "buffer_size": 2048,
+    "learning_rate": 1e-4,
+    "epochs": 20,
+    "batch_size": 256,
+    "entropy_coef": 0.02,
+    "value_coef": 0.05,
+    "clip_eps": 0.2,
+    "gamma": 0.99,
+    "lambda": 0.95,
+    "action_dim": 2,
 }
 
 # === Imitation Learning Config ===
-EPOCHS = 10
-BATCH_SIZE = 64
-VALUE_LOSS_COEF = 0.2
-
-# === Other Settings ===
-WINDOW_SIZE = SEQ_LEN
-ACTION_DIM = 2
+IMITATION_CONFIG = {
+    "epochs": 10,
+    "batch_size": 64,
+    "learning_rate": 1e-4,
+    "value_loss_coef": 0.2,
+}
 
 # === Features Per Timeframe ===
 FEATURE_CATEGORIES_BY_TF = {

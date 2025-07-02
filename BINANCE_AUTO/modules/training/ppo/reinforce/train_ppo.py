@@ -23,9 +23,6 @@ from modules.config import (
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_FINAL_MODEL_PATHS,
     TIMEFRAMES,
-    SEQ_LEN,
-    HIDDEN_DIM,
-    PPO_MAX_STEPS,
     PPO_CONFIG,
 )
 
@@ -106,7 +103,7 @@ def train_ppo(
     value_coef: float = PPO_CONFIG["value_coef"],
     entropy_coef: float = PPO_CONFIG["entropy_coef"],
     lr: float = PPO_CONFIG["learning_rate"],
-    max_steps: int = PPO_MAX_STEPS,
+    max_steps: int = PPO_CONFIG["max_steps"],
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, Any]:
     logger.info(f"🔁 [{direction.upper()}] PPO 학습 시작 (MTF)")
@@ -114,11 +111,11 @@ def train_ppo(
     logger.info(
         f"🎯 [{direction.upper()}] epochs={total_epochs}, batch_size={batch_size}, lr={lr}, device={device}"
     )
-    logger.info(f"🕒 [{direction.upper()}] Timeframes: {TIMEFRAMES}, seq_len={SEQ_LEN}")
+    logger.info(f"🕒 [{direction.upper()}] Timeframes: {TIMEFRAMES}, seq_len={PPO_CONFIG["seq_len"]}")
 
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
-    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=SEQ_LEN, reward_scale=10.0)
+    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=PPO_CONFIG["seq_len"], reward_scale=10.0)
 
 
     # MTF 입력 차원 정보 가져오기
@@ -126,7 +123,7 @@ def train_ppo(
     logger.info(f"📊 [{direction.upper()}] 환경 생성 완료: input_dims={input_dims}")
 
     # MTF 지원 PPO 모델 초기화
-    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=HIDDEN_DIM).to(
+    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"]).to(
         device
     )
 
@@ -419,5 +416,5 @@ if __name__ == "__main__":
 
     logger.info("🎉 모든 PPO 강화학습 훈련이 완료되었습니다! (MTF)")
     logger.info(f"🕒 사용된 Timeframes: {TIMEFRAMES}")
-    logger.info(f"📏 Sequence Length: {SEQ_LEN}")
-    logger.info(f"🧠 Hidden Dimension: {HIDDEN_DIM}")
+    logger.info(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
+    logger.info(f"🧠 Hidden Dimension: {PPO_CONFIG["hidden_dim"]}")
