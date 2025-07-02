@@ -17,7 +17,7 @@ class PPOTradingEnv:
         reference_timeframe: str = "15min",
         hold_reward: float = 0.001,
         include_all_scenarios: bool = True,
-        reward_scale: float = 1.0,
+        reward_scale: float = 10.0,
     ):
         """
         MTF PPO Trading Environment
@@ -312,6 +312,7 @@ class PPOTradingEnv:
         if self.ptr >= len(self.entry_indices) - 1:
             done = True
 
+        print(f"[STEP DEBUG] action={action}, tp_hit={tp_hit}, sl_hit={sl_hit}, reward={reward:.4f}")
         return self._get_state(), reward, done, info
 
     def get_action_space_size(self):

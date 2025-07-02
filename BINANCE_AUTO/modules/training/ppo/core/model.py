@@ -73,7 +73,6 @@ class PPOPolicyNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.LayerNorm(hidden_dim // 2),
             nn.Linear(hidden_dim // 2, 1)
         )
 
