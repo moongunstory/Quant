@@ -39,7 +39,7 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns, normalize=True):  # 기본값을 True로 변경
+def compute_value_loss(values, returns, normalize=False):  # True → False로 변경
     """MSE between predicted state value and return."""
     if returns.std() < 1e-3:
         returns = returns + torch.randn_like(returns) * 1e-2
