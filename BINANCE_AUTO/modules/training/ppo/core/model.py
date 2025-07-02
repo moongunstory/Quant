@@ -79,11 +79,15 @@ class PPOPolicyNetwork(nn.Module):
         self._init_value_head()
 
     def _init_value_head(self):
-        """Initialize value head weights using Xavier uniform."""
-        for m in self.value_head.modules():
+        """Initialize value head weights using proper scaling."""
+        for i, m in enumerate(self.value_head.modules()):
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=2.0)
-                nn.init.zeros_(m.bias)
+                if i == len(list(self.value_head.modules())) - 1:  # 마지막 레이어
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)  # 매우 작은 초기값
+                    nn.init.constant_(m.bias, 0.8) 
+                else:
+                    nn.init.xavier_uniform_(m.weight, gain=1.0)  # 정상적인 gain
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: Dict[str, torch.Tensor]):
         """
