@@ -499,7 +499,7 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
             X_reshaped = X_values.reshape(num_windows, PPO_CONFIG["seq_len"], num_features)
         except ValueError as e:
             logger.error(f"Reshape 오류 - {timeframe}: {e}")
-            logger.error(f"Shape: {X_values.shape}, Target: ({num_windows}, {PPO_CONFIG["seq_len"]}, {num_features})")
+            logger.error(f"Shape: {X_values.shape}, Target: ({num_windows}, {PPO_CONFIG['seq_len']}, {num_features})")
             raise
         
         mtf_features_array[timeframe] = X_reshaped
