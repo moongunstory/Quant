@@ -111,7 +111,7 @@ def train_ppo(
     logger.info(
         f"🎯 [{direction.upper()}] epochs={total_epochs}, batch_size={batch_size}, lr={lr}, device={device}"
     )
-    logger.info(f"🕒 [{direction.upper()}] Timeframes: {TIMEFRAMES}, seq_len={PPO_CONFIG["seq_len"]}")
+    logger.info(f"🕒 [{direction.upper()}] Timeframes: {TIMEFRAMES}, seq_len={PPO_CONFIG['seq_len']}")
 
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
@@ -416,5 +416,5 @@ if __name__ == "__main__":
 
     logger.info("🎉 모든 PPO 강화학습 훈련이 완료되었습니다! (MTF)")
     logger.info(f"🕒 사용된 Timeframes: {TIMEFRAMES}")
-    logger.info(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
-    logger.info(f"🧠 Hidden Dimension: {PPO_CONFIG["hidden_dim"]}")
+    logger.info(f"📏 Sequence Length: {PPO_CONFIG['seq_len']}")
+    logger.info(f"🧠 Hidden Dimension: {PPO_CONFIG['hidden_dim']}")
