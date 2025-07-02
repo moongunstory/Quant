@@ -1,10 +1,10 @@
 import torch
 import numpy as np
 from typing import Dict, List, Generator, Tuple
-from modules.config import PPO_BUFFER_SIZE, TIMEFRAMES
+from modules.config import PPO_CONFIG, TIMEFRAMES
 
 class RolloutBuffer:
-    def __init__(self, buffer_size: int = PPO_BUFFER_SIZE):
+    def __init__(self, buffer_size: int = PPO_CONFIG["buffer_size"]):
         """
         MTF RolloutBuffer for PPO training
         
