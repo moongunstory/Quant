@@ -13,13 +13,14 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95, normal
     values = values + [last_value]
 
     N = len(rewards)
-    sample_indices = set(np.linspace(0, N - 1, num=10, dtype=int))  # 균등하게 10개 위치 선택
+    # Only log at start, middle and end to reduce log volume
+    log_indices = {0, N // 2, N - 1}
 
     for t in reversed(range(N)):
         delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
         gae = delta + gamma * lam * (1 - dones[t]) * gae
 
-        if logger.isEnabledFor(logging.DEBUG) and t in sample_indices:
+        if logger.isEnabledFor(logging.DEBUG) and t in log_indices:
             logger.debug(
                 f"[GAE] t={t} | reward={rewards[t]:.3f}, value={values[t]:.3f}, "
                 f"delta={delta:.3f}, done={int(dones[t])}, gae={gae:.3f}"

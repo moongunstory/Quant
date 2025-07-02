@@ -71,14 +71,15 @@ class RolloutBuffer:
         self.advantages = []
 
         N = len(self.rewards)
-        sample_indices = set(np.linspace(0, N - 1, num=min(10, N), dtype=int))
+        # Only log at start, middle and end to reduce noise
+        log_indices = {0, N // 2, N - 1}
 
         for t in reversed(range(N)):
             # Convert done to float to prevent type errors
             done_float = float(self.dones[t])
             delta = self.rewards[t] + gamma * values[t + 1] * (1 - done_float) - values[t]
             gae = delta + gamma * lam * (1 - done_float) * gae
-            if logger.isEnabledFor(logging.DEBUG) and t in sample_indices:
+            if logger.isEnabledFor(logging.DEBUG) and t in log_indices:
                 logger.debug(
                     f"[GAE] t={t} | reward={self.rewards[t]:.3f}, value={values[t]:.3f}, "
                     f"delta={delta:.3f}, done={int(done_float)}, gae={gae:.3f}"

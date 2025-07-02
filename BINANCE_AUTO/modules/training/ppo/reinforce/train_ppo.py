@@ -301,9 +301,10 @@ def train_ppo(
                     if val_check_count >= 20:
                         break
                     error = v.item() - r.item()
-                    logger.debug(
-                        f"[VAL-CHECK] value={v.item():.3f}, return={r.item():.3f}, error={error:.3f}"
-                    )
+                    if abs(error) >= 0.5:
+                        logger.debug(
+                            f"[VAL-CHECK] value={v.item():.3f}, return={r.item():.3f}, error={error:.3f}"
+                        )
                     val_check_count += 1
             policy_loss = compute_ppo_loss(
                 log_probs, old_logprob_batch, adv_batch, clip_eps
@@ -322,7 +323,8 @@ def train_ppo(
                         grad_squares.append(param.grad.norm() ** 2)
                 if grad_squares:
                     grad_norm = float(torch.sqrt(sum(grad_squares)))
-                    logger.debug(f"[GRAD] Value head grad norm = {grad_norm:.6f}")
+                    if grad_norm < 0.05 or grad_norm > 5.0:
+                        logger.debug(f"[GRAD] Value head grad norm = {grad_norm:.6f}")
 
             optimizer.step()
 
