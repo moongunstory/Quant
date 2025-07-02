@@ -70,12 +70,15 @@ class RolloutBuffer:
         self.returns = []
         self.advantages = []
 
-        for t in reversed(range(len(self.rewards))):
+        N = len(self.rewards)
+        sample_indices = set(np.linspace(0, N - 1, num=min(10, N), dtype=int))
+
+        for t in reversed(range(N)):
             # Convert done to float to prevent type errors
             done_float = float(self.dones[t])
             delta = self.rewards[t] + gamma * values[t + 1] * (1 - done_float) - values[t]
             gae = delta + gamma * lam * (1 - done_float) * gae
-            if logger.isEnabledFor(logging.DEBUG):
+            if logger.isEnabledFor(logging.DEBUG) and t in sample_indices:
                 logger.debug(
                     f"[GAE] t={t} | reward={self.rewards[t]:.3f}, value={values[t]:.3f}, "
                     f"delta={delta:.3f}, done={int(done_float)}, gae={gae:.3f}"
