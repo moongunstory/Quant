@@ -133,11 +133,32 @@ def train_ppo(
     logger.info(f"📦 [{direction.upper()}] 모방학습 모델 로딩: {imitation_model_path}")
     model.load_model(imitation_model_path, allow_partial=True)
 
-    # 가치 헤드 랜덤 초기화 (사전학습 없이)
-    logger.info(
-        f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다."
-    )
-    init_value_head_weights(model)
+    if os.path.exists(value_model_path):
+        logger.info(
+            f"📥 [{direction.upper()}] 가치망 로딩 시도: {value_model_path}"
+        )
+        try:
+            state_dict = torch.load(value_model_path, map_location="cpu")
+            current = model.state_dict()
+            loaded_keys = []
+            for k, v in state_dict.items():
+                if k.startswith("value_head") and k in current and current[k].shape == v.shape:
+                    current[k] = v
+                    loaded_keys.append(k)
+            model.load_state_dict(current)
+            logger.info(
+                f"✅ [{direction.upper()}] 가치망 로드 완료 ({len(loaded_keys)} tensors)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ [{direction.upper()}] 가치망 로딩 실패: {e}. 랜덤 초기화 수행"
+            )
+            init_value_head_weights(model)
+    else:
+        logger.info(
+            f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다."
+        )
+        init_value_head_weights(model)
 
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
@@ -224,6 +245,8 @@ def train_ppo(
         batch_returns = []
         batch_evs = []
         value_ranges = []
+        epoch_values_list = []
+        epoch_returns_list = []
 
         last_values = None
         last_returns = None
@@ -267,6 +290,9 @@ def train_ppo(
             )
             value_ranges.append((values.min().item(), values.max().item()))
 
+            epoch_values_list.extend(values.detach().cpu().numpy().tolist())
+            epoch_returns_list.extend(return_batch.detach().cpu().numpy().tolist())
+
             last_values = values.detach().cpu()
             last_returns = return_batch.detach().cpu()
 
@@ -282,6 +308,13 @@ def train_ppo(
         avg_value_loss = np.mean(value_losses)
         avg_entropy = np.mean(entropies)
         all_epoch_rewards.append(avg_reward)
+
+        corr = 0.0
+        if len(epoch_values_list) > 1:
+            corr = np.corrcoef(epoch_values_list, epoch_returns_list)[0, 1]
+        val_std = np.std(epoch_values_list) if epoch_values_list else 0.0
+        ret_std = np.std(epoch_returns_list) if epoch_returns_list else 0.0
+        scale_ratio = val_std / (ret_std + 1e-8)
 
         logger.info(
             f"📈 Epoch {epoch+1}: Avg Return={avg_return:.3f}, "
@@ -299,6 +332,11 @@ def train_ppo(
             f"🔧 [{direction.upper()} Epoch {epoch+1}/{total_epochs}] "
             f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
             f"Entropy: {avg_entropy:.4f} | Entropy Coef: {entropy_coef:.4f}"
+        )
+
+        logger.info(
+            f"📏 Value range: {value_min:.3f}..{value_max:.3f} | "
+            f"std ratio (val/ret): {scale_ratio:.3f} | corr: {corr:.3f}"
         )
 
         if monitor_training_health(ev, avg_entropy):
