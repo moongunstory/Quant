@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import pickle
-import os
-from typing import Dict, Union
+from typing import Dict
 
 # Import config values
 from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON, TIMEFRAMES
@@ -53,9 +52,11 @@ class PPOTradingEnv:
 
     def _load_mtf_data(self, data_path: str):
         """Load MTF data from pickle or npz file"""
+        from modules.training.ppo.reinforce.train_ppo import load_cached_pickle  # 필요시 위치 조정
+
         if data_path.endswith(".pkl"):
-            with open(data_path, "rb") as f:
-                self.mtf_data = pickle.load(f)
+            self.mtf_data = load_cached_pickle(data_path)
+
         elif data_path.endswith(".npz"):
             loaded = np.load(data_path, allow_pickle=True)
             self.mtf_data = loaded["data"].item()  # Convert back to dict
