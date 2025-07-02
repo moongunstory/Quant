@@ -1,17 +1,19 @@
 import torch
 import torch.optim as optim
 import numpy as np
-import pandas as pd
 import os
 import sys
 import logging
-from typing import Dict, Any, Tuple
+import joblib 
+from typing import Dict, Any
 
 # 로깅 설정
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG,  # ← 여기만 바꿈
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../../../"))
@@ -35,6 +37,19 @@ from modules.training.ppo.core.core import (
     compute_explained_variance,
 )
 
+def load_cached_pickle(path: str):
+    cache_path = path.replace(".pkl", ".joblib")
+    if os.path.exists(cache_path):
+        logger.info(f"📥 캐시된 joblib 파일 로딩: {cache_path}")
+        return joblib.load(cache_path)
+    else:
+        logger.info(f"📦 원본 pkl 파일 로딩: {path}")
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        joblib.dump(data, cache_path)
+        logger.info(f"💾 캐시 저장 완료: {cache_path}")
+        return data
 
 def move_obs_to_device(
     obs: Dict[str, torch.Tensor], device: torch.device
@@ -114,7 +129,7 @@ def train_ppo(
 
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
-    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=PPO_CONFIG["seq_len"], reward_scale=3.0)  # 10.0 → 3.0으로 감소
+    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=PPO_CONFIG["seq_len"], reward_scale=0.5)  
 
     # MTF 입력 차원 정보 가져오기
     input_dims = env.get_input_dims()  # Returns Dict[str, int]
