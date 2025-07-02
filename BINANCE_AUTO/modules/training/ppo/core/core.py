@@ -1,5 +1,8 @@
 import torch
 import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
 
 def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95, normalize=True):
     """
@@ -12,10 +15,25 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95, normal
     for t in reversed(range(len(rewards))):
         delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
         gae = delta + gamma * lam * (1 - dones[t]) * gae
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[GAE] t={t} | reward={rewards[t]:.3f}, value={values[t]:.3f}, "
+                f"delta={delta:.3f}, done={int(dones[t])}, gae={gae:.3f}"
+            )
         advantages.insert(0, gae)
 
     advantages = torch.tensor(advantages, dtype=torch.float32)
     returns = advantages + torch.tensor(values[:-1], dtype=torch.float32)
+
+    if logger.isEnabledFor(logging.DEBUG) and len(advantages) > 0:
+        logger.debug(
+            f"[GAE] Advantage dist → mean={advantages.mean():.3f}, "
+            f"std={advantages.std():.3f}, min={advantages.min():.3f}, max={advantages.max():.3f}"
+        )
+        logger.debug(
+            f"[GAE] Return dist → mean={returns.mean():.3f}, "
+            f"std={returns.std():.3f}, min={returns.min():.3f}, max={returns.max():.3f}"
+        )
 
     if normalize:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

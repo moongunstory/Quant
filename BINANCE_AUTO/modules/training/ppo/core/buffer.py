@@ -1,7 +1,10 @@
 import torch
 import numpy as np
+import logging
 from typing import Dict, List, Generator, Tuple
 from modules.config import PPO_CONFIG, TIMEFRAMES
+
+logger = logging.getLogger(__name__)
 
 class RolloutBuffer:
     def __init__(self, buffer_size: int = PPO_CONFIG["buffer_size"]):
@@ -47,7 +50,7 @@ class RolloutBuffer:
         self.log_probs.append(log_prob)
         self.values.append(value)
 
-    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99, 
+    def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99,
                                     lam: float = 0.95, normalize: bool = True):
         # 모든 값을 float로 통일
         values = self.values + [last_value]
@@ -59,12 +62,27 @@ class RolloutBuffer:
             done_float = 1.0 if self.dones[t] else 0.0  # bool을 명시적으로 float 변환
             delta = self.rewards[t] + gamma * values[t + 1] * (1.0 - done_float) - values[t]
             gae = delta + gamma * lam * (1.0 - done_float) * gae
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"[GAE] t={t} | reward={self.rewards[t]:.3f}, value={values[t]:.3f}, "
+                    f"delta={delta:.3f}, done={int(done_float)}, gae={gae:.3f}"
+                )
             self.advantages.insert(0, gae)
             self.returns.insert(0, gae + values[t])
 
-        # 안정적인 정규화
+        # 안정적인 정규화 전 통계
         advantages = torch.tensor(self.advantages, dtype=torch.float32)
         returns = torch.tensor(self.returns, dtype=torch.float32)
+
+        if logger.isEnabledFor(logging.DEBUG) and len(advantages) > 0:
+            logger.debug(
+                f"[GAE] Advantage dist → mean={advantages.mean():.3f}, "
+                f"std={advantages.std():.3f}, min={advantages.min():.3f}, max={advantages.max():.3f}"
+            )
+            logger.debug(
+                f"[GAE] Return dist → mean={returns.mean():.3f}, "
+                f"std={returns.std():.3f}, min={returns.min():.3f}, max={returns.max():.3f}"
+            )
 
         if normalize and advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

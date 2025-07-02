@@ -3,8 +3,11 @@ import numpy as np
 import pickle
 import os
 import re
+import logging
 from typing import Dict, Union, Generator, Tuple
 from modules.config import TIMEFRAMES
+
+logger = logging.getLogger(__name__)
 
 class RolloutBuffer:
     def __init__(self, buffer_size: int):
@@ -72,11 +75,26 @@ class RolloutBuffer:
             done_float = float(self.dones[t])
             delta = self.rewards[t] + gamma * values[t + 1] * (1 - done_float) - values[t]
             gae = delta + gamma * lam * (1 - done_float) * gae
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"[GAE] t={t} | reward={self.rewards[t]:.3f}, value={values[t]:.3f}, "
+                    f"delta={delta:.3f}, done={int(done_float)}, gae={gae:.3f}"
+                )
             self.advantages.insert(0, gae)
             self.returns.insert(0, gae + values[t])
 
         advantages = torch.tensor(self.advantages, dtype=torch.float32)
         returns = torch.tensor(self.returns, dtype=torch.float32)
+
+        if logger.isEnabledFor(logging.DEBUG) and len(advantages) > 0:
+            logger.debug(
+                f"[GAE] Advantage dist → mean={advantages.mean():.3f}, "
+                f"std={advantages.std():.3f}, min={advantages.min():.3f}, max={advantages.max():.3f}"
+            )
+            logger.debug(
+                f"[GAE] Return dist → mean={returns.mean():.3f}, "
+                f"std={returns.std():.3f}, min={returns.min():.3f}, max={returns.max():.3f}"
+            )
 
         if normalize:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

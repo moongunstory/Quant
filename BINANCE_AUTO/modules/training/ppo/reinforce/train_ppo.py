@@ -225,16 +225,16 @@ def train_ppo(
         if logger.isEnabledFor(logging.DEBUG):
             rewards_arr = np.array(episode_rewards)
             logger.debug(
-                f"Reward dist → mean:{rewards_arr.mean():.3f}, "
-                f"std:{rewards_arr.std():.3f}, min:{rewards_arr.min():.3f}, max:{rewards_arr.max():.3f}"
+                f"episode_rewards → mean={rewards_arr.mean():.3f}, "
+                f"std={rewards_arr.std():.3f}, min={rewards_arr.min():.3f}, max={rewards_arr.max():.3f}"
             )
             logger.debug(
-                f"Advantage dist → mean:{buffer.advantages.mean():.3f}, "
-                f"std:{buffer.advantages.std():.3f}, min:{buffer.advantages.min():.3f}, max:{buffer.advantages.max():.3f}"
+                f"Advantage dist → mean={buffer.advantages.mean():.3f}, "
+                f"std={buffer.advantages.std():.3f}, min={buffer.advantages.min():.3f}, max={buffer.advantages.max():.3f}"
             )
             logger.debug(
-                f"Return dist → mean:{buffer.returns.mean():.3f}, "
-                f"std:{buffer.returns.std():.3f}, min:{buffer.returns.min():.3f}, max:{buffer.returns.max():.3f}"
+                f"Return dist → mean={buffer.returns.mean():.3f}, "
+                f"std={buffer.returns.std():.3f}, min={buffer.returns.min():.3f}, max={buffer.returns.max():.3f}"
             )
 
         # 롤아웃 통계
@@ -348,6 +348,11 @@ def train_ppo(
             f"std ratio (val/ret): {scale_ratio:.3f} | corr: {corr:.3f}"
         )
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Value vs Return → corr={corr:.3f}, std_ratio={scale_ratio:.3f}"
+            )
+
         if monitor_training_health(ev, avg_entropy):
             early_stop = True
             break
@@ -358,9 +363,9 @@ def train_ppo(
             logger.warning(
                 f"⚠️ [{direction.upper()} Epoch {epoch+1}] High Variance in Advantage: std={adv_std:.3f}"
             )
-        if abs(avg_value) < 0.001:
+        if abs(avg_value) < 0.001 or val_std < 0.01:
             logger.warning(
-                f"⚠️ [{direction.upper()} Epoch {epoch+1}] Value predictions too low: {avg_value:.6f}"
+                f"⚠️ [{direction.upper()} Epoch {epoch+1}] Value predictions too flat: avg={avg_value:.6f}, std={val_std:.6f}"
             )
 
         if logger.isEnabledFor(logging.DEBUG):
