@@ -118,7 +118,8 @@ def train_ppo(
 
     # MTF 환경 생성
     logger.info(f"🧭 ENV 생성 직전: direction={direction}, csv_path={csv_path}")
-    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=SEQ_LEN)
+    env = PPOTradingEnv(data_path=csv_path, direction=direction, seq_len=SEQ_LEN, reward_scale=10.0)
+
 
     # MTF 입력 차원 정보 가져오기
     input_dims = env.get_input_dims()  # Returns Dict[str, int]
