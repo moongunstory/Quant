@@ -18,10 +18,8 @@ from modules.config import (
     PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_BUFFER_PATHS,
-    PPO_BUFFER_SIZE,
-    PPO_EPOCHS,
+    PPO_CONFIG,
     TIMEFRAMES,
-    SEQ_LEN,
     LONG_THRESHOLD,
     SHORT_THRESHOLD,
     FEATURE_CATEGORIES_BY_TF,
@@ -97,7 +95,7 @@ def main():
     
     print(f"🚀 MTF Trading System 시작")
     print(f"📊 지원 Timeframes: {TIMEFRAMES}")
-    print(f"📏 Sequence Length: {SEQ_LEN}")
+    print(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
 
     while True:
         try:
@@ -173,7 +171,7 @@ def main():
                 if os.path.exists(temp_path):
                     buffer = RolloutBuffer.load(temp_path)
                 else:
-                    buffer = RolloutBuffer(buffer_size=PPO_BUFFER_SIZE)
+                    buffer = RolloutBuffer(buffer_size=PPO_CONFIG["buffer_size"])
 
                 # 6. MTF 관찰값을 버퍼에 저장
                 action_idx = 0 if policy_action == direction else 1
@@ -199,7 +197,7 @@ def main():
                 print(
                     f"🧐 [{direction.upper()}] Action: {policy_action.upper()} {emoji} | "
                     f"Confidence: {prob:.3f} | Reward: {reward:.3f} | "
-                    f"Buffer: {len(buffer)}/{PPO_BUFFER_SIZE}"
+                    f"Buffer: {len(buffer)}/{PPO_CONFIG["buffer_size"]}"
                 )
 
                 # 8. MTF 기반 PPO 학습 실행
@@ -212,7 +210,7 @@ def main():
                             imitation_model_path=PPO_IMITATION_MODEL_PATHS[direction],
                             value_model_path=VALUE_PRETRAIN_OUTPUT_PATH[direction],
                             save_path=PPO_FINAL_MODEL_PATHS[direction],
-                            total_epochs=PPO_EPOCHS
+                            total_epochs=PPO_CONFIG["epochs"]
                         )
                         print(f"✅ PPO 학습 완료: {direction.upper()}")
                         buffer.reset()
@@ -234,7 +232,7 @@ def test_mtf_components():
     test_state = {}
     for tf in TIMEFRAMES:
         # 임의의 시퀀스 데이터 생성 (seq_len, features)
-        test_state[tf] = np.random.randn(SEQ_LEN, 10)  # 10개 피처 가정
+        test_state[tf] = np.random.randn(PPO_CONFIG["seq_len"], 10)  # 10개 피처 가정
     
     print("✅ 테스트 MTF 상태 생성 완료")
     log_mtf_shapes(test_state, "Test State")

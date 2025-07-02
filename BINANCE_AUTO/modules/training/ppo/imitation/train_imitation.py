@@ -19,9 +19,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(C
 sys.path.append(PROJECT_ROOT)
 
 from modules.config import (
-    TRAIN_PICKLE_PATHS, PPO_IMITATION_MODEL_PATHS, TIMEFRAMES, WINDOW_SIZE,
-    HIDDEN_DIM, ACTION_DIM, LEARNING_RATE, EPOCHS, BATCH_SIZE, VALUE_LOSS_COEF,
-    TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON
+    TRAIN_PICKLE_PATHS,
+    PPO_IMITATION_MODEL_PATHS,
+    TIMEFRAMES,
+    PPO_CONFIG,
+    IMITATION_CONFIG,
+    TP_THRESHOLD,
+    SL_THRESHOLD,
+    LABEL_HORIZON,
 )
 from modules.training.ppo.core.model import PPOPolicyNetwork
 
@@ -256,7 +261,7 @@ def generate_mtf_features(mtf_dict: Dict[str, pd.DataFrame]) -> Dict[str, pd.Dat
         # 시계열 윈도우 생성
         flatten_dfs = []
         for col in feature_cols:
-            for i in range(WINDOW_SIZE):
+            for i in range(PPO_CONFIG["seq_len"]):
                 shifted = df[col].shift(i + 1)
                 flatten_dfs.append(shifted.rename(f"{col}_t-{i+1}"))
         
@@ -312,14 +317,14 @@ def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val
     # 손실 함수 및 옵티마이저
     policy_criterion = nn.CrossEntropyLoss()
     value_criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=IMITATION_CONFIG["learning_rate"], weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
     
     best_f1 = 0.0
     patience_counter = 0
     max_patience = 5
     
-    for epoch in range(EPOCHS):
+    for epoch in range(IMITATION_CONFIG["epochs"]):
         # Training
         model.train()
         train_metrics = {
@@ -340,7 +345,7 @@ def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val
             # 손실 계산
             policy_loss = policy_criterion(policy_logits, target)
             value_loss = value_criterion(value.squeeze(), reward)
-            total_loss = policy_loss + VALUE_LOSS_COEF * value_loss
+            total_loss = policy_loss + IMITATION_CONFIG["value_loss_coef"] * value_loss
             
             # Backward pass
             total_loss.backward()
@@ -372,7 +377,7 @@ def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val
         scheduler.step(val_f1)
         
         # 로깅
-        logger.info(f'Epoch {epoch+1}/{EPOCHS}:')
+        logger.info(f'Epoch {epoch+1}/{IMITATION_CONFIG["epochs"]}:')
         logger.info(f'  Train - Acc: {train_accuracy:.3f}, Policy Loss: {avg_policy_loss:.3f}, Value Loss: {avg_value_loss:.3f}')
         logger.info(f'  Val   - Acc: {val_accuracy:.3f}, F1: {val_f1:.3f}')
         logger.info(f'  Value - Pred: {avg_pred_value:.3f}, Actual: {avg_actual_reward:.3f}')
@@ -493,13 +498,13 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
         
         # Reshape
         num_windows = features_df.shape[0]
-        num_features = int(features_df.shape[1] / WINDOW_SIZE)
+        num_features = int(features_df.shape[1] / PPO_CONFIG["seq_len"])
         
         try:
-            X_reshaped = X_values.reshape(num_windows, WINDOW_SIZE, num_features)
+            X_reshaped = X_values.reshape(num_windows, PPO_CONFIG["seq_len"], num_features)
         except ValueError as e:
             logger.error(f"Reshape 오류 - {timeframe}: {e}")
-            logger.error(f"Shape: {X_values.shape}, Target: ({num_windows}, {WINDOW_SIZE}, {num_features})")
+            logger.error(f"Shape: {X_values.shape}, Target: ({num_windows}, {PPO_CONFIG["seq_len"]}, {num_features})")
             raise
         
         mtf_features_array[timeframe] = X_reshaped
@@ -516,13 +521,13 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     )
     
     # 데이터로더 생성
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=False, num_workers=0)
     
     logger.info(f"📊 데이터 분할 - Train: {train_size}, Val: {val_size}")
     
     # 모델 생성
-    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=HIDDEN_DIM, action_dim=ACTION_DIM)
+    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"], action_dim=PPO_CONFIG["action_dim"])
     logger.info(f"🤖 모델 생성 완료 - {model.get_model_info()}")
     
     # 훈련
