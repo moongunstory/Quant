@@ -201,6 +201,10 @@ def train_ppo(
             f"(entropy_coef={entropy_coef:.4f})"
         )
 
+        # Only enable verbose debug logging for the first two epochs
+        debug_epoch = epoch < 2
+        val_check_count = 0
+
         buffer = RolloutBuffer(buffer_size=max_steps)
         obs = env.reset()  # Returns Dict[str, np.ndarray]
         done = False
@@ -291,6 +295,16 @@ def train_ppo(
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
             values = torch.clamp(values, -20.0, 20.0)  # 극단값 방지
             entropy = torch.clamp(entropy, min=0.005, max=2.0)  # 최대값도 제한
+
+            if debug_epoch and val_check_count < 20:
+                for v, r in zip(values.detach().cpu(), return_batch.detach().cpu()):
+                    if val_check_count >= 20:
+                        break
+                    error = v.item() - r.item()
+                    logger.debug(
+                        f"[VAL-CHECK] value={v.item():.3f}, return={r.item():.3f}, error={error:.3f}"
+                    )
+                    val_check_count += 1
             policy_loss = compute_ppo_loss(
                 log_probs, old_logprob_batch, adv_batch, clip_eps
             )
@@ -299,6 +313,17 @@ def train_ppo(
 
             optimizer.zero_grad()
             loss.backward()
+
+            if debug_epoch:
+                # Compute gradient norm for value head
+                grad_squares = []
+                for name, param in model.named_parameters():
+                    if 'value_head' in name and param.grad is not None:
+                        grad_squares.append(param.grad.norm() ** 2)
+                if grad_squares:
+                    grad_norm = float(torch.sqrt(sum(grad_squares)))
+                    logger.debug(f"[GRAD] Value head grad norm = {grad_norm:.6f}")
+
             optimizer.step()
 
             policy_losses.append(policy_loss.item())
@@ -357,6 +382,11 @@ def train_ppo(
             f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
             f"Entropy: {avg_entropy:.4f} | Entropy Coef: {entropy_coef:.4f}"
         )
+
+        if debug_epoch:
+            logger.debug(
+                f"[LOSS] value_loss={avg_value_loss:.6f}, policy_loss={avg_policy_loss:.6f}, entropy={avg_entropy:.3f}"
+            )
 
         logger.info(
             f"📏 Value range: {value_min:.3f}..{value_max:.3f} | "
