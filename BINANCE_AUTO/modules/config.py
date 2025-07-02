@@ -46,6 +46,11 @@ VALUE_PRETRAIN_OUTPUT_PATH = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_short.pt"),
 }
 
+# If True, PPO training loads policy weights from imitation models
+# and value weights from VALUE_PRETRAIN_OUTPUT_PATH.
+# If False, both heads are loaded from VALUE_PRETRAIN_OUTPUT_PATH.
+USE_POLICY_FROM_IMITATION = True
+
 PPO_FINAL_MODEL_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_long.pt"),
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_short.pt"),
