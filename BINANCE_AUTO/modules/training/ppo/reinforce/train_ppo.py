@@ -89,19 +89,17 @@ def init_value_head_weights(model: PPOPolicyNetwork):
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
+            torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)  # ✅ Xavier → Normal(std=0.01)
             torch.nn.init.zeros_(m.bias)
 
-    # MTF 모델의 경우 각 타임프레임별 가치 헤드 초기화
     if hasattr(model, "value_heads"):
-        # Multi-head value network
         for tf, value_head in model.value_heads.items():
             value_head.apply(init_weights)
         logger.info("🧹 MTF value heads 랜덤 초기화 완료")
     else:
-        # Single value head
         model.value_head.apply(init_weights)
         logger.info("🧹 Single value head 랜덤 초기화 완료")
+
 
 def train_ppo(
     direction: str,
@@ -293,7 +291,7 @@ def train_ppo(
             adv_batch = adv_batch.to(device)
             old_logprob_batch = old_logprob_batch.to(device)
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
-            values = torch.clamp(values, -20.0, 20.0)  # 극단값 방지
+            values = torch.clamp(values, min=-2.0, max=2.0)  # ✅ 여기
             entropy = torch.clamp(entropy, min=0.005, max=2.0)  # 최대값도 제한
 
             if debug_epoch and val_check_count < 20:

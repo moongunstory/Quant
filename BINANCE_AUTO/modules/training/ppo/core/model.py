@@ -69,12 +69,11 @@ class PPOPolicyNetwork(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1)
         )
+
 
         self._init_value_head()
 
@@ -82,12 +81,10 @@ class PPOPolicyNetwork(nn.Module):
         """Initialize value head weights using proper scaling."""
         for i, m in enumerate(self.value_head.modules()):
             if isinstance(m, nn.Linear):
-                if i == len(list(self.value_head.modules())) - 1:  # 마지막 레이어
-                    nn.init.xavier_uniform_(m.weight, gain=0.01)  # 매우 작은 초기값
-                    nn.init.constant_(m.bias, 0.8) 
-                else:
-                    nn.init.xavier_uniform_(m.weight, gain=1.0)  # 정상적인 gain
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                     nn.init.zeros_(m.bias)
+
 
     def forward(self, x: Dict[str, torch.Tensor]):
         """
