@@ -273,15 +273,13 @@ def train_ppo(
             return_batch = return_batch.to(device)
             adv_batch = adv_batch.to(device)
             old_logprob_batch = old_logprob_batch.to(device)
-
             log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
-            # Value 클리핑으로 극단값 방지
-            values = torch.clamp(values, -50.0, 50.0)
+            values = torch.clamp(values, -20.0, 20.0)  # 극단값 방지
             entropy = torch.clamp(entropy, min=0.005, max=2.0)  # 최대값도 제한
             policy_loss = compute_ppo_loss(
                 log_probs, old_logprob_batch, adv_batch, clip_eps
             )
-            value_loss = compute_value_loss(values, return_batch, normalize=True)
+            value_loss = compute_value_loss(values, return_batch, normalize=False)
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
 
             optimizer.zero_grad()
