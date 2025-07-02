@@ -47,7 +47,8 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
 def load_labeled_data(data_type: str = "long") -> pd.DataFrame:
     """Long/Short 이진분류 데이터 로딩"""
     data_path = TRAIN_PICKLE_PATHS[data_type]
-    df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+    mtf_dict = pd.read_pickle(data_path)  # ✅ dict 구조로 로드됨
+    df = mtf_dict["15min"]  # ✅ 기준 타임프레임 선택 (15분봉 기준 라벨링)
     print(f"[📊 {data_type.upper()} 라벨 데이터 로딩 완료] 행: {len(df)}, 컬럼: {len(df.columns)}")
     return df
 
