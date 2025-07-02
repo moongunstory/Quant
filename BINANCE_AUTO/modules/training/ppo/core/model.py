@@ -82,7 +82,7 @@ class PPOPolicyNetwork(nn.Module):
         """Initialize value head weights using Xavier uniform."""
         for m in self.value_head.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.xavier_uniform_(m.weight, gain=2.0)
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: Dict[str, torch.Tensor]):
