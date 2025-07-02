@@ -307,17 +307,24 @@ class MTFTimeSeriesDataset(Dataset):
 
 def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val_loader: DataLoader, 
                          output_model_path: str) -> Tuple[PPOPolicyNetwork, float]:
-    """PPO 모방학습 훈련"""
+    """PPO 모방학습 훈련 (정책망만 학습, 가치망 고정)"""
     logger.info("🚀 PPO 모방학습 훈련 시작")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     logger.info(f"디바이스: {device}")
+
+    # 🔒 가치망 파라미터 고정
+    for param in model.value_head.parameters():
+        param.requires_grad = False
     
     # 손실 함수 및 옵티마이저
     policy_criterion = nn.CrossEntropyLoss()
-    value_criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=IMITATION_CONFIG["learning_rate"], weight_decay=1e-5)
+    optimizer = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=IMITATION_CONFIG["learning_rate"],
+        weight_decay=1e-5
+    )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
     
     best_f1 = 0.0
@@ -325,64 +332,52 @@ def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val
     max_patience = 5
     
     for epoch in range(IMITATION_CONFIG["epochs"]):
-        # Training
         model.train()
         train_metrics = {
-            'policy_loss': 0, 'value_loss': 0, 'correct': 0, 'total': 0,
+            'policy_loss': 0, 'correct': 0, 'total': 0,
             'pred_values': [], 'actual_rewards': []
         }
-        
+
         for batch_idx, (mtf_data, target, reward) in enumerate(train_loader):
             mtf_data = {tf: data.to(device) for tf, data in mtf_data.items()}
             target = target.to(device)
             reward = reward.to(device)
-            
+
             optimizer.zero_grad()
-            
+
             # Forward pass
             policy_logits, value = model(mtf_data)
-            
-            # 손실 계산
+
+            # 정책 손실만 계산
             policy_loss = policy_criterion(policy_logits, target)
-            value_loss = value_criterion(value.squeeze(), reward)
-            total_loss = policy_loss + IMITATION_CONFIG["value_loss_coef"] * value_loss
-            
-            # Backward pass
+            total_loss = policy_loss
+
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
-            
-            # 메트릭 업데이트
+
+            # 메트릭
             train_metrics['policy_loss'] += policy_loss.item()
-            train_metrics['value_loss'] += value_loss.item()
-            
             pred = policy_logits.argmax(dim=1)
             train_metrics['correct'] += pred.eq(target).sum().item()
             train_metrics['total'] += target.size(0)
-            
-            train_metrics['pred_values'].extend(value.squeeze().detach().cpu().numpy())
+            train_metrics['pred_values'].extend(value.detach().cpu().numpy())
             train_metrics['actual_rewards'].extend(reward.detach().cpu().numpy())
         
-        # 훈련 메트릭 계산
         avg_policy_loss = train_metrics['policy_loss'] / len(train_loader)
-        avg_value_loss = train_metrics['value_loss'] / len(train_loader)
         train_accuracy = train_metrics['correct'] / train_metrics['total']
         avg_pred_value = np.mean(train_metrics['pred_values'])
         avg_actual_reward = np.mean(train_metrics['actual_rewards'])
-        
+
         # Validation
         val_accuracy, val_f1, val_metrics = evaluate_model(model, val_loader, device)
-        
-        # 스케줄러 업데이트
         scheduler.step(val_f1)
-        
-        # 로깅
+
         logger.info(f'Epoch {epoch+1}/{IMITATION_CONFIG["epochs"]}:')
-        logger.info(f'  Train - Acc: {train_accuracy:.3f}, Policy Loss: {avg_policy_loss:.3f}, Value Loss: {avg_value_loss:.3f}')
+        logger.info(f'  Train - Acc: {train_accuracy:.3f}, Policy Loss: {avg_policy_loss:.3f}')
         logger.info(f'  Val   - Acc: {val_accuracy:.3f}, F1: {val_f1:.3f}')
         logger.info(f'  Value - Pred: {avg_pred_value:.3f}, Actual: {avg_actual_reward:.3f}')
-        
-        # 모델 저장
+
         if val_f1 > best_f1:
             best_f1 = val_f1
             torch.save(model.state_dict(), output_model_path)
@@ -393,7 +388,7 @@ def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val
             if patience_counter >= max_patience:
                 logger.info(f'조기 종료 - {max_patience} epoch 동안 개선 없음')
                 break
-    
+
     return model, best_f1
 
 def evaluate_model(model: PPOPolicyNetwork, test_loader: DataLoader, 
