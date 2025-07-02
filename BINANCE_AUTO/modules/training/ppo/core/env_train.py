@@ -38,6 +38,7 @@ class PPOTradingEnv:
         self.include_all = include_all_scenarios
         self.reward_scale = reward_scale
         self._logged_direction = False
+        self.step_count = 0
 
         print(
             f"[ENV INIT] direction='{self.direction}', ref_tf='{reference_timeframe}', hold_reward={hold_reward}"
@@ -191,6 +192,7 @@ class PPOTradingEnv:
                 self.sequences[tf] = self.sequences[tf][perm]
 
         self.ptr = 0
+        self.step_count = 0
         self.done = False
         return self._get_state()
 
@@ -310,26 +312,39 @@ class PPOTradingEnv:
 
         # Reward Shaping: 가격 움직임 정보 추가
         base_reward = reward
+        price_change = 0.0
+        shaped_reward = 0.0
         if horizon_limit > entry_idx:
             # 실제 가격 변화율 계산
             final_price = ref_df.iloc[horizon_limit][close_col]
             price_change = (final_price - entry_price) / entry_price
-            
+
             if self.direction == "long":
                 # Long의 경우 가격 상승이 좋음
                 shaped_reward = price_change * 0.5 * self.reward_scale
             else:
                 # Short의 경우 가격 하락이 좋음
                 shaped_reward = -price_change * 0.5 * self.reward_scale
-            
+
             # Action에 따라 reward 조정
             if action == 1:  # Trade
                 reward = base_reward + shaped_reward
             else:  # Hold
                 reward = base_reward - abs(shaped_reward) * 0.1  # Hold시 기회비용
 
+        # Debug logging every 100th step
+        if self.step_count % 100 == 0:
+            print(
+                f"[REWARD] idx={self.step_count}, action={action}, "
+                f"base={base_reward:.3f}, shaped={shaped_reward:.3f}, total={reward:.3f}"
+            )
+            print(
+                f"→ TP={tp_hit}, SL={sl_hit}, price_change={price_change:.4f}"
+            )
+
         # Move to next state
         self.ptr += 1
+        self.step_count += 1
         if self.ptr >= len(self.entry_indices) - 1:
             done = True
             
