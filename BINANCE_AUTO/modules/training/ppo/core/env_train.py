@@ -307,6 +307,26 @@ class PPOTradingEnv:
             else:
                 reward = -0.01 * self.reward_scale
 
+        # Reward Shaping: 가격 움직임 정보 추가
+        base_reward = reward
+        if horizon_limit > entry_idx:
+            # 실제 가격 변화율 계산
+            final_price = ref_df.iloc[horizon_limit][close_col]
+            price_change = (final_price - entry_price) / entry_price
+            
+            if self.direction == "long":
+                # Long의 경우 가격 상승이 좋음
+                shaped_reward = price_change * 0.5 * self.reward_scale
+            else:
+                # Short의 경우 가격 하락이 좋음
+                shaped_reward = -price_change * 0.5 * self.reward_scale
+            
+            # Action에 따라 reward 조정
+            if action == 1:  # Trade
+                reward = base_reward + shaped_reward
+            else:  # Hold
+                reward = base_reward - abs(shaped_reward) * 0.1  # Hold시 기회비용
+
         # Move to next state
         self.ptr += 1
         if self.ptr >= len(self.entry_indices) - 1:
