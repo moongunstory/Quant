@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
-import pickle
-from typing import Dict
+import logging
 
+logger = logging.getLogger(__name__)
+
+from typing import Dict
 # Import config values
 from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON, TIMEFRAMES
 
