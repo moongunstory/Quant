@@ -332,13 +332,12 @@ class PPOTradingEnv:
             else:  # Hold
                 reward = base_reward - abs(shaped_reward) * 0.1  # Hold시 기회비용
 
-        # Debug logging every 100th step
-        if self.step_count % 100 == 0:
-            print(
+        if logger.isEnabledFor(logging.DEBUG) and action == 1 and abs(reward) >= 0.3:
+            logger.debug(
                 f"[REWARD] idx={self.step_count}, action={action}, "
                 f"base={base_reward:.3f}, shaped={shaped_reward:.3f}, total={reward:.3f}"
             )
-            print(
+            logger.debug(
                 f"→ TP={tp_hit}, SL={sl_hit}, price_change={price_change:.4f}"
             )
 
