@@ -26,6 +26,7 @@ from modules.config import (
     PPO_FINAL_MODEL_PATHS,
     TIMEFRAMES,
     PPO_CONFIG,
+    USE_POLICY_FROM_IMITATION,
 )
 
 from modules.training.ppo.core.env_train import PPOTradingEnv
@@ -117,6 +118,7 @@ def train_ppo(
     lr: float = PPO_CONFIG["learning_rate"],
     max_steps: int = PPO_CONFIG["max_steps"],
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    use_policy_from_imitation: bool = USE_POLICY_FROM_IMITATION,
 ) -> Dict[str, Any]:
     logger.info(f"🔁 [{direction.upper()}] PPO 학습 시작 (MTF)")
     logger.info(f"📁 [{direction.upper()}] PKL 파일: {csv_path}")
@@ -138,36 +140,45 @@ def train_ppo(
         device
     )
 
-    # 정책 사전학습 모델 로드
-    logger.info(f"📦 [{direction.upper()}] 모방학습 모델 로딩: {imitation_model_path}")
-    model.load_model(imitation_model_path, allow_partial=True)
+    if USE_POLICY_FROM_IMITATION:
+        logger.info(f"📦 [{direction.upper()}] 모방학습 정책 로딩: {imitation_model_path}")
+        model.load_model(imitation_model_path, allow_partial=True)
 
-    if os.path.exists(value_model_path):
-        logger.info(
-            f"📥 [{direction.upper()}] 가치망 로딩 시도: {value_model_path}"
-        )
-        try:
-            state_dict = torch.load(value_model_path, map_location="cpu")
-            current = model.state_dict()
-            loaded_keys = []
-            for k, v in state_dict.items():
-                if k.startswith("value_head") and k in current and current[k].shape == v.shape:
-                    current[k] = v
-                    loaded_keys.append(k)
-            model.load_state_dict(current)
+        if os.path.exists(value_model_path):
             logger.info(
-                f"✅ [{direction.upper()}] 가치망 로드 완료 ({len(loaded_keys)} tensors)"
+                f"📥 [{direction.upper()}] 가치망 로딩 시도: {value_model_path}"
             )
-        except Exception as e:
-            logger.warning(
-                f"⚠️ [{direction.upper()}] 가치망 로딩 실패: {e}. 랜덤 초기화 수행"
+            try:
+                state_dict = torch.load(value_model_path, map_location="cpu")
+                current = model.state_dict()
+                loaded_keys = []
+                for k, v in state_dict.items():
+                    if k.startswith("value_head") and k in current and current[k].shape == v.shape:
+                        current[k] = v
+                        loaded_keys.append(k)
+                model.load_state_dict(current)
+                logger.info(
+                    f"✅ [{direction.upper()}] 가치망 로드 완료 ({len(loaded_keys)} tensors)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ [{direction.upper()}] 가치망 로딩 실패: {e}. 랜덤 초기화 수행"
+                )
+                init_value_head_weights(model)
+        else:
+            logger.info(
+                f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다."
             )
             init_value_head_weights(model)
     else:
-        logger.info(
-            f"🧹 [{direction.upper()}] value head를 사전학습 없이 랜덤 초기화합니다."
-        )
-        init_value_head_weights(model)
+        if os.path.exists(value_model_path):
+            logger.info(f"📦 [{direction.upper()}] 전체 모델 로딩: {value_model_path}")
+            model.load_model(value_model_path, allow_partial=True)
+        else:
+            logger.warning(
+                f"⚠️ [{direction.upper()}] {value_model_path} 존재하지 않음. 랜덤 초기화 수행"
+            )
+            init_value_head_weights(model)
 
     logger.info(f"✅ [{direction.upper()}] 모델 초기화 완료")
 
