@@ -52,6 +52,15 @@ class RolloutBuffer:
 
     def compute_returns_and_advantages(self, last_value: float, gamma: float = 0.99,
                                     lam: float = 0.95, normalize: bool = True):
+        """
+        GAE 계산 및 리턴/어드밴티지 정규화
+        
+        Args:
+            last_value: 마지막 상태의 가치 추정값
+            gamma: 할인 팩터
+            lam: GAE 람다 파라미터
+            normalize: 정규화 여부
+        """
         # 모든 값을 float로 통일
         values = self.values + [last_value]
         gae = 0.0
@@ -84,12 +93,21 @@ class RolloutBuffer:
                 f"std={advantages.std():.3f}, min={advantages.min():.3f}, max={advantages.max():.3f}"
             )
             logger.debug(
-                f"[GAE] Return dist → mean={returns.mean():.3f}, "
+                f"[GAE] Return dist (before normalization) → mean={returns.mean():.3f}, "
                 f"std={returns.std():.3f}, min={returns.min():.3f}, max={returns.max():.3f}"
             )
 
+        # 어드밴티지 정규화 (기존과 동일)
         if normalize and advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 🔥 핵심 수정: 리턴도 정규화 추가
+        if normalize and returns.std() > 1e-8:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            logger.debug(
+                f"[GAE] Return dist (after normalization) → mean={returns.mean():.3f}, "
+                f"std={returns.std():.3f}, min={returns.min():.3f}, max={returns.max():.3f}"
+            )
 
         self.advantages = advantages
         self.returns = returns

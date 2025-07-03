@@ -63,19 +63,21 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns, normalize=False):  # True → False로 변경
-    """MSE between predicted state value and return."""
-    if returns.std() < 1e-3:
-        returns = returns + torch.randn_like(returns) * 1e-2
-
-    if normalize:
-        # Value와 Return 모두 정규화
-        returns_norm = (returns - returns.mean()) / (returns.std() + 1e-8)
-        values_norm = (values - values.mean()) / (values.std() + 1e-8)
-        return F.mse_loss(values_norm, returns_norm)
-    else:
-        # Huber Loss 사용하여 outlier에 robust하게
-        return F.smooth_l1_loss(values, returns)
+def compute_value_loss(values, returns, normalize=True):
+    """
+    가치 함수 손실 계산 - MSE 사용으로 변경
+    
+    Args:
+        values: 모델이 예측한 가치값
+        returns: 목표 리턴값 (이미 정규화됨)
+        normalize: 정규화 여부 (현재는 사용하지 않음, 리턴이 이미 정규화되어 전달됨)
+    
+    Returns:
+        MSE 손실값
+    """
+    # 🔥 핵심 수정: smooth_l1_loss → mse_loss 변경
+    # 정규화된 리턴과 가치 예측값 간의 MSE 계산
+    return F.mse_loss(values, returns)
     
 
 def compute_explained_variance(predicted, actual):

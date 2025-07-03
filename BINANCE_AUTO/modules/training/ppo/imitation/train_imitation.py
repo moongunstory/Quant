@@ -14,10 +14,12 @@ import logging
 import warnings
 warnings.filterwarnings('ignore')
 
+# 프로젝트 루트 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR))))
 sys.path.append(PROJECT_ROOT)
 
+# 내부 모듈 임포트
 from modules.config import (
     TRAIN_PICKLE_PATHS,
     PPO_IMITATION_MODEL_PATHS,
@@ -30,15 +32,17 @@ from modules.config import (
 )
 from modules.training.ppo.core.model import PPOPolicyNetwork
 
+# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def set_seed(seed=42):
-    """모든 랜덤 시드 고정"""
+    """재현성을 위한 랜덤 시드 고정"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -271,194 +275,176 @@ def generate_mtf_features(mtf_dict: Dict[str, pd.DataFrame]) -> Dict[str, pd.Dat
     
     return mtf_features
 
-def generate_rewards(tp_hit_array: np.ndarray, sl_hit_array: np.ndarray) -> np.ndarray:
-    """리워드 생성"""
-    rewards = np.where(tp_hit_array, 1.0, np.where(sl_hit_array, -1.0, 0.0))
-    
-    reward_dist = {
-        'positive': (rewards > 0).sum(),
-        'negative': (rewards < 0).sum(),
-        'neutral': (rewards == 0).sum()
-    }
-    
-    logger.info(f"📊 Reward 분포: +1: {reward_dist['positive']}, -1: {reward_dist['negative']}, 0: {reward_dist['neutral']}")
-    logger.info(f"   평균 reward: {rewards.mean():.4f}")
-    
-    return rewards
-
-class MTFTimeSeriesDataset(Dataset):
-    def __init__(self, mtf_features: Dict[str, np.ndarray], labels: np.ndarray, rewards: np.ndarray):
+class ImitationDataset(Dataset):
+    """모방 학습을 위한 데이터셋 (상태, 정책 라벨)"""
+    def __init__(self, mtf_features: Dict[str, np.ndarray], labels: np.ndarray):
         self.mtf_features = {tf: torch.FloatTensor(features) for tf, features in mtf_features.items()}
         self.labels = torch.LongTensor(labels)
-        self.rewards = torch.FloatTensor(rewards)
         
-        # 데이터셋 통계
-        label_counts = Counter(labels.tolist())
         logger.info(f"📊 데이터셋 생성: 총 {len(self.labels)} 샘플")
-        logger.info(f"   라벨 분포: {dict(label_counts)}")
-        logger.info(f"   Reward 평균: {self.rewards.mean().item():.4f}, 표준편차: {self.rewards.std().item():.4f}")
+        logger.info(f"   라벨 분포: {dict(Counter(labels.tolist()))}")
     
     def __len__(self):
         return len(self.labels)
     
-    def __getitem__(self, idx) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        features_dict = {tf: features[idx] for tf, features in self.mtf_features.items()}
-        return features_dict, self.labels[idx], self.rewards[idx]
+    def __getitem__(self, idx) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        features = {tf: data[idx] for tf, data in self.mtf_features.items()}
+        return features, self.labels[idx]
 
-def train_imitation_model(model: PPOPolicyNetwork, train_loader: DataLoader, val_loader: DataLoader, 
-                         output_model_path: str) -> Tuple[PPOPolicyNetwork, float]:
-    """PPO 모방학습 훈련 (정책망만 학습, 가치망 고정)"""
-    logger.info("🚀 PPO 모방학습 훈련 시작")
-    
+def evaluate_policy(model: PPOPolicyNetwork, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    """정책망의 성능(정확도, F1 스코어)을 평가"""
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for features, targets in loader:
+            features = {tf: data.to(device) for tf, data in features.items()}
+            
+            policy_logits, _ = model(features)
+            preds = policy_logits.argmax(dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+
+    accuracy = accuracy_score(all_targets, all_preds)
+    f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+    return accuracy, f1
+
+def train_policy_network(model: PPOPolicyNetwork, train_loader: DataLoader, val_loader: DataLoader, 
+                         output_path: str) -> Tuple[PPOPolicyNetwork, float]:
+    """모방 학습을 통해 정책망을 훈련"""
+    logger.info("🚀 정책망 모방 학습 시작")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    logger.info(f"디바이스: {device}")
+    model.to(device)
+    logger.info(f"   사용 디바이스: {device}")
 
-    # 🔒 가치망 파라미터 고정
-    for param in model.value_head.parameters():
-        param.requires_grad = False
-    
-    # 손실 함수 및 옵티마이저
-    policy_criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=IMITATION_CONFIG["learning_rate"],
-        weight_decay=1e-5
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
-    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=IMITATION_CONFIG["learning_rate"], weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.5, patience=3)
+
     best_f1 = 0.0
     patience_counter = 0
-    max_patience = 5
     
     for epoch in range(IMITATION_CONFIG["epochs"]):
         model.train()
-        train_metrics = {
-            'policy_loss': 0, 'correct': 0, 'total': 0,
-            'pred_values': [], 'actual_rewards': []
-        }
+        total_loss, total_correct, total_samples = 0, 0, 0
 
-        for batch_idx, (mtf_data, target, reward) in enumerate(train_loader):
-            mtf_data = {tf: data.to(device) for tf, data in mtf_data.items()}
-            target = target.to(device)
-            reward = reward.to(device)
+        for features, targets in train_loader:
+            features = {tf: data.to(device) for tf, data in features.items()}
+            targets = targets.to(device)
 
             optimizer.zero_grad()
-
-            # Forward pass
-            policy_logits, value = model(mtf_data)
-
-            # 정책 손실만 계산
-            policy_loss = policy_criterion(policy_logits, target)
-            total_loss = policy_loss
-
-            total_loss.backward()
+            policy_logits, _ = model(features)
+            loss = criterion(policy_logits, targets)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
-            # 메트릭
-            train_metrics['policy_loss'] += policy_loss.item()
-            pred = policy_logits.argmax(dim=1)
-            train_metrics['correct'] += pred.eq(target).sum().item()
-            train_metrics['total'] += target.size(0)
-            train_metrics['pred_values'].extend(value.detach().cpu().numpy())
-            train_metrics['actual_rewards'].extend(reward.detach().cpu().numpy())
+            total_loss += loss.item()
+            preds = policy_logits.argmax(dim=1)
+            total_correct += (preds == targets).sum().item()
+            total_samples += targets.size(0)
         
-        avg_policy_loss = train_metrics['policy_loss'] / len(train_loader)
-        train_accuracy = train_metrics['correct'] / train_metrics['total']
-        avg_pred_value = np.mean(train_metrics['pred_values'])
-        avg_actual_reward = np.mean(train_metrics['actual_rewards'])
+        train_loss = total_loss / len(train_loader)
+        train_acc = total_correct / total_samples
 
-        # Validation
-        val_accuracy, val_f1, val_metrics = evaluate_model(model, val_loader, device)
+        val_acc, val_f1 = evaluate_policy(model, val_loader, device)
         scheduler.step(val_f1)
 
-        logger.info(f'Epoch {epoch+1}/{IMITATION_CONFIG["epochs"]}:')
-        logger.info(f'  Train - Acc: {train_accuracy:.3f}, Policy Loss: {avg_policy_loss:.3f}')
-        logger.info(f'  Val   - Acc: {val_accuracy:.3f}, F1: {val_f1:.3f}')
-        logger.info(f'  Value - Pred: {avg_pred_value:.3f}, Actual: {avg_actual_reward:.3f}')
+        logger.info(f"Epoch {epoch+1}/{IMITATION_CONFIG['epochs']} | "
+                    f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.3f} | "
+                    f"Val Acc: {val_acc:.3f}, Val F1: {val_f1:.3f}")
 
         if val_f1 > best_f1:
             best_f1 = val_f1
-            torch.save(model.state_dict(), output_model_path)
-            logger.info(f'🎯 새로운 최고 F1: {val_f1:.3f} - 모델 저장됨')
+            torch.save(model.state_dict(), output_path)
+            logger.info(f"   🎯 새로운 최고 F1 달성: {val_f1:.3f}. 모델 저장: {output_path}")
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= max_patience:
-                logger.info(f'조기 종료 - {max_patience} epoch 동안 개선 없음')
+            if patience_counter >= IMITATION_CONFIG['early_stopping_patience']:
+                logger.info(f"   조기 종료: {patience_counter} epoch 동안 성능 개선 없음.")
                 break
-
+    
+    # 가장 성능이 좋았던 모델을 다시 로드
+    model.load_state_dict(torch.load(output_path))
     return model, best_f1
 
-def evaluate_model(model: PPOPolicyNetwork, test_loader: DataLoader, 
-                  device: torch.device) -> Tuple[float, float, Dict]:
-    """모델 평가"""
-    model.eval()
-    predictions = []
-    targets = []
-    values = []
+def prepare_features(raw_data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, np.ndarray], Dict[str, int], int]:
+    """원시 데이터로부터 MTF 피처를 생성, 정규화 및 재구성"""
+    logger.info("🛠️  피처 준비 시작")
     
-    with torch.no_grad():
-        for mtf_data, target, reward in test_loader:
-            mtf_data = {tf: data.to(device) for tf, data in mtf_data.items()}
-            target = target.to(device)
-            
-            policy_logits, value = model(mtf_data)
-            pred = policy_logits.argmax(dim=1)
-            
-            predictions.extend(pred.cpu().numpy())
-            targets.extend(target.cpu().numpy())
-            values.extend(value.cpu().numpy())
-    
-    accuracy = accuracy_score(targets, predictions)
-    
-    # F1 스코어 계산 (클래스 불균형 고려)
-    if len(set(targets)) > 1 and len(set(predictions)) > 1:
-        f1 = f1_score(targets, predictions, average='weighted', zero_division=0)
-    else:
-        f1 = 0.0
-        logger.warning("⚠️ 단일 클래스 예측 - F1 스코어 0")
-    
-    metrics = {
-        'accuracy': accuracy,
-        'f1_score': f1,
-        'avg_value': np.mean(values),
-        'predictions': Counter(predictions),
-        'targets': Counter(targets)
-    }
-    
-    return accuracy, f1, metrics
+    # 1. MTF 피처 생성
+    mtf_features_df = {}
+    for tf in TIMEFRAMES:
+        if tf not in raw_data: 
+            continue
+        df = raw_data[tf].copy()
+        
+        # 피처로 사용할 컬럼 선택 (라벨 등 제외)
+        exclude_keywords = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        feature_cols = [col for col in numeric_cols if not any(k in col.lower() for k in exclude_keywords)]
+        
+        if len(feature_cols) == 0:
+            logger.warning(f"⚠️ {tf}에 사용 가능한 피처가 없습니다")
+            continue
+        
+        # 시계열 윈도우 생성
+        flatten_dfs = [df[col].shift(i + 1).rename(f"{col}_t-{i+1}") for col in feature_cols for i in range(PPO_CONFIG["seq_len"])]
+        tf_feature_df = pd.concat(flatten_dfs, axis=1).dropna()
+        mtf_features_df[tf] = tf_feature_df
+        logger.info(f"   - [{tf}] 피처 생성 완료. Shape: {tf_feature_df.shape}")
 
-def train_model_for_direction(direction: str) -> Dict[str, Any]:
-    """특정 방향(long/short)에 대한 모델 훈련"""
-    logger.info(f"{'='*60}")
-    logger.info(f"🎯 {direction.upper()} 모델 훈련 시작")
-    logger.info(f"{'='*60}")
+    # 2. 데이터 길이 정렬
+    entry_df = raw_data['15min'].copy()
+    min_len = min(len(df) for df in mtf_features_df.values())
+    min_len = min(min_len, len(entry_df))
     
+    for tf in mtf_features_df:
+        mtf_features_df[tf] = mtf_features_df[tf].iloc[-min_len:]
+    
+    # 3. 피처 정규화 및 Reshape
+    mtf_features_array = {}
+    input_dims = {}
+    for tf, features_df in mtf_features_df.items():
+        X = features_df.values
+        mean = X.mean(axis=0)
+        std = X.std(axis=0) + 1e-8
+        X_normalized = (X - mean) / std
+        
+        num_features = len(features_df.columns) // PPO_CONFIG["seq_len"]
+        X_reshaped = X_normalized.reshape(len(X), PPO_CONFIG["seq_len"], num_features)
+        
+        mtf_features_array[tf] = X_reshaped
+        input_dims[tf] = num_features
+        logger.info(f"   - [{tf}] 정규화 및 Reshape 완료. 최종 Shape: {X_reshaped.shape}")
+
+    return mtf_features_array, input_dims, min_len
+
+def run_imitation_learning_for(direction: str):
+    """지정된 방향(long/short)에 대한 모방 학습 전체 파이프라인 실행"""
+    logger.info(f"""
+{'='*60}
+🎯 [{direction.upper()}] 모방 학습 파이프라인 시작
+{'='*60}""")
     set_seed(42)
-    
-    # 경로 설정
-    train_data_path = TRAIN_PICKLE_PATHS[direction]
-    output_model_path = PPO_IMITATION_MODEL_PATHS[direction]
-    os.makedirs(os.path.dirname(output_model_path), exist_ok=True)
-    
-    # 데이터 로드
-    logger.info(f"📁 데이터 로드: {train_data_path}")
-    raw = pd.read_pickle(train_data_path)
+
+    # 1. 데이터 로드 및 준비
+    raw_data = pd.read_pickle(TRAIN_PICKLE_PATHS[direction])
+    logger.info(f"   - 원본 데이터 로드 완료: {TRAIN_PICKLE_PATHS[direction]}")
     
     # 타임프레임 설정
     entry_tf, eval_tf = "15min", "5min"
     
     # 데이터 검증
-    df_entry = validate_data(raw[entry_tf].copy(), f"{direction}-entry")
-    df_eval = validate_data(raw[eval_tf].copy(), f"{direction}-eval")
+    df_entry = validate_data(raw_data[entry_tf].copy(), f"{direction}-entry")
+    df_eval = validate_data(raw_data[eval_tf].copy(), f"{direction}-eval")
     
     # 타임프레임 정렬
     df_entry, df_eval = align_timeframes(df_entry, df_eval)
     
     # MTF 피처 생성
-    mtf_features_df = generate_mtf_features(raw)
+    mtf_features_df = generate_mtf_features(raw_data)
     
     # 모든 타임프레임의 최소 길이에 맞춰 정렬
     min_len = min([features.shape[0] for features in mtf_features_df.values()])
@@ -466,16 +452,7 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
     
     # 데이터 정렬
     labels = df_entry["label"].values[:min_len].astype(int)
-    df_entry_aligned = df_entry.iloc[:min_len].copy()
-    
-    # TP/SL 히트 계산
-    logger.info(f"🔍 Config - TP: {TP_THRESHOLD:.1%}, SL: {abs(SL_THRESHOLD):.1%}, Horizon: {LABEL_HORIZON}")
-    tp_hit_array, sl_hit_array = calculate_tp_sl_hits_optimized(df_entry_aligned, df_eval, direction)
-    
-    # 리워드 생성
-    rewards = generate_rewards(tp_hit_array, sl_hit_array)
-    
-    # 데이터 정규화 및 reshape
+
     mtf_features_array = {}
     input_dims = {}
     
@@ -505,86 +482,52 @@ def train_model_for_direction(direction: str) -> Dict[str, Any]:
         mtf_features_array[timeframe] = X_reshaped
         input_dims[timeframe] = num_features
     
-    # 데이터셋 생성
-    dataset = MTFTimeSeriesDataset(mtf_features_array, labels, rewards)
-    
-    # Train/Val 분할
-    train_size = int(0.8 * len(dataset))
+    # 2. 데이터셋 및 데이터로더 생성
+    dataset = ImitationDataset(mtf_features_array, labels)
+    train_size = int(len(dataset) * 0.8)
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=False)
+    logger.info(f"   - 데이터셋 분할 완료: Train {train_size}개, Validation {val_size}개")
+
+    # 3. 모델 생성
+    model = PPOPolicyNetwork(
+        timeframe_dims=input_dims, 
+        hidden_dim=PPO_CONFIG["hidden_dim"], 
+        action_dim=PPO_CONFIG["action_dim"],
+        create_value_head=False 
     )
+    logger.info(f"   - 정책망 모델 생성 완료. {model.get_model_info()}")
+
+    # 4. 모델 훈련
+    output_path = PPO_IMITATION_MODEL_PATHS[direction]
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # 데이터로더 생성
-    train_loader = DataLoader(train_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=IMITATION_CONFIG["batch_size"], shuffle=False, num_workers=0)
-    
-    logger.info(f"📊 데이터 분할 - Train: {train_size}, Val: {val_size}")
-    
-    # 모델 생성
-    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"], action_dim=PPO_CONFIG["action_dim"])
-    logger.info(f"🤖 모델 생성 완료 - {model.get_model_info()}")
-    
-    # 훈련
-    model, best_f1 = train_imitation_model(model, train_loader, val_loader, output_model_path)
-    
-    # 최종 평가
+    final_model, best_f1 = train_policy_network(model, train_loader, val_loader, output_path)
+
+    # 5. 최종 평가 및 결과 요약
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    accuracy, f1, metrics = evaluate_model(model, val_loader, device)
+    final_accuracy, final_f1 = evaluate_policy(final_model, val_loader, device)
     
-    logger.info(f"✅ {direction.upper()} 훈련 완료!")
-    logger.info(f"   최종 성능 - Acc: {accuracy:.3f}, F1: {f1:.3f}, Best F1: {best_f1:.3f}")
-    
-    return {
-        'direction': direction,
-        'accuracy': accuracy,
-        'f1_score': f1,
-        'best_f1_score': best_f1,
-        'model_path': output_model_path,
-        'input_dims': input_dims,
-        'metrics': metrics
-    }
+    logger.info(f"""
+{'='*60}
+✅ [{direction.upper()}] 모방 학습 완료
+{'='*60}""")
+    logger.info(f"   - 최종 검증 정확도: {final_accuracy:.3f}")
+    logger.info(f"   - 최종 검증 F1-Score: {final_f1:.3f} (Best F1: {best_f1:.3f})")
+    logger.info(f"   - 저장된 모델 경로: {output_path}")
+    logger.info(f"""{'='*60}
+""")
 
 def main():
     """메인 실행 함수"""
-    logger.info("🚀 PPO 모방학습 파이프라인 시작")
-    logger.info(f"설정: TP={TP_THRESHOLD:.1%}, SL={abs(SL_THRESHOLD):.1%}, Horizon={LABEL_HORIZON}")
-    
-    set_seed(42)
-    results = []
-    
     for direction in ['long', 'short']:
         try:
-            result = train_model_for_direction(direction)
-            results.append(result)
-        except KeyboardInterrupt:
-            logger.warning("⚠️ 사용자가 훈련을 중단했습니다.")
-            break
+            run_imitation_learning_for(direction)
         except Exception as e:
-            logger.error(f"❌ {direction} 훈련 중 오류 발생: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-            # 오류가 발생해도 다음 방향 훈련 시도
-            continue
-    
-    # 최종 결과 출력
-    if results:
-        logger.info("="*60)
-        logger.info("📊 최종 결과 요약:")
-        logger.info("="*60)
-        
-        for result in results:
-            logger.info(f"{result['direction'].upper()}:")
-            logger.info(f"  - Accuracy: {result['accuracy']:.3f}")
-            logger.info(f"  - F1 Score: {result['f1_score']:.3f}")
-            logger.info(f"  - Best F1: {result['best_f1_score']:.3f}")
-            logger.info(f"  - Model: {result['model_path']}")
-        
-        logger.info("="*60)
-        logger.info("🎉 PPO 모방학습 파이프라인 완료!")
-    else:
-        logger.warning("⚠️ 완료된 훈련이 없습니다.")
+            logger.error(f"❌ [{direction.upper()}] 처리 중 심각한 오류 발생: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()

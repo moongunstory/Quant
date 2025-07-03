@@ -98,6 +98,7 @@ IMITATION_CONFIG = {
     "batch_size": 64,
     "learning_rate": 1e-4,
     "value_loss_coef": 0.2,
+    "early_stopping_patience": 5,
 }
 
 # === Features Per Timeframe ===
