@@ -196,7 +196,7 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
 
 def main():
     """메인 처리 함수"""
-    print("[🚀 MTF 데이터 전처리 및 라벨링 시작]")
+    print("[MTF 데이터 전처리 및 라벨링 시작]")
 
     # 1. MTF 데이터 로딩 (유출 없는 원본 피처)
     mtf_data = load_mtf_data()
@@ -206,32 +206,32 @@ def main():
     # (DUNE 및 BTC 관련 처리는 그대로 유지)
     if "dune" in mtf_data and not mtf_data["dune"].empty:
         mtf_data["dune"] = create_dune_derived_features(mtf_data["dune"])
-        print("[⛓️ DUNE 파생 피처 생성 완료]")
+        print("[DUNE 파생 피처 생성 완료]")
 
     if "btc" in mtf_data and not mtf_data["btc"].empty:
         mtf_data["btc"] = apply_feature_processing(mtf_data["btc"], "btc")
-        print("[🔧 BTC 피처 처리 완료]")
+        print("[BTC 피처 처리 완료]")
 
     if "dune" in mtf_data and not mtf_data["dune"].empty:
         mtf_data["dune"] = apply_feature_processing(mtf_data["dune"], "dune")
-        print("[🔧 DUNE 피처 처리 완료]")
+        print("[DUNE 피처 처리 완료]")
 
     # 2. 라벨 생성 (방향별 라벨링)
-    print("[🎯 방향별 라벨링 시작]")
+    print("[방향별 라벨링 시작]")
     df_labels_long = create_labels(mtf_data, LABEL_HORIZON, direction="long")
     df_labels_short = create_labels(mtf_data, LABEL_HORIZON, direction="short")
-    print("[✅ 방향별 라벨링 완료]")
+    print("[방향별 라벨링 완료]")
 
     # 3. 깨끗한 15분봉 데이터에 라벨 병합 (데이터 유출 방지)
     df_15m_clean = mtf_data["15min"]
 
     df_labeled_long = df_15m_clean.join(df_labels_long, how='inner')
     df_labeled_short = df_15m_clean.join(df_labels_short, how='inner')
-    print("[✅ 라벨-피처 안전한 병합 완료]")
+    print("[라벨-피처 안전한 병합 완료]")
 
     # 라벨 분포 확인
-    print(f"[📊 Long 라벨 분포] {dict(df_labeled_long['label'].value_counts())}")
-    print(f"[📊 Short 라벨 분포] {dict(df_labeled_short['label'].value_counts())}")
+    print(f"[Long 라벨 분포] {dict(df_labeled_long['label'].value_counts())}")
+    print(f"[Short 라벨 분포] {dict(df_labeled_short['label'].value_counts())}")
 
     # 4. PPO 학습을 위한 균형 데이터셋 구성
     df_long_binary = create_balanced_ppo_dataset(df_labeled_long, "long")
@@ -240,7 +240,7 @@ def main():
     df_short_binary = create_balanced_ppo_dataset(df_labeled_short, "short")
     df_short_binary['label'] = (df_short_binary['label'] == 'short').astype(int)
 
-    print(f"[🎯 이진분류 데이터 준비]")
+    print(f"[이진분류 데이터 준비]")
     print(f"  - Long 모델용: {len(df_long_binary)}행 (long={sum(df_long_binary['label'])}, hold={len(df_long_binary)-sum(df_long_binary['label'])})")
     print(f"  - Short 모델용: {len(df_short_binary)}행 (short={sum(df_short_binary['label'])}, hold={len(df_short_binary)-sum(df_short_binary['label'])})")
 
@@ -261,7 +261,7 @@ def main():
     with open(short_path, "wb") as f:
         pickle.dump(short_data_to_save, f)
 
-    print(f"[💾 저장 완료]")
+    print(f"[저장 완료]")
     print(f"  - Long 이진분류 데이터: {len(df_long_binary)}행 → {long_path}")
     print(f"  - Short 이진분류 데이터: {len(df_short_binary)}행 → {short_path}")
 

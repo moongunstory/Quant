@@ -81,12 +81,11 @@ def validate_data(df: pd.DataFrame, name: str) -> pd.DataFrame:
     # 정렬
     df = df.sort_index()
     
-    # 데이터 정보 출력
-    logger.info(f"   시간 범위: {df.index[0]} ~ {df.index[-1]}")
-    logger.info(f"   샘플 수: {len(df)}")
-    
-    if 'close' in df.columns:
-        logger.info(f"   가격 범위: {df['close'].min():.2f} ~ {df['close'].max():.2f}")
+    # 데이터 정보 출력 (비활성화)
+    # logger.info(f"   시간 범위: {df.index[0]} ~ {df.index[-1]}")
+    # logger.info(f"   샘플 수: {len(df)}")
+    # if 'close' in df.columns:
+    #     logger.info(f"   가격 범위: {df['close'].min():.2f} ~ {df['close'].max():.2f}")
     
     return df
 

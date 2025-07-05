@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Tuple
+from sklearn.metrics import mean_absolute_error, r2_score
 
 # 프로젝트 루트 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -119,7 +120,11 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
     if not all([close_col, high_col, low_col]):
         raise ValueError("Could not find required 'close', 'high', 'low' columns for return calculation.")
 
-    amplification = 30  # tanh 스케일링 계수
+    amplification = 100  # tanh 스케일링 계수 (보상 증폭)
+    logger.info(f"   - 보상 증폭 계수(amplification) 적용: {amplification}")
+
+    # 로그용 카운터
+    hit_counts = {'TP': 0, 'SL': 0, 'No Hit': 0}
 
     for i in range(len(df_entry) - LABEL_HORIZON):
         entry_time = df_entry.index[i]
@@ -160,12 +165,19 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
         is_sl_hit = pd.notna(sl_first_time)
 
         # 도달한 시점 기준 최종 평가 가격 결정
+        reward_case = ""
         if is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
             final_price = df_eval.loc[tp_first_time][close_col]
+            hit_counts['TP'] += 1
+            reward_case = "TP Hit"
         elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
             final_price = df_eval.loc[sl_first_time][close_col]
+            hit_counts['SL'] += 1
+            reward_case = "SL Hit"
         else:
             final_price = future_eval_data.iloc[-1][close_col]
+            hit_counts['No Hit'] += 1
+            reward_case = "No Hit"
 
         # 수익률 계산
         calculated_return = (final_price - entry_price) / entry_price
@@ -178,9 +190,13 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
 
         if log_this_sample:
             logger.debug(
-                f"[{i}] Entry: {entry_time}, EntryPrice: {entry_price:.2f}, FinalPrice: {final_price:.2f}, "
-                f"Return: {calculated_return:.4f}, Reward: {reward:.4f}, TP: {is_tp_hit}, SL: {is_sl_hit}"
+                f"[{i:04d}] {reward_case: >7} | Entry: {entry_price:.2f}, Final: {final_price:.2f}, "
+                f"Return: {calculated_return:.4f}, Reward: {reward:.4f}"
             )
+
+    # 최종 보상 집계 로그
+    total_hits = sum(hit_counts.values())
+    logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {total_hits}건)")
 
     return returns_array, valid_samples_mask
 
@@ -304,15 +320,22 @@ def run_value_pretraining_for(direction: str):
         # 검증
         model.eval()
         val_loss = 0
+        all_returns, all_preds = [], []
         with torch.no_grad():
             for features, returns in val_loader:
                 features = {tf: data.to(device) for tf, data in features.items()}
                 returns = returns.to(device)
                 _, value = model(features)
                 val_loss += criterion(value.squeeze(), returns).item()
+                all_returns.extend(returns.cpu().numpy())
+                all_preds.extend(value.squeeze().cpu().numpy())
+        
         val_loss /= len(val_loader)
+        val_mae = mean_absolute_error(all_returns, all_preds)
+        val_r2 = r2_score(all_returns, all_preds)
+        current_lr = optimizer.param_groups[0]['lr']
 
-        logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val MAE: {val_mae:.6f} | Val R2: {val_r2:.6f} | LR: {current_lr:.1e}")
         scheduler.step(val_loss)
 
         if val_loss < best_val_loss:

@@ -67,9 +67,9 @@ CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
 ONCHAIN_CACHE_DIR = os.path.join(CACHE_DIR, "onchain")
 
 # === Labeling Parameters ===
-TP_THRESHOLD = 0.008
-SL_THRESHOLD = -0.008
-LABEL_HORIZON = 5
+TP_THRESHOLD = 0.01
+SL_THRESHOLD = -0.01
+LABEL_HORIZON = 8
 
 # === Thresholds ===
 LGBM_THRESHOLD = 0.5
@@ -82,7 +82,7 @@ PPO_CONFIG = {
     "hidden_dim": 128,
     "max_steps": 2048,
     "buffer_size": 2048,
-    "learning_rate": 1e-5,
+    "learning_rate": 3e-5,
     "epochs": 20,
     "batch_size": 256,
     "entropy_coef": 0.02,
