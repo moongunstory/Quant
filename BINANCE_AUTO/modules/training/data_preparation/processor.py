@@ -89,138 +89,70 @@ def apply_feature_processing(df: pd.DataFrame, data_type: str) -> pd.DataFrame:
     log_ohlcv_nans(df_processed, data_type, stage="after_process")
     return df_processed
 
-def create_labels(df_dict: Dict[str, pd.DataFrame], label_horizon: int = 4) -> pd.DataFrame:
-    """15분봉 기준 라벨 생성 (5분봉 기준 TP/SL 도달 판별)"""
-    if "15min" not in df_dict:
-        raise ValueError("15min timeframe not found in df_dict")
-    
-    if "5min" not in df_dict:
-        raise ValueError("5min timeframe not found in df_dict")
-    
-    # 15분봉을 베이스로 라벨링
+def create_labels(df_dict: Dict[str, pd.DataFrame], label_horizon: int = 4, direction: str = "long") -> pd.DataFrame:
+    """
+    15분봉 기준 라벨 생성 (5분봉 기준 TP/SL 도달 판별) -> 라벨만 반환
+    direction: 'long' 또는 'short'에 따라 라벨링 로직 변경
+    """
+    if "15min" not in df_dict or "5min" not in df_dict:
+        raise ValueError("Label creation requires both '15min' and '5min' data.")
+
     df_15m = df_dict["15min"].copy()
-    df_5m = df_dict["5min"]
-    
-    # 15분봉에서 close 컬럼 찾기
-    close_col = None
-    for col in df_15m.columns:
-        if "close" in col.lower():
-            close_col = col
-            break
-    if close_col is None:
-        raise ValueError("No 'close' column found in 15min timeframe")
-    
-    # 5분봉에서 high/low 컬럼 찾기
-    high_col = low_col = None
-    for col in df_5m.columns:
-        if "high" in col.lower():
-            high_col = col
-        elif "low" in col.lower():
-            low_col = col
-    if high_col is None or low_col is None:
-        raise ValueError("No 'high' or 'low' columns found in 5min timeframe")
-    
-    # 라벨 컬럼 초기화
-    df_15m['label'] = 'hold'
-    
-    # 15분봉 인덱스를 기준으로 반복
+    df_5m = df_dict["5min"].copy()
+
+    # Find close, high, low columns robustly
+    close_col = next((col for col in df_15m.columns if "close" in col.lower()), None)
+    high_col = next((col for col in df_5m.columns if "high" in col.lower()), None)
+    low_col = next((col for col in df_5m.columns if "low" in col.lower()), None)
+
+    if not all([close_col, high_col, low_col]):
+        raise ValueError("Could not find required 'close', 'high', 'low' columns.")
+
+    labels = pd.Series('hold', index=df_15m.index, name='label')
+
     for i in range(len(df_15m) - label_horizon):
-        # 진입 시점 (15분봉 기준)
         entry_time = df_15m.index[i]
         entry_price = df_15m.iloc[i][close_col]
-        
-        # TP/SL 가격 계산
-        tp_price = entry_price * (1 + TP_THRESHOLD)
-        sl_price = entry_price * (1 + SL_THRESHOLD)
-        
-        # horizon 기간 설정 (다음 label_horizon개 15분봉)
-        if i + label_horizon < len(df_15m):
-            end_time = df_15m.index[i + label_horizon]
+
+        # 방향에 따른 TP/SL 가격 계산
+        if direction == "long":
+            tp_price = entry_price * (1 + TP_THRESHOLD)
+            sl_price = entry_price * (1 + SL_THRESHOLD)
+        elif direction == "short":
+            tp_price = entry_price * (1 + SL_THRESHOLD)
+            sl_price = entry_price * (1 + TP_THRESHOLD)
         else:
-            end_time = df_15m.index[-1]
-        
-        # 해당 기간의 5분봉 데이터 추출
+            raise ValueError("Direction must be 'long' or 'short'.")
+
+        end_time = df_15m.index[i + label_horizon]
         future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
-        
-        if len(future_5m) == 0:
+
+        if future_5m.empty:
             continue
-        
-        # TP/SL 도달 시점 찾기 (5분봉 high/low 사용)
-        tp_reached = future_5m[high_col] >= tp_price
-        sl_reached = future_5m[low_col] <= sl_price
-        
-        tp_first_idx = future_5m[tp_reached].index.min() if tp_reached.any() else pd.NaT
-        sl_first_idx = future_5m[sl_reached].index.min() if sl_reached.any() else pd.NaT
-        
-        # 라벨 결정
-        if pd.notna(tp_first_idx) and pd.notna(sl_first_idx):
-            # 둘 다 도달 - 먼저 도달한 것으로 결정
-            if sl_first_idx < tp_first_idx:
-                df_15m.iloc[i, df_15m.columns.get_loc('label')] = 'short'
-            else:
-                df_15m.iloc[i, df_15m.columns.get_loc('label')] = 'long'
-        elif pd.notna(tp_first_idx):
-            # TP만 도달
-            df_15m.iloc[i, df_15m.columns.get_loc('label')] = 'long'
-        elif pd.notna(sl_first_idx):
-            # SL만 도달
-            df_15m.iloc[i, df_15m.columns.get_loc('label')] = 'short'
-        # 둘 다 도달하지 않음 - 'hold' 유지
-    
-    return df_15m
 
-def mask_future_5m_values(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataFrame,
-                         label_horizon: int = 4) -> Dict[str, pd.DataFrame]:
-    """미래 5분봉 high/low 값 마스킹 - 데이터 누출 방지"""
-    if "5min" not in df_dict:
-        return df_dict
-    
-    df_dict_masked = df_dict.copy()
-    df_5m = df_dict_masked["5min"].copy()
-    
-    # 5분봉에서 high/low 컬럼 찾기
-    high_col = low_col = None
-    for col in df_5m.columns:
-        if "high" in col.lower():
-            high_col = col
-        elif "low" in col.lower():
-            low_col = col
-    
-    if high_col is None or low_col is None:
-        logger.warning("[WARNING] No high/low columns found in 5min data for masking")
-        return df_dict_masked
-    
-    # 각 15분봉 라벨링 시점에 대해 미래 5분봉 값 마스킹
-    for i in range(len(df_labeled) - label_horizon):
-        entry_time = df_labeled.index[i]
-        
-        # horizon 기간 설정
-        if i + label_horizon < len(df_labeled):
-            end_time = df_labeled.index[i + label_horizon]
+        # 방향에 따른 TP/SL 도달 조건
+        if direction == "long":
+            tp_reached_times = future_5m.index[future_5m[high_col] >= tp_price]
+            sl_reached_times = future_5m.index[future_5m[low_col] <= sl_price]
         else:
-            end_time = df_labeled.index[-1]
-        
-        # 미래 5분봉 구간 마스킹
-        future_mask = (df_5m.index > entry_time) & (df_5m.index <= end_time)
-        df_5m.loc[future_mask, [high_col, low_col]] = np.nan
+            tp_reached_times = future_5m.index[future_5m[low_col] <= tp_price]
+            sl_reached_times = future_5m.index[future_5m[high_col] >= sl_price]
 
-    log_ohlcv_nans(df_5m, "5min", stage="future_masked")
+        tp_first_time = tp_reached_times.min() if not tp_reached_times.empty else pd.NaT
+        sl_first_time = sl_reached_times.min() if not sl_reached_times.empty else pd.NaT
 
-    # Remove rows with masked NaNs to keep dataset clean
-    df_5m = df_5m.dropna(subset=[high_col, low_col])
-    log_ohlcv_nans(df_5m, "5min", stage="post_mask_drop")
+        # 라벨 할당
+        if pd.notna(tp_first_time) and pd.notna(sl_first_time):
+            if tp_first_time <= sl_first_time:
+                labels.iloc[i] = direction
+            else:
+                labels.iloc[i] = 'hold'
+        elif pd.notna(tp_first_time):
+            labels.iloc[i] = direction
+        elif pd.notna(sl_first_time):
+            labels.iloc[i] = 'hold'
 
-    df_dict_masked["5min"] = df_5m
-    logger.info("[MASK] 미래 5분봉 high/low 값 마스킹 완료")
-
-    return df_dict_masked
-
-def prepare_ppo_data(df_dict: Dict[str, pd.DataFrame], df_labeled: pd.DataFrame,
-                     mask_for_inference: bool = False) -> Dict[str, pd.DataFrame]:
-    """Prepare PPO dataset with optional future masking for inference."""
-    if mask_for_inference:
-        return mask_future_5m_values(df_dict, df_labeled, LABEL_HORIZON)
-    return df_dict
+    return labels.to_frame()
 
 def create_balanced_ppo_dataset(df_labeled: pd.DataFrame, success_label: str) -> pd.DataFrame:
     """Create a balanced PPO dataset with success, fail and hold scenarios."""
@@ -265,68 +197,75 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
 def main():
     """메인 처리 함수"""
     print("[🚀 MTF 데이터 전처리 및 라벨링 시작]")
-    
-    # 1. MTF 데이터 로딩
+
+    # 1. MTF 데이터 로딩 (유출 없는 원본 피처)
     mtf_data = load_mtf_data()
     if not mtf_data:
         raise ValueError("MTF 데이터를 로드할 수 없습니다.")
-    
-    # 2. DUNE 파생 피처 생성 (DUNE DataFrame만)
+
+    # (DUNE 및 BTC 관련 처리는 그대로 유지)
     if "dune" in mtf_data and not mtf_data["dune"].empty:
         mtf_data["dune"] = create_dune_derived_features(mtf_data["dune"])
         print("[⛓️ DUNE 파생 피처 생성 완료]")
-    
-    # 3. 개별 피처 처리
+
     if "btc" in mtf_data and not mtf_data["btc"].empty:
         mtf_data["btc"] = apply_feature_processing(mtf_data["btc"], "btc")
         print("[🔧 BTC 피처 처리 완료]")
-    
+
     if "dune" in mtf_data and not mtf_data["dune"].empty:
         mtf_data["dune"] = apply_feature_processing(mtf_data["dune"], "dune")
         print("[🔧 DUNE 피처 처리 완료]")
-    
-    # 4. 라벨 생성 (15분봉 기준, 5분봉 TP/SL 사용)
-    df_labeled_15m = create_labels(mtf_data, LABEL_HORIZON)
-    print("[🎯 라벨링 완료]")
-    
+
+    # 2. 라벨 생성 (방향별 라벨링)
+    print("[🎯 방향별 라벨링 시작]")
+    df_labels_long = create_labels(mtf_data, LABEL_HORIZON, direction="long")
+    df_labels_short = create_labels(mtf_data, LABEL_HORIZON, direction="short")
+    print("[✅ 방향별 라벨링 완료]")
+
+    # 3. 깨끗한 15분봉 데이터에 라벨 병합 (데이터 유출 방지)
+    df_15m_clean = mtf_data["15min"]
+
+    df_labeled_long = df_15m_clean.join(df_labels_long, how='inner')
+    df_labeled_short = df_15m_clean.join(df_labels_short, how='inner')
+    print("[✅ 라벨-피처 안전한 병합 완료]")
+
     # 라벨 분포 확인
-    label_counts = df_labeled_15m['label'].value_counts()
-    print(f"[📊 라벨 분포] {dict(label_counts)}")
-    
-    # 5. PPO 학습용 데이터 준비 (마스킹은 inference에서만 적용)
-    mtf_data_prepared = prepare_ppo_data(mtf_data, df_labeled_15m, mask_for_inference=False)
-    
-    # 6. PPO 학습을 위한 균형 데이터셋 구성
-    df_long_binary = create_balanced_ppo_dataset(df_labeled_15m, "long")
+    print(f"[📊 Long 라벨 분포] {dict(df_labeled_long['label'].value_counts())}")
+    print(f"[📊 Short 라벨 분포] {dict(df_labeled_short['label'].value_counts())}")
+
+    # 4. PPO 학습을 위한 균형 데이터셋 구성
+    df_long_binary = create_balanced_ppo_dataset(df_labeled_long, "long")
     df_long_binary['label'] = (df_long_binary['label'] == 'long').astype(int)
 
-    df_short_binary = create_balanced_ppo_dataset(df_labeled_15m, "short")
+    df_short_binary = create_balanced_ppo_dataset(df_labeled_short, "short")
     df_short_binary['label'] = (df_short_binary['label'] == 'short').astype(int)
-    
+
     print(f"[🎯 이진분류 데이터 준비]")
     print(f"  - Long 모델용: {len(df_long_binary)}행 (long={sum(df_long_binary['label'])}, hold={len(df_long_binary)-sum(df_long_binary['label'])})")
     print(f"  - Short 모델용: {len(df_short_binary)}행 (short={sum(df_short_binary['label'])}, hold={len(df_short_binary)-sum(df_short_binary['label'])})")
-    
-    # 7. 저장
+
+    # 5. 최종 데이터 저장
     long_path = TRAIN_PICKLE_PATHS["long"]
     short_path = TRAIN_PICKLE_PATHS["short"]
-    
+
     os.makedirs(os.path.dirname(long_path), exist_ok=True)
     os.makedirs(os.path.dirname(short_path), exist_ok=True)
-    
-    # ✅ long
-    with open(long_path, "wb") as f:
-        pickle.dump({**mtf_data_prepared, "15min": df_long_binary}, f)
 
-    # ✅ short
+    long_data_to_save = mtf_data.copy()
+    long_data_to_save["15min"] = df_long_binary
+    with open(long_path, "wb") as f:
+        pickle.dump(long_data_to_save, f)
+
+    short_data_to_save = mtf_data.copy()
+    short_data_to_save["15min"] = df_short_binary
     with open(short_path, "wb") as f:
-        pickle.dump({**mtf_data_prepared, "15min": df_short_binary}, f)
+        pickle.dump(short_data_to_save, f)
 
     print(f"[💾 저장 완료]")
     print(f"  - Long 이진분류 데이터: {len(df_long_binary)}행 → {long_path}")
     print(f"  - Short 이진분류 데이터: {len(df_short_binary)}행 → {short_path}")
-    
-    return df_labeled_15m, mtf_data_prepared
+
+    return df_labeled_long, df_labeled_short
 
 if __name__ == "__main__":
-    labeled_df, masked_mtf_data = main()
+    labeled_df, processed_mtf_data = main()

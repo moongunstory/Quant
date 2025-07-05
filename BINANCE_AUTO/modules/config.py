@@ -10,7 +10,8 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
 # === Time & Symbol Settings ===
 TZ = 'UTC'
-TIMEFRAMES = ["5min", "15min", "30min", "1H"]
+TIMEFRAMES = ["5min", "15min", "30min", "1H", "btc",] # "dune" < 일단 빼버림
+AUX_TIMEFRAMES = ["btc",] # "dune" < 일단 빼버림
 TRADE_SYMBOL = "ETHUSDT"
 FUTURES_SYMBOL = "ETHUSDT"
 FUTURES_LEVERAGE = 5
@@ -68,10 +69,10 @@ ONCHAIN_CACHE_DIR = os.path.join(CACHE_DIR, "onchain")
 # === Labeling Parameters ===
 TP_THRESHOLD = 0.008
 SL_THRESHOLD = -0.008
-LABEL_HORIZON = 20
+LABEL_HORIZON = 5
 
 # === Thresholds ===
-LGBM_THRESHOLD = 0.6
+LGBM_THRESHOLD = 0.5
 LONG_THRESHOLD = 0.685
 SHORT_THRESHOLD = 0.685
 
@@ -81,7 +82,7 @@ PPO_CONFIG = {
     "hidden_dim": 128,
     "max_steps": 2048,
     "buffer_size": 2048,
-    "learning_rate": 1e-4,
+    "learning_rate": 1e-5,
     "epochs": 20,
     "batch_size": 256,
     "entropy_coef": 0.02,

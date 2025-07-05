@@ -31,7 +31,7 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
     mtf_data = {}
     
     # 각 타임프레임 + BTC/DUNE 데이터 로드
-    data_keys = TIMEFRAMES + ["btc", "dune"]
+    data_keys = TIMEFRAMES
     
     for key in data_keys:
         file_path = os.path.join(save_dir, f"market_data_{key}.pkl")
@@ -68,93 +68,71 @@ def filter_features_by_timeframe(df: pd.DataFrame, timeframe: str) -> List[str]:
     
     return filtered_features
 
-def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame], 
-                         target_index: pd.DatetimeIndex) -> Tuple[Dict[str, np.ndarray], List[pd.Timestamp]]:
-    """MTF 시퀀스 데이터 생성 (고속/저메모리 최적화)"""
-    mtf_sequences = {}
-    final_valid_indices = None  # 공통으로 존재하는 인덱스만 유지
+def create_lgbm_features(labeled_df: pd.DataFrame, mtf_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    merge_asof를 사용하여 모든 타임프레임의 피처를 기준 데이터프레임에 결합합니다.
+    데이터 손실 없이 LGBM에 최적화된 피처셋을 생성합니다.
+    """
+    print("[🚀 새로운 피처 엔지니어링 시작 (merge_asof)]")
 
-    for timeframe in TIMEFRAMES:
-        if timeframe not in mtf_data:
-            print(f"[경고] {timeframe} 데이터가 없습니다.")
-            continue
+    # 기준 데이터프레임(15min)의 인덱스를 datetime으로 변환
+    base_df = labeled_df.copy()
+    base_df.index = pd.to_datetime(base_df.index)
 
-        df = mtf_data[timeframe].copy()
+    # 사용할 모든 타임프레임 (보조 피처 포함)
+    all_timeframes = [tf for tf in TIMEFRAMES if tf != "dune"]
 
-        # 피처 선택 및 전처리
-        feature_cols = filter_features_by_timeframe(df, timeframe)
-        df = df[feature_cols].ffill().fillna(0)
+    # 기준(15min)을 제외한 나머지 타임프레임
+    feature_timeframes = [tf for tf in all_timeframes if tf != "15min" and tf in mtf_data]
 
-        print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {PPO_CONFIG["seq_len"]}")
+    # 각 타임프레임의 데이터를 base_df에 병합
+    for timeframe in feature_timeframes:
+        print(f"  - 병합 중: {timeframe}")
+        feature_df = mtf_data[timeframe].copy()
+        feature_df.index = pd.to_datetime(feature_df.index)
+        feature_df = feature_df.add_suffix(f'_{timeframe}')
 
-        # 미리 인덱스 및 값 추출
-        index_list = df.index.to_list()
-        values = df.values
-        sequences = []
-        valid_indices = []
-
-        for t in target_index:
-            if df.index.tz is not None:
-                t = t.tz_convert(df.index.tz)
-            else:
-                t = t.tz_localize(None)
-
-            pos = bisect.bisect_right(index_list, t)
-
-            if pos >= PPO_CONFIG["seq_len"]:
-                seq = values[pos - PPO_CONFIG["seq_len"]:pos]
-                sequences.append(seq)
-                valid_indices.append(index_list[pos - 1])
-            elif pos > 0:
-                pad_len = PPO_CONFIG["seq_len"] - pos
-                padded = np.vstack([
-                    np.zeros((pad_len, values.shape[1])),
-                    values[:pos]
-                ])
-                sequences.append(padded)
-                valid_indices.append(index_list[pos - 1])
-            # else: 데이터가 하나도 없는 경우 무시
-
-        if sequences:
-            mtf_sequences[timeframe] = np.array(sequences)
-            print(f"[✅ {timeframe}] 시퀀스 생성 완료: {mtf_sequences[timeframe].shape}")
-
-            if final_valid_indices is None:
-                final_valid_indices = valid_indices
-            else:
-                final_valid_indices = list(set(final_valid_indices) & set(valid_indices))
+        # 타임프레임별 tolerance 설정
+        if timeframe == 'btc':
+            tolerance = pd.Timedelta('45min')
+        elif timeframe == 'dune':
+            tolerance = pd.Timedelta('6h')
         else:
-            print(f"[❌ {timeframe}] 유효한 시퀀스가 없습니다.")
+            tolerance = pd.Timedelta('3d')
 
-    return mtf_sequences, sorted(final_valid_indices)
+        # 병합 전 마스킹 피처 생성
+        valid_mask = feature_df.notna().all(axis=1).astype(int)
+        valid_mask.name = f"{timeframe}_valid"
 
-def flatten_mtf_sequences(mtf_sequences: Dict[str, np.ndarray]) -> np.ndarray:
-    """MTF 시퀀스를 LGBM용 평면 피처로 변환"""
-    flattened_features = []
-    feature_names = []
-    
-    for timeframe in TIMEFRAMES:
-        if timeframe not in mtf_sequences:
-            continue
-        
-        sequences = mtf_sequences[timeframe]  # Shape: (N, PPO_CONFIG["seq_len"], features)
-        n_samples, seq_len, n_features = sequences.shape
-        
-        # 시퀀스를 평면화 (각 타임스텝과 피처를 별도 컬럼으로)
-        flat_data = sequences.reshape(n_samples, -1)  # Shape: (N, PPO_CONFIG["seq_len"] * features)
-        flattened_features.append(flat_data)
-        
-        # 피처명 생성
-        for t in range(seq_len):
-            for f in range(n_features):
-                feature_names.append(f"{timeframe}_t{t}_f{f}")
-    
-    if flattened_features:
-        X_flat = np.concatenate(flattened_features, axis=1)
-        print(f"[🔄 MTF 평면화 완료] Shape: {X_flat.shape}, 피처 수: {len(feature_names)}")
-        return X_flat, feature_names
-    else:
-        raise ValueError("평면화할 MTF 시퀀스가 없습니다.")
+        # NaN → 0으로 채움
+        feature_df.fillna(0, inplace=True)
+
+        # 본 데이터 병합
+        base_df = pd.merge_asof(
+            left=base_df,
+            right=feature_df,
+            left_index=True,
+            right_index=True,
+            direction='backward',
+            tolerance=tolerance
+        )
+
+        # 마스킹 피처 병합
+        base_df = pd.merge_asof(
+            left=base_df,
+            right=valid_mask,
+            left_index=True,
+            right_index=True,
+            direction='backward',
+            tolerance=tolerance
+        )
+
+    # 병합 후 발생할 수 있는 NaN 값 처리 (앞선 값으로 채우기)
+    base_df.ffill(inplace=True)
+
+    print(f"[✅ 피처 엔지니어링 완료] 최종 피처 수:  {len(base_df.columns)}, 최종 샘플 수: {len(base_df)}")
+
+    return base_df
 
 def create_time_based_split(X: np.ndarray, y: np.ndarray, 
                            timestamps: pd.DatetimeIndex, 
@@ -346,7 +324,7 @@ def save_model(model: lgb.LGBMClassifier, metrics: Dict, data_type: str = "long"
     print(f"  - Recall: {metrics['recall']:.4f}")
     print(f"  - Signal Rate: {metrics['signal_rate']:.2%}")
     print(f"  - Timeframes: {TIMEFRAMES}")
-    print(f"  - Sequence Length: {PPO_CONFIG["seq_len"]}")
+    print(f"  - Sequence Length: {PPO_CONFIG['seq_len']}")
 
 def show_feature_importance(model: lgb.LGBMClassifier, feature_names: List[str], 
                            data_type: str = "long", top_k: int = 20):
@@ -375,7 +353,7 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     print(f"\n{'='*60}")
     print(f"🚀 {data_type.upper()} MTF LGBM 모델 학습 시작")
     print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
-    print(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
+    print(f"📏 Sequence Length: {PPO_CONFIG['seq_len']}")
     print(f"{'='*60}")
     
     # 1. MTF 데이터 로딩
@@ -384,36 +362,33 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     # 2. 라벨 데이터 로딩
     labeled_df = load_labeled_data(data_type)
     
-    # 3. MTF 시퀀스 생성 (PPO와 동일한 방식)
-    mtf_sequences, valid_indices = create_mtf_sequences(mtf_data, labeled_df.index)
-    
-    # 4. 유효한 인덱스에 맞춰 라벨 정렬
-    valid_timestamps = pd.DatetimeIndex(valid_indices)
-    aligned_labels = labeled_df.loc[valid_timestamps, 'label'].values
-    
-    print(f"[🔧 {data_type.upper()} 데이터 정렬 완료]")
-    print(f"  - 유효 샘플 수: {len(aligned_labels)}")
-    print(f"  - 라벨 분포: {data_type}={sum(aligned_labels)}, hold={len(aligned_labels)-sum(aligned_labels)}")
-    
-    # 5. MTF 시퀀스를 LGBM용 평면 피처로 변환
-    X_flat, feature_names = flatten_mtf_sequences(mtf_sequences)
+    # 3. 새로운 피처 엔지니어링 함수 호출
+    final_df = create_lgbm_features(labeled_df, mtf_data)
 
-    # 라벨 데이터프레임의 인덱스에서 valid_timestamps가 위치한 행을 찾아
-    # 해당 위치의 피처만 선택한다. get_indexer는 각 타임스탬프의 위치를
-    # 반환하며, 존재하지 않는 경우 -1을 반환하므로 필터링 전에 검증한다.
-    valid_indices_pos = labeled_df.index.get_indexer(valid_timestamps)
-    if (valid_indices_pos < 0).any():
-        raise ValueError("일부 유효 타임스탬프가 라벨 데이터프레임에 존재하지 않습니다.")
+    # 4. 피처(X)와 라벨(y) 분리
+    # 미래 정보나 라벨과 직접 관련된 컬럼들을 피처에서 제외
+    future_keywords = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
+    feature_columns = [col for col in final_df.columns if not any(keyword in col.lower() for keyword in future_keywords)]
 
-    X_flat = X_flat[valid_indices_pos]
-    y = aligned_labels
+    X = final_df[feature_columns]
+    y = final_df['label']
 
-    # 피처와 라벨의 행 수가 일치하는지 확인
-    assert X_flat.shape[0] == len(aligned_labels), "Features and labels size mismatch"
-    
+    # 라벨 분포 확인
+    print(f"[🔧 {data_type.upper()} 데이터 준비 완료]")
+    print(f"  - 최종 학습 샘플 수: {len(X)}")
+    print(f"  - 라벨 분포: {data_type}={y.sum()}, hold={len(y)-y.sum()}")
+
+    # 5. 시간 기반 train/validation 분할
+    X_train, X_val, y_train, y_val = create_time_based_split(
+        X.values, y.values, final_df.index, train_ratio=0.8
+    )
+
+    # 피처 이름 저장 (피처 중요도 분석용)
+    feature_names = X.columns.tolist()
+
     # 6. 시간 기반 train/validation 분할 (셔플 금지)
     X_train, X_val, y_train, y_val = create_time_based_split(
-        X_flat, y, valid_timestamps, train_ratio=0.8
+        X.values, y.values, final_df.index, train_ratio=0.8
     )
     
     # 7. 모델 학습
@@ -439,7 +414,7 @@ def main():
     print("=" * 80)
     print("🚀 MTF LGBM Long/Short 이진분류 모델 학습 시작")
     print(f"🕒 지원 Timeframes: {TIMEFRAMES}")
-    print(f"📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
+    print(f"📏 Sequence Length: {PPO_CONFIG['seq_len']}")
     print("=" * 80)
     
     results = {}
@@ -465,7 +440,7 @@ def main():
     print(f"   ✅ {LGBM_MODEL_PATHS['short']}")
     print(f"\n🔧 MTF 설정:")
     print(f"   📊 Timeframes: {TIMEFRAMES}")
-    print(f"   📏 Sequence Length: {PPO_CONFIG["seq_len"]}")
+    print(f"   📏 Sequence Length: {PPO_CONFIG['seq_len']}")
     print(f"   🎯 Threshold: {LGBM_THRESHOLD}")
     print(f"{'=' * 80}")
     
