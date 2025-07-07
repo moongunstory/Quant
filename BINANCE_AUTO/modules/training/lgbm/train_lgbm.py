@@ -68,72 +68,94 @@ def filter_features_by_timeframe(df: pd.DataFrame, timeframe: str) -> List[str]:
    
    return filtered_features
 
-def create_lgbm_features(labeled_df: pd.DataFrame, mtf_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-   """
-   merge_asof를 사용하여 모든 타임프레임의 피처를 기준 데이터프레임에 결합합니다.
-   데이터 손실 없이 LGBM에 최적화된 피처셋을 생성합니다.
-   """
-   print("[새로운 피처 엔지니어링 시작 (merge_asof)]")
+def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame], 
+                         target_index: pd.DatetimeIndex) -> Tuple[Dict[str, np.ndarray], List[pd.Timestamp]]:
+    """MTF 시퀀스 데이터 생성 (고속/저메모리 최적화)"""
+    mtf_sequences = {}
+    final_valid_indices = None  # 공통으로 존재하는 인덱스만 유지
 
-   # 기준 데이터프레임(15min)의 인덱스를 datetime으로 변환
-   base_df = labeled_df.copy()
-   base_df.index = pd.to_datetime(base_df.index)
+    for timeframe in TIMEFRAMES:
+        if timeframe not in mtf_data:
+            print(f"[경고] {timeframe} 데이터가 없습니다.")
+            continue
 
-   # 사용할 모든 타임프레임 (보조 피처 포함)
-   all_timeframes = [tf for tf in TIMEFRAMES if tf != "dune"]
+        df = mtf_data[timeframe].copy()
 
-   # 기준(15min)을 제외한 나머지 타임프레임
-   feature_timeframes = [tf for tf in all_timeframes if tf != "15min" and tf in mtf_data]
+        # 피처 선택 및 전처리
+        feature_cols = filter_features_by_timeframe(df, timeframe)
+        df = df[feature_cols].ffill().fillna(0)
 
-   # 각 타임프레임의 데이터를 base_df에 병합
-   for timeframe in feature_timeframes:
-       print(f"  - 병합 중: {timeframe}")
-       feature_df = mtf_data[timeframe].copy()
-       feature_df.index = pd.to_datetime(feature_df.index)
-       feature_df = feature_df.add_suffix(f'_{timeframe}')
+        print(f"[🔧 {timeframe}] 피처 수: {len(feature_cols)}, 시퀀스 길이: {PPO_CONFIG['seq_len']}")
 
-       # 타임프레임별 tolerance 설정
-       if timeframe == 'btc':
-           tolerance = pd.Timedelta('45min')
-       elif timeframe == 'dune':
-           tolerance = pd.Timedelta('6h')
-       else:
-           tolerance = pd.Timedelta('3d')
+        # 미리 인덱스 및 값 추출
+        index_list = df.index.to_list()
+        values = df.values
+        sequences = []
+        valid_indices = []
 
-       # 병합 전 마스킹 피처 생성
-       valid_mask = feature_df.notna().all(axis=1).astype(int)
-       valid_mask.name = f"{timeframe}_valid"
+        for t in target_index:
+            if df.index.tz is not None:
+                t = t.tz_convert(df.index.tz)
+            else:
+                t = t.tz_localize(None)
 
-       # NaN → 0으로 채움
-       feature_df.fillna(0, inplace=True)
+            pos = bisect.bisect_right(index_list, t)
 
-       # 본 데이터 병합
-       base_df = pd.merge_asof(
-           left=base_df,
-           right=feature_df,
-           left_index=True,
-           right_index=True,
-           direction='backward',
-           tolerance=tolerance
-       )
+            if pos >= PPO_CONFIG["seq_len"]:
+                seq = values[pos - PPO_CONFIG["seq_len"]:pos]
+                sequences.append(seq)
+                valid_indices.append(index_list[pos - 1])
+            elif pos > 0:
+                pad_len = PPO_CONFIG["seq_len"] - pos
+                padded = np.vstack([
+                    np.zeros((pad_len, values.shape[1])),
+                    values[:pos]
+                ])
+                sequences.append(padded)
+                valid_indices.append(index_list[pos - 1])
+            # else: 데이터가 하나도 없는 경우 무시
 
-       # 마스킹 피처 병합
-       base_df = pd.merge_asof(
-           left=base_df,
-           right=valid_mask,
-           left_index=True,
-           right_index=True,
-           direction='backward',
-           tolerance=tolerance
-       )
+        if sequences:
+            mtf_sequences[timeframe] = np.array(sequences)
+            print(f"[✅ {timeframe}] 시퀀스 생성 완료: {mtf_sequences[timeframe].shape}")
 
-   # 병합 후 발생할 수 있는 NaN 값 처리 (앞선 값으로 채우기)
-   base_df.ffill(inplace=True)
+            if final_valid_indices is None:
+                final_valid_indices = valid_indices
+            else:
+                final_valid_indices = list(set(final_valid_indices) & set(valid_indices))
+        else:
+            print(f"[❌ {timeframe}] 유효한 시퀀스가 없습니다.")
 
-   print(f"[피처 엔지니어링 완료] 최종 피처 수: {len(base_df.columns)}, 최종 샘플 수: {len(base_df)}")
+    return mtf_sequences, sorted(final_valid_indices)
 
-   return base_df
-
+def flatten_mtf_sequences(mtf_sequences: Dict[str, np.ndarray]) -> np.ndarray:
+    """MTF 시퀀스를 LGBM용 평면 피처로 변환"""
+    flattened_features = []
+    feature_names = []
+    
+    for timeframe in TIMEFRAMES:
+        if timeframe not in mtf_sequences:
+            continue
+        
+        sequences = mtf_sequences[timeframe]  # Shape: (N, PPO_CONFIG["seq_len"], features)
+        n_samples, seq_len, n_features = sequences.shape
+        
+        # 시퀀스를 평면화 (각 타임스텝과 피처를 별도 컬럼으로)
+        flat_data = sequences.reshape(n_samples, -1)  # Shape: (N, PPO_CONFIG["seq_len"] * features)
+        flattened_features.append(flat_data)
+        
+        # 피처명 생성
+        for t in range(seq_len):
+            for f in range(n_features):
+                feature_names.append(f"{timeframe}_t{t}_f{f}")
+    
+    if flattened_features:
+        X_flat = np.concatenate(flattened_features, axis=1)
+        print(f"[🔄 MTF 평면화 완료] Shape: {X_flat.shape}, 피처 수: {len(feature_names)}")
+        return X_flat, feature_names
+    else:
+        raise ValueError("평면화할 MTF 시퀀스가 없습니다.")
+    
 def create_time_based_split(X: np.ndarray, y: np.ndarray, 
                           timestamps: pd.DatetimeIndex, 
                           train_ratio: float = 0.8) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -266,12 +288,13 @@ def train_model(X_train: np.ndarray, y_train: np.ndarray,
    return model
 
 def evaluate_model(model: lgb.LGBMClassifier, X_val: np.ndarray, y_val: np.ndarray, 
-                 data_type: str = "long") -> Dict:
+                   data_type: str = "long", feature_names: List[str] = None) -> Dict:
    """모델 평가"""
    print(f"[{data_type.upper()} 모델 평가 중...]")
    
    # 확률 예측
-   y_prob = model.predict_proba(X_val)[:, 1]
+   X_val_df = pd.DataFrame(X_val, columns=feature_names)
+   y_prob = model.predict_proba(X_val_df)[:, 1]
    
    # Threshold 기반 예측
    y_pred = (y_prob >= LGBM_THRESHOLD).astype(int)
@@ -349,65 +372,55 @@ def show_feature_importance(model: lgb.LGBMClassifier, feature_names: List[str],
        print(f"  {tf}: {importance:.4f}")
 
 def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
-   """MTF LGBM 학습 파이프라인"""
-   print(f"\n{'='*60}")
-   print(f"{data_type.upper()} MTF LGBM 모델 학습 시작")
-   print(f"지원 Timeframes: {TIMEFRAMES}")
-   print(f"Sequence Length: {PPO_CONFIG['seq_len']}")
-   print(f"{'='*60}")
-   
-   # 1. MTF 데이터 로딩
-   mtf_data = load_mtf_data()
-   
-   # 2. 라벨 데이터 로딩
-   labeled_df = load_labeled_data(data_type)
-   
-   # 3. 새로운 피처 엔지니어링 함수 호출
-   final_df = create_lgbm_features(labeled_df, mtf_data)
+    print(f"\n{'='*60}")
+    print(f"{data_type.upper()} MTF LGBM 모델 학습 시작")
+    print(f"지원 Timeframes: {TIMEFRAMES}")
+    print(f"Sequence Length: {PPO_CONFIG['seq_len']}")
+    print(f"{'='*60}")
+    
+    mtf_data = load_mtf_data()
+    labeled_df = load_labeled_data(data_type)
 
-   # 4. 피처(X)와 라벨(y) 분리
-   # 미래 정보나 라벨과 직접 관련된 컬럼들을 피처에서 제외
-   future_keywords = ['label', 'target', 'tp_hit', 'sl_hit', 'next_', 'forward_']
-   feature_columns = [col for col in final_df.columns if not any(keyword in col.lower() for keyword in future_keywords)]
+    # 3. MTF 시퀀스 생성
+    mtf_sequences, valid_indices = create_mtf_sequences(mtf_data, labeled_df.index)
 
-   X = final_df[feature_columns]
-   y = final_df['label']
+    # 4. 라벨 동기화
+    valid_timestamps = pd.DatetimeIndex(valid_indices)
+    aligned_labels = labeled_df.loc[valid_timestamps, 'label'].values
 
-   # 라벨 분포 확인
-   print(f"[{data_type.upper()} 데이터 준비 완료]")
-   print(f"  - 최종 학습 샘플 수: {len(X)}")
-   print(f"  - 라벨 분포: {data_type}={y.sum()}, hold={len(y)-y.sum()}")
+    # 5. 시퀀스 평면화
+    X_flat, feature_names = flatten_mtf_sequences(mtf_sequences)
 
-   # 5. 시간 기반 train/validation 분할
-   X_train, X_val, y_train, y_val = create_time_based_split(
-       X.values, y.values, final_df.index, train_ratio=0.8
-   )
+    # 인덱스 정렬
+    valid_indices_pos = labeled_df.index.get_indexer(valid_timestamps)
+    if (valid_indices_pos < 0).any():
+        raise ValueError("일부 유효 타임스탬프가 라벨 데이터프레임에 존재하지 않습니다.")
+    
+    X_flat = X_flat[valid_indices_pos]
+    y = aligned_labels
 
-   # 피처 이름 저장 (피처 중요도 분석용)
-   feature_names = X.columns.tolist()
+    assert X_flat.shape[0] == len(y), "Features and labels size mismatch"
 
-   # 6. 시간 기반 train/validation 분할 (셔플 금지)
-   X_train, X_val, y_train, y_val = create_time_based_split(
-       X.values, y.values, final_df.index, train_ratio=0.8
-   )
-   
-   # 7. 모델 학습
-   model = train_model(X_train, y_train, X_val, y_val, data_type, use_optuna)
-   
-   # 8. 모델 평가
-   metrics = evaluate_model(model, X_val, y_val, data_type)
-   
-   # 9. 피처 중요도 분석
-   show_feature_importance(model, feature_names, data_type)
-   
-   # 10. 모델 저장
-   save_model(model, metrics, data_type)
-   
-   print(f"\n[{data_type.upper()} MTF LGBM 학습 완료]")
-   print(f"   F1-Score: {metrics['f1']:.4f}")
-   print(f"   {data_type.title()} 신호율: {metrics['signal_rate']:.2%}")
-   
-   return model, metrics
+    print(f"[{data_type.upper()} 데이터 준비 완료]")
+    print(f"  - 최종 학습 샘플 수: {len(X_flat)}")
+    print(f"  - 라벨 분포: {data_type}={y.sum()}, hold={len(y)-y.sum()}")
+
+    # 6. train/val split
+    X_train, X_val, y_train, y_val = create_time_based_split(
+        X_flat, y, valid_timestamps, train_ratio=0.8
+    )
+
+    # 7~10단계 동일
+    model = train_model(X_train, y_train, X_val, y_val, data_type, use_optuna)
+    metrics = evaluate_model(model, X_val, y_val, data_type, feature_names)
+    show_feature_importance(model, feature_names, data_type)
+    save_model(model, metrics, data_type)
+
+    print(f"\n[{data_type.upper()} MTF LGBM 학습 완료]")
+    print(f"   F1-Score: {metrics['f1']:.4f}")
+    print(f"   {data_type.title()} 신호율: {metrics['signal_rate']:.2%}")
+
+    return model, metrics
 
 def main():
    """메인 실행 함수 - Long/Short MTF LGBM 모델 모두 학습"""

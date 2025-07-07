@@ -11,7 +11,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 # === Time & Symbol Settings ===
 TZ = 'UTC'
 TIMEFRAMES = ["5min", "15min", "30min", "1H", "btc",] # "dune" < 일단 빼버림
-AUX_TIMEFRAMES = ["btc",] # "dune" < 일단 빼버림
+AUX_TIMEFRAMES = "btc"
 TRADE_SYMBOL = "ETHUSDT"
 FUTURES_SYMBOL = "ETHUSDT"
 FUTURES_LEVERAGE = 5
@@ -91,6 +91,7 @@ PPO_CONFIG = {
     "gamma": 0.99,
     "lambda": 0.95,
     "action_dim": 2,
+    "neutral_band_ratio": 0.1,
 }
 
 # === Imitation Learning Config ===

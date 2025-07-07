@@ -32,19 +32,11 @@ from modules.training.ppo.imitation.train_imitation import (
     validate_data,
     ProcessedData,
 )
-DEBUG_LOG_LIMIT = 100 
-REWARD_SCALE_FACTOR = 100
-# 로깅 설정
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s') # INFO -> DEBUG
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
-log_counts = {
-    'tp_first': 0, 'sl_first': 0, 'only_tp': 0, 'only_sl': 0, 'no_hit': 0, 'no_future_data': 0
-}
-max_logs = {
-    'tp_first': 10, 'sl_first': 10, 'only_tp': 10, 'only_sl': 10, 'no_hit': 10, 'no_future_data': 10
-}
+# 로깅 설정 (INFO 레벨로 간소화)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 class ValuePretrainDataset(Dataset):
     """가치 사전 학습을 위한 데이터셋 (상태, 실제 누적 보상)"""
@@ -71,9 +63,6 @@ class ValuePretrainDataset(Dataset):
                     features[tf] = torch.FloatTensor(data[actual_idx])
             else:
                 # 데이터가 없는 경우 제로 패딩
-                # 이 부분은 PPOPolicyNetwork의 forward에서 처리되므로, 여기서는 단순히 0으로 채움
-                # PPOPolicyNetwork의 forward 로직과 일치하도록 수정 필요
-                # 현재는 input_dims를 사용하여 0으로 채우지만, 실제 데이터에서는 이런 경우가 없어야 함
                 dim = self.input_dims[tf]
                 if tf in ['btc', 'dune']:
                     features[tf] = torch.zeros(dim, dtype=torch.float32)
@@ -95,8 +84,6 @@ def generate_rewards(returns_array: np.ndarray) -> np.ndarray:
     """
     실제 수익률 배열을 받아 보상으로 사용합니다.
     """
-    # 여기서는 받은 수익률 배열을 그대로 보상으로 사용합니다.
-    # 필요하다면 추가적인 변환 로직을 여기에 추가할 수 있습니다.
     epsilon = 1e-6
     reward_dist = {
         'positive': (returns_array > 0).sum(),
@@ -109,7 +96,14 @@ def generate_rewards(returns_array: np.ndarray) -> np.ndarray:
 
     return returns_array
 
-def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, direction: str) -> Tuple[np.ndarray, np.ndarray]:
+def calculate_horizon_returns(
+    df_entry: pd.DataFrame,
+    df_eval: pd.DataFrame,
+    direction: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    TP/SL 기반 수익률 보상 계산
+    """
     returns_array = np.zeros(len(df_entry), dtype=float)
     valid_samples_mask = np.ones(len(df_entry), dtype=bool)
 
@@ -120,25 +114,54 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
     if not all([close_col, high_col, low_col]):
         raise ValueError("Could not find required 'close', 'high', 'low' columns for return calculation.")
 
-    amplification = 100  # tanh 스케일링 계수 (보상 증폭)
-    logger.info(f"   - 보상 증폭 계수(amplification) 적용: {amplification}")
+    REWARD_SCALE = 10.0
 
-    # 로그용 카운터
+    def get_no_hit_reward(ret: float, direction: str) -> float:
+        neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1) # 기본값 0.1
+        
+        tp_thresh = TP_THRESHOLD
+        sl_thresh = abs(SL_THRESHOLD) # SL_THRESHOLD는 음수이므로 절대값 사용
+
+        # 중립 구간 경계 설정
+        positive_neutral_thresh = tp_thresh * neutral_band
+        negative_neutral_thresh = sl_thresh * neutral_band
+
+        if direction == "long":
+            if 0 <= ret < positive_neutral_thresh:
+                return 0.0
+            if ret >= positive_neutral_thresh:
+                # 중립 구간을 제외한 범위에서 0~1로 정규화
+                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
+            if ret < 0:
+                # 손실은 SL 임계값으로 정규화 (0 ~ -1 범위)
+                return ret / sl_thresh
+
+        elif direction == "short":
+            # Short 포지션의 수익률(ret)은 (수익시 양수, 손실시 음수)로 변환되었음
+            # 따라서 ret > 0 이면 이익, ret < 0 이면 손실
+            if 0 <= ret < positive_neutral_thresh:
+                return 0.0
+            if ret >= positive_neutral_thresh:
+                # 이익 구간 (ret은 양수)
+                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
+            if ret < 0:
+                # 손실 구간 (ret은 음수)
+                return ret / sl_thresh
+        
+        return 0.0 # 그 외의 경우는 0
+
     hit_counts = {'TP': 0, 'SL': 0, 'No Hit': 0}
 
     for i in range(len(df_entry) - LABEL_HORIZON):
         entry_time = df_entry.index[i]
         entry_price = df_entry.iloc[i][close_col]
-        log_this_sample = (i < DEBUG_LOG_LIMIT)
 
         if direction == "long":
             tp_price = entry_price * (1 + TP_THRESHOLD)
-            sl_price = entry_price * (1 + SL_THRESHOLD)
-        elif direction == "short":
-            tp_price = entry_price * (1 + SL_THRESHOLD)
-            sl_price = entry_price * (1 + TP_THRESHOLD)
+            sl_price = entry_price * (1 - abs(SL_THRESHOLD))
         else:
-            raise ValueError("Direction must be 'long' or 'short'.")
+            tp_price = entry_price * (1 - TP_THRESHOLD)
+            sl_price = entry_price * (1 + abs(SL_THRESHOLD))
 
         end_time = df_entry.index[i + LABEL_HORIZON]
         future_eval_data = df_eval[(df_eval.index > entry_time) & (df_eval.index <= end_time)]
@@ -146,11 +169,10 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
         if future_eval_data.empty:
             returns_array[i] = 0.0
             valid_samples_mask[i] = False
-            if log_this_sample:
-                logger.debug(f"[{i}] No future_eval_data. Marked as invalid. Entry Time: {entry_time}")
+            hit_counts['No Hit'] += 1 # No Hit 카운트 증가
+            logger.debug(f"[{i}] No Hit (No Future Data).")
             continue
 
-        # TP/SL 도달 시점 확인
         if direction == "long":
             tp_hit_times = future_eval_data.index[future_eval_data[high_col] >= tp_price]
             sl_hit_times = future_eval_data.index[future_eval_data[low_col] <= sl_price]
@@ -164,41 +186,38 @@ def calculate_horizon_returns(df_entry: pd.DataFrame, df_eval: pd.DataFrame, dir
         is_tp_hit = pd.notna(tp_first_time)
         is_sl_hit = pd.notna(sl_first_time)
 
-        # 도달한 시점 기준 최종 평가 가격 결정
-        reward_case = ""
+        logger.debug(f"[{i}] is_tp_hit: {is_tp_hit}, is_sl_hit: {is_sl_hit}")
+        logger.debug(f"[{i}] tp_first_time: {tp_first_time}, sl_first_time: {sl_first_time}")
+        # logger.debug(f"[{i}] future_eval_data:\n{future_eval_data.to_string()}") # 너무 많은 로그가 발생할 수 있으므로 필요시 주석 해제
+
         if is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
             final_price = df_eval.loc[tp_first_time][close_col]
             hit_counts['TP'] += 1
-            reward_case = "TP Hit"
+            logger.debug(f"[{i}] TP Hit. final_price: {final_price:.4f}")
         elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
             final_price = df_eval.loc[sl_first_time][close_col]
             hit_counts['SL'] += 1
-            reward_case = "SL Hit"
+            logger.debug(f"[{i}] SL Hit. final_price: {final_price:.4f}")
         else:
             final_price = future_eval_data.iloc[-1][close_col]
             hit_counts['No Hit'] += 1
-            reward_case = "No Hit"
+            logger.debug(f"[{i}] No Hit. final_price: {final_price:.4f}")
 
-        # 수익률 계산
-        calculated_return = (final_price - entry_price) / entry_price
-        if direction == "short":
-            calculated_return *= -1
+        # 순수 수익률 계산 (부호 변경 없음)
+        ret = (final_price - entry_price) / entry_price
+        logger.debug(f"[{i}] Calculated ret: {ret:.4f}")
+        
+        reward = (
+            10.0 if is_tp_hit else
+            -1.0 if is_sl_hit else
+            get_no_hit_reward(ret, direction) # 순수 ret을 전달
+        )
+        logger.debug(f"[{i}] Final reward: {reward:.4f}")
+        returns_array[i] = reward * REWARD_SCALE
 
-        # tanh 기반 shaping reward
-        reward = float(np.tanh(calculated_return * amplification))
-        returns_array[i] = reward
+    logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {sum(hit_counts.values())}건)")
 
-        if log_this_sample:
-            logger.debug(
-                f"[{i:04d}] {reward_case: >7} | Entry: {entry_price:.2f}, Final: {final_price:.2f}, "
-                f"Return: {calculated_return:.4f}, Reward: {reward:.4f}"
-            )
-
-    # 최종 보상 집계 로그
-    total_hits = sum(hit_counts.values())
-    logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {total_hits}건)")
-
-    return returns_array, valid_samples_mask
+    return returns_array, valid_samples_mask, hit_counts
 
 def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePretrainDataset, Dict]:
     logger.info(f"🛠️  [{direction.upper()}] 가치 사전 학습 데이터 준비 시작")
@@ -218,7 +237,7 @@ def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePre
     df_eval = raw_features_df[eval_tf]
 
     # 3. 보상 및 유효 샘플 마스크 계산 (시퀀싱 전 인덱스 기준)
-    rewards_array, valid_samples_mask = calculate_horizon_returns(df_entry, df_eval, direction)
+    rewards_array, valid_samples_mask, _ = calculate_horizon_returns(df_entry, df_eval, direction)
 
     # 4. 보상과 마스크를 pandas Series로 변환하여, 최종 인덱스로 정렬 (핵심 수정)
     rewards_series = pd.Series(rewards_array, index=df_entry.index)
@@ -257,10 +276,7 @@ def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePre
 
 def run_value_pretraining_for(direction: str):
     """지정된 방향에 대해 가치망 사전 학습 실행"""
-    logger.info(f"""
-{'='*60}
-🎯 [{direction.upper()}] 가치망 사전 학습 시작
-{'='*60}""")
+    logger.info(f"\n{'='*60}\n🎯 [{direction.upper()}] 가치망 사전 학습 시작\n{'='*60}")
     
     # 1. 데이터 준비
     train_ds, val_ds, input_dims = create_pretrain_data(direction)
@@ -290,7 +306,6 @@ def run_value_pretraining_for(direction: str):
     # 가치망(value_head)의 파라미터만 학습 가능하도록 설정
     for name, param in model.value_head.named_parameters():
         param.requires_grad = True
-        logger.info(f"   - 학습 대상 파라미터 (가치망): {name}")
 
     # 5. 가치망 학습
     criterion = nn.MSELoss()
@@ -344,12 +359,8 @@ def run_value_pretraining_for(direction: str):
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             # 가치망의 state_dict만 저장
             torch.save(model.value_head.state_dict(), output_path)
-            logger.info(f"   ✅ 새로운 최저 검증 손실 달성. 가치망 저장: {output_path}")
 
-    logger.info(f"""
-{'='*60}
-✅ [{direction.upper()}] 가치망 사전 학습 완료
-{'='*60}""")
+    logger.info(f"\n{'='*60}\n✅ [{direction.upper()}] 가치망 사전 학습 완료\n{'='*60}")
 
 def main():
     for direction in ['long', 'short']:

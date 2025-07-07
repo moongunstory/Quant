@@ -229,7 +229,6 @@ def prepare_features(raw_data: Dict[str, pd.DataFrame], master_tf: str = "5min")
     - 가장 짧은 master_tf를 기준으로 모든 데이터를 ffill하여 정렬합니다.
     - 데이터 손실을 최소화하고, 실제 매매 환경과 동일한 데이터 시점을 보장합니다.
     """
-    logger.info(f"🛠️  Feature preparation started (v4 - Async Event-based). Master Timeframe: {master_tf}")
 
     # 1. 데이터 역할 정의
     LABEL_COLUMNS = ['label']

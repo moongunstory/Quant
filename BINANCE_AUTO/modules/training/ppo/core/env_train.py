@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 from typing import Dict
 # Import config values
-from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON, TIMEFRAMES
+from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON, TIMEFRAMES, PPO_CONFIG
 
 
 class PPOTradingEnv:
@@ -16,9 +16,7 @@ class PPOTradingEnv:
         direction: str = "long",
         seq_len: int = 32,
         reference_timeframe: str = "15min",
-        hold_reward: float = 0.001,
         include_all_scenarios: bool = True,
-        reward_scale: float = 10.0,
     ):
         """
         MTF PPO Trading Environment
@@ -36,15 +34,10 @@ class PPOTradingEnv:
         self.tp_ratio = TP_THRESHOLD
         self.sl_ratio = SL_THRESHOLD
         self.horizon = LABEL_HORIZON
-        self.hold_reward = hold_reward
         self.include_all = include_all_scenarios
-        self.reward_scale = reward_scale
         self._logged_direction = False
         self.step_count = 0
 
-        print(
-            f"[ENV INIT] direction='{self.direction}', ref_tf='{reference_timeframe}', hold_reward={hold_reward}"
-        )
         print(
             f"[ENV INIT] TP={self.tp_ratio}, SL={self.sl_ratio}, horizon={self.horizon}"
         )
@@ -65,6 +58,11 @@ class PPOTradingEnv:
             self.mtf_data = loaded["data"].item()  # Convert back to dict
         else:
             raise ValueError(f"Unsupported file format: {data_path}")
+
+        # 'dune' 데이터를 로드 단계에서부터 제외
+        if 'dune' in self.mtf_data:
+            del self.mtf_data['dune']
+            logger.info("🚫 'dune' timeframe data excluded from loading.")
 
         if not isinstance(self.mtf_data, dict):
             raise ValueError("Data must be a dictionary of timeframe DataFrames")
@@ -127,7 +125,7 @@ class PPOTradingEnv:
             tf_sequences = {}
             valid_sequence = True
 
-            for tf in TIMEFRAMES + ["btc", "dune"]:
+            for tf in TIMEFRAMES + ["btc"]:
                 if tf not in self.mtf_data or self.mtf_data[tf].empty:
                     continue
 
@@ -253,103 +251,91 @@ class PPOTradingEnv:
 
         horizon_limit = min(entry_idx + self.horizon, len(ref_df) - 1)
 
-        if horizon_limit > entry_idx and "5min" in self.mtf_data:
-            df_5m = self.mtf_data["5min"]
+        # 5min 데이터프레임 가져오기
+        df_5m = self.mtf_data["5min"]
+        high_col = low_col = None
+        for col in self.feature_cols.get("5min", []):
+            if "high" in col.lower():
+                high_col = col
+            elif "low" in col.lower():
+                low_col = col
+        if high_col is None or low_col is None:
+            raise ValueError("No 'high' or 'low' column found in 5min timeframe")
 
-            high_col = low_col = None
-            for col in self.feature_cols.get("5min", []):
-                if "high" in col.lower():
-                    high_col = col
-                elif "low" in col.lower():
-                    low_col = col
-            if high_col is None or low_col is None:
-                raise ValueError("No 'high' or 'low' column found in 5min timeframe")
+        entry_time = ref_df.index[entry_idx]
+        end_time = ref_df.index[horizon_limit]
 
-            entry_time = ref_df.index[entry_idx]
-            end_time = ref_df.index[horizon_limit]
+        future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
 
-            future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
-
-            if self.direction == "long":
-                tp_price = entry_price * (1 + self.tp_ratio)
-                sl_price = entry_price * (1 + self.sl_ratio)
-                tp_reached = future_5m[high_col] >= tp_price
-                sl_reached = future_5m[low_col] <= sl_price
-            else:
-                tp_price = entry_price * (1 + self.sl_ratio)
-                sl_price = entry_price * (1 + self.tp_ratio)
-                tp_reached = future_5m[low_col] <= tp_price
-                sl_reached = future_5m[high_col] >= sl_price
-
-            tp_first_idx = (
-                future_5m[tp_reached].index.min() if tp_reached.any() else pd.NaT
-            )
-            sl_first_idx = (
-                future_5m[sl_reached].index.min() if sl_reached.any() else pd.NaT
-            )
-
-            tp_hit = pd.notna(tp_first_idx)
-            sl_hit = pd.notna(sl_first_idx)
+        # TP/SL 가격 계산 (pretrain.py와 동일)
+        if self.direction == "long":
+            tp_price = entry_price * (1 + TP_THRESHOLD)
+            sl_price = entry_price * (1 - abs(SL_THRESHOLD))
         else:
-            tp_hit = False
-            sl_hit = False
+            tp_price = entry_price * (1 - TP_THRESHOLD)
+            sl_price = entry_price * (1 + abs(SL_THRESHOLD))
 
-        if action == 0:  # Hold
-            if sl_hit and not tp_hit:
-                reward = 0.1 * self.reward_scale
-            else:
-                reward = -0.01 * self.reward_scale
-        else:  # Trade
-            if tp_hit and sl_hit:
-                hit_tp = tp_first_idx < sl_first_idx
-            else:
-                hit_tp = tp_hit and not sl_hit
+        # TP/SL 도달 여부 판단 (pretrain.py와 동일)
+        if self.direction == "long":
+            tp_hit_times = future_5m.index[future_5m[high_col] >= tp_price]
+            sl_hit_times = future_5m.index[future_5m[low_col] <= sl_price]
+        else:
+            tp_hit_times = future_5m.index[future_5m[low_col] <= tp_price]
+            sl_hit_times = future_5m.index[future_5m[high_col] >= sl_price]
 
-            if hit_tp:
-                reward = 1.0 * self.reward_scale
-            elif sl_hit:
-                reward = -1.0 * self.reward_scale
-            else:
-                reward = -0.01 * self.reward_scale
+        tp_first_time = tp_hit_times.min() if not tp_hit_times.empty else pd.NaT
+        sl_first_time = sl_hit_times.min() if not sl_hit_times.empty else pd.NaT
 
-        # Reward Shaping: 가격 움직임 정보 추가
-        base_reward = reward
-        price_change = 0.0
-        shaped_reward = 0.0
-        if horizon_limit > entry_idx:
-            # 실제 가격 변화율 계산
-            final_price = ref_df.iloc[horizon_limit][close_col]
-            price_change = (final_price - entry_price) / entry_price
+        is_tp_hit = pd.notna(tp_first_time)
+        is_sl_hit = pd.notna(sl_first_time)
 
-            if self.direction == "long":
-                # Long의 경우 가격 상승이 좋음
-                shaped_reward = price_change * 0.5 * self.reward_scale
-            else:
-                # Short의 경우 가격 하락이 좋음
-                shaped_reward = -price_change * 0.5 * self.reward_scale
+        # 보상 계산 (pretrain.py와 동일)
+        REWARD_SCALE = PPO_CONFIG.get("reward_scale", 10.0) # config에서 가져오거나 기본값 사용
 
-            # Action에 따라 reward 조정
-            if action == 1:  # Trade
-                reward = base_reward + shaped_reward
-            else:  # Hold
-                reward = base_reward - abs(shaped_reward) * 0.1  # Hold시 기회비용
+        def get_no_hit_reward(ret: float, direction: str) -> float:
+            neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1)
+            tp_thresh = TP_THRESHOLD
+            sl_thresh = abs(SL_THRESHOLD)
 
-        if logger.isEnabledFor(logging.DEBUG):
-            should_log = (
-                shaped_reward >= 0.05
-                or shaped_reward <= -0.05
-                or base_reward == 0.5
-                or base_reward == -0.5
-                or (action == 1 and reward < 0)
-            )
-            if should_log and self.step_count % 500 == 0:
-                logger.debug(
-                    f"[REWARD] idx={self.step_count}, action={action}, "
-                    f"base={base_reward:.3f}, shaped={shaped_reward:.3f}, total={reward:.3f}"
-                )
-                logger.debug(
-                    f"→ TP={tp_hit}, SL={sl_hit}, price_change={price_change:.4f}"
-                )
+            positive_neutral_thresh = tp_thresh * neutral_band
+            negative_neutral_thresh = sl_thresh * neutral_band
+
+            if direction == "long":
+                if 0 <= ret < positive_neutral_thresh:
+                    return 0.0
+                if ret >= positive_neutral_thresh:
+                    return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
+                if ret < 0:
+                    return ret / sl_thresh
+            elif direction == "short":
+                if 0 <= ret < positive_neutral_thresh:
+                    return 0.0
+                if ret >= positive_neutral_thresh:
+                    return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
+                if ret < 0:
+                    return ret / sl_thresh
+            return 0.0
+
+        if future_5m.empty: # future_eval_data.empty와 동일
+            reward = 0.0 # No Hit (No Future Data)
+        elif is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
+            final_price = df_5m.loc[tp_first_time][close_col]
+            ret = (final_price - entry_price) / entry_price
+            reward = 10.0 * REWARD_SCALE # TP 보상 10배
+        elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
+            final_price = df_5m.loc[sl_first_time][close_col]
+            ret = (final_price - entry_price) / entry_price
+            reward = -1.0 * REWARD_SCALE # SL 보상
+        else:
+            final_price = future_5m.iloc[-1][close_col]
+            ret = (final_price - entry_price) / entry_price
+            reward = get_no_hit_reward(ret, self.direction) * REWARD_SCALE
+
+        # Action에 따른 보상 조정 (Trade 액션만 고려)
+        if action == 1: # Trade
+            pass # 위에서 계산된 reward를 그대로 사용
+        else: # Hold (action == 0)
+            reward = 0.0 # Hold 액션에 대한 보상은 0으로 설정 (또는 작은 음수 값)
 
         # Move to next state
         self.ptr += 1
