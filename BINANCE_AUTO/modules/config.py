@@ -8,9 +8,43 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
+# === Dune Analytics Query Parts ===
+DUNE_QUERY_PARTS = {
+    "onchain_raw_1": "5214958",
+    "onchain_raw_2": "5215003",
+    "onchain_raw_3": "5215021",
+    "onchain_raw_4": "5215040",
+    "onchain_raw_5": "5215054",
+    "onchain_raw_6": "5215063",
+    "onchain_raw_7": "5215077",
+    "onchain_raw_8": "5281243",
+    "onchain_raw_9": "5287851",
+    "onchain_raw_10": "5287867",
+    "onchain_raw_11": "5287868",
+    "onchain_raw_12": "5287869",
+    "onchain_raw_13": "5287870",
+    "onchain_raw_14": "5287871",
+    "onchain_raw_15": "5287872",
+    "onchain_raw_16": "5287873"
+}
+
 # === Time & Symbol Settings ===
 TZ = 'UTC'
-TIMEFRAMES = ["5min", "15min", "30min", "1H", "btc",] # "dune" < 일단 빼버림
+
+# 📊 ETH 메인 타임프레임들 (Binance interval 매핑 필요)
+ETH_TIMEFRAMES = ["1min", "5min", "15min", "1H"]
+
+# 🔧 보조 데이터 활성화 플래그
+ENABLE_BTC = True      # BTC 보조 데이터 수집 여부
+ENABLE_DUNE = False    # DUNE 온체인 데이터 수집 여부 (일단 비활성화)
+
+# 🔄 하위 호환성을 위한 통합 리스트 (기존 코드 호환용)
+TIMEFRAMES = ETH_TIMEFRAMES.copy()
+if ENABLE_BTC:
+    TIMEFRAMES.append("btc")
+if ENABLE_DUNE:
+    TIMEFRAMES.append("dune")
+
 AUX_TIMEFRAMES = "btc"
 TRADE_SYMBOL = "ETHUSDT"
 FUTURES_SYMBOL = "ETHUSDT"
@@ -25,32 +59,15 @@ END_DATE = "2025-05-24"
 # === Paths ===
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-RAW_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "market_raw_data.csv")
-
 TRAIN_PICKLE_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "data", "label", "train_long.pkl"),
-    "short": os.path.join(PROJECT_ROOT, "data", "label", "train_short.pkl"),
-}
-
-LGBM_MODEL_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "data", "models", "lgbm", "lgbm_long.pkl"),
-    "short": os.path.join(PROJECT_ROOT, "data", "models", "lgbm", "lgbm_short.pkl"),
-}
-
-PPO_IMITATION_MODEL_PATHS = {
-    "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "long_imitation.pt"),
-    "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "short_imitation.pt"),
+    "long": os.path.join(PROJECT_ROOT, "data", "processed", "train_long.pkl"),
+    "short": os.path.join(PROJECT_ROOT, "data", "processed", "train_short.pkl"),
 }
 
 VALUE_PRETRAIN_OUTPUT_PATH = {
     "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_long.pt"),
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_short.pt"),
 }
-
-# If True, PPO training loads policy weights from imitation models
-# and value weights from VALUE_PRETRAIN_OUTPUT_PATH.
-# If False, both heads are loaded from VALUE_PRETRAIN_OUTPUT_PATH.
-USE_POLICY_FROM_IMITATION = True
 
 PPO_FINAL_MODEL_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_long.pt"),
@@ -66,16 +83,6 @@ PPO_BUFFER_PATHS = {
 CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
 ONCHAIN_CACHE_DIR = os.path.join(CACHE_DIR, "onchain")
 
-# === Labeling Parameters ===
-TP_THRESHOLD = 0.01
-SL_THRESHOLD = -0.01
-LABEL_HORIZON = 8
-
-# === Thresholds ===
-LGBM_THRESHOLD = 0.5
-LONG_THRESHOLD = 0.685
-SHORT_THRESHOLD = 0.685
-
 # === PPO Hyperparameters ===
 PPO_CONFIG = {
     "seq_len": 32,
@@ -83,61 +90,70 @@ PPO_CONFIG = {
     "max_steps": 2048,
     "buffer_size": 2048,
     "learning_rate": 3e-5,
-    "epochs": 20,
+    "epochs": 10,
     "batch_size": 256,
     "entropy_coef": 0.02,
-    "value_coef": 0.05,
+    "value_coef": 1.0,
     "clip_eps": 0.2,
     "gamma": 0.99,
     "lambda": 0.95,
-    "action_dim": 2,
+    "action_dim": 1, # Continuous action for liquidation confidence (0.0 to 1.0)
+    "min_profit_target": 0.002, # 0.2% profit target for pre-training reward
+    "max_loss_tolerance": 0.001, # 0.1% loss tolerance for pre-training reward
     "neutral_band_ratio": 0.1,
-}
-
-# === Imitation Learning Config ===
-IMITATION_CONFIG = {
-    "epochs": 10,
-    "batch_size": 64,
-    "learning_rate": 1e-4,
-    "value_loss_coef": 0.2,
-    "early_stopping_patience": 5,
+    "reward_scaling_factor": 100.0,
 }
 
 # === Features Per Timeframe ===
 FEATURE_CATEGORIES_BY_TF = {
-    "15min": [
-        "rsi", "stochastic_k", "cci", "roc", "mom",
-        "macd", "macd_signal", "macd_histogram",
-        "ema_20", "ema_50", "sma_20", "sma_50",
-        "adx", "atr", "obv", "volume_ratio"
+    "1min": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
+        "sma_10", "sma_20", "ema_10", "ema_20", "adx", "plus_di", "minus_di",
+        "atr", "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
     ],
     "5min": [
-        "rsi", "stochastic_k", "macd", "macd_signal",
-        "rsi_mean_6", "rsi_std_6",
-        "macd_slope_6",
-        "stochk_range_6"
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
+        "sma_20", "sma_50", "ema_20", "ema_50", "adx", "plus_di", "minus_di",
+        "atr", "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
     ],
-    "30min": ["rsi", "macd", "ema_20", "adx"],
-    "1H": ["rsi", "ema_20", "sma_50", "adx"]
-}
-
-# === Dune Queries ===
-DUNE_QUERY_PARTS = {
-    'A': '5214958', 'B': '5215003', 'C': '5215021', 'D': '5215040',
-    'E': '5215054', 'F': '5215063', 'G': '5215077', 'H': '5281243',
-    'I': '5287851', 'J': '5287867', 'K': '5287868', 'L': '5287869',
-    'M': '5287870', 'N': '5287871', 'O': '5287872', 'P': '5287873'
+    "15min": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
+        "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
+    ],
+    "1H": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
+        "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
+    ],
+    "btc": [ # BTC는 별도 처리 (BINANCE_INTERVAL_MAP 불필요)
+        "btc_open", "btc_high", "btc_low", "btc_close", "btc_volume",
+        "btc_returns", "btc_high_low_range", "btc_open_close_range",
+        "btc_rsi", "btc_macd", "btc_macd_signal", "btc_macd_hist",
+        "btc_smoothed_ha_open", "btc_smoothed_ha_close", "btc_smoothed_ha_high", "btc_smoothed_ha_low"
+    ]
 }
 
 # === Real-time Requirements ===
 REQUIRED_CANDLE_COUNTS = {
-    "5min": 50,
+    "1min": 70,
+    "5min": 70,
     "15min": 70,
-    "30min": 70,
     "1H": 70
 }
 
+# 📈 ETH 타임프레임만을 위한 Binance interval 매핑
 BINANCE_INTERVAL_MAP = {
     "1min": "1m", "3min": "3m", "5min": "5m", "15min": "15m", "30min": "30m",
     "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"
+    # 주의: "btc", "dune"는 별도 처리되므로 여기에 포함하지 않음
 }
+
+# === BTC 설정 ===
+BTC_INTERVAL = "1h"  # BTC 데이터 수집용 고정 인터벌

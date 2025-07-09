@@ -63,21 +63,33 @@ def compute_ppo_loss(new_log_probs, old_log_probs, advantages, clip_eps=0.2):
     return policy_loss
 
 
-def compute_value_loss(values, returns, normalize=True):
+def compute_value_loss(values, returns, normalize=True, class_weights=None):
     """
-    가치 함수 손실 계산 - MSE 사용으로 변경
+    가치 함수 손실 계산 - 분류 문제로 전환 (CrossEntropyLoss 사용)
     
     Args:
-        values: 모델이 예측한 가치값
-        returns: 목표 리턴값 (이미 정규화됨)
-        normalize: 정규화 여부 (현재는 사용하지 않음, 리턴이 이미 정규화되어 전달됨)
+        values: 모델이 예측한 가치값 (logits)
+        returns: 목표 리턴값 (연속값)
+        normalize: 정규화 여부 (현재는 사용하지 않음)
     
     Returns:
-        MSE 손실값
+        CrossEntropy 손실값
     """
-    # 🔥 핵심 수정: smooth_l1_loss → mse_loss 변경
-    # 정규화된 리턴과 가치 예측값 간의 MSE 계산
-    return F.mse_loss(values, returns)
+    # 리턴값을 분류 라벨로 변환
+    # 예: ±1.0 구간 기준으로 라벨링
+    # reward >= 0.5 -> label = 2 (강력히 좋은 상태)
+    # reward <= -0.5 -> label = 0 (강력히 나쁜 상태)
+    # else -> label = 1 (중립 or 애매)
+    
+    # Ensure returns is on the same device as values
+    returns = returns.to(values.device)
+
+    target_labels = torch.ones_like(returns, dtype=torch.long) # Default to neutral (1)
+    target_labels[returns >= 0.5] = 2
+    target_labels[returns <= -0.5] = 0
+
+    # CrossEntropyLoss는 logits를 입력으로 받음
+    return F.cross_entropy(values, target_labels, weight=class_weights)
     
 
 def compute_explained_variance(predicted, actual):

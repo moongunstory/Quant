@@ -1,12 +1,13 @@
 import numpy as np
 import pandas as pd
 import logging
+import random
 
 logger = logging.getLogger(__name__)
 
 from typing import Dict
 # Import config values
-from modules.config import TP_THRESHOLD, SL_THRESHOLD, LABEL_HORIZON, TIMEFRAMES, PPO_CONFIG
+from modules.config import PPO_CONFIG, TIMEFRAMES
 
 
 class PPOTradingEnv:
@@ -15,31 +16,42 @@ class PPOTradingEnv:
         data_path: str,
         direction: str = "long",
         seq_len: int = 32,
-        reference_timeframe: str = "15min",
-        include_all_scenarios: bool = True,
+        reference_timeframe: str = "1min", # 1분봉 기준으로 변경
+        liquidation_threshold: float = 0.5, # 청산 확신도 임계치
+        max_episode_steps: int = 120, # 한 에피소드의 최대 길이 (분 단위)
     ):
         """
-        MTF PPO Trading Environment
+        MTF PPO Trading Environment for Position Management
 
         Args:
-            data_path: Path to MTF data (Dict[str, pd.DataFrame] pickle or npz file)
-            direction: "long" or "short"
+            data_path: Path to MTF data (Dict[str, pd.DataFrame] pickle file)
+            direction: "long" or "short" - the type of position this environment manages
             seq_len: Sequence length for each timeframe
-            reference_timeframe: Timeframe used for reward calculation and entry signals
-            hold_reward: Reward when neither TP nor SL is hit
+            reference_timeframe: Timeframe used for current price and indexing
+            liquidation_threshold: Confidence level above which to liquidate
+            max_episode_steps: Maximum number of steps (minutes) in an episode
         """
         self.direction = direction.lower()
+        if self.direction not in ['long', 'short']:
+            raise ValueError("Direction must be 'long' or 'short'.")
+
         self.seq_len = seq_len
         self.reference_timeframe = reference_timeframe
-        self.tp_ratio = TP_THRESHOLD
-        self.sl_ratio = SL_THRESHOLD
-        self.horizon = LABEL_HORIZON
-        self.include_all = include_all_scenarios
-        self._logged_direction = False
-        self.step_count = 0
+        self.liquidation_threshold = liquidation_threshold
+        self.max_episode_steps = max_episode_steps
 
-        print(
-            f"[ENV INIT] TP={self.tp_ratio}, SL={self.sl_ratio}, horizon={self.horizon}"
+        # Position tracking variables
+        self.current_position_type = self.direction  # Agent always starts in a position of its type
+        self.position_entry_price = None
+        self.time_in_position = 0
+        self.unrealized_pnl = 0.0
+        self.current_idx = 0 # Current index within the reference dataframe
+        self.start_idx = 0 # Starting index of the current episode
+
+        logger.info(
+            f"""[ENV INIT] Direction={self.direction.upper()}, SeqLen={self.seq_len}, "
+            f"RefTF={self.reference_timeframe}, LiqThresh={self.liquidation_threshold}, "
+            f"MaxSteps={self.max_episode_steps}"""
         )
 
         self._load_mtf_data(data_path)
@@ -47,19 +59,15 @@ class PPOTradingEnv:
         self.reset()
 
     def _load_mtf_data(self, data_path: str):
-        """Load MTF data from pickle or npz file"""
-        from modules.training.ppo.reinforce.train_ppo import load_cached_pickle  # 필요시 위치 조정
+        """Load MTF data from pickle file"""
+        from modules.training.ppo.reinforce.train_ppo import load_cached_pickle  # Assuming this is correct path
 
         if data_path.endswith(".pkl"):
             self.mtf_data = load_cached_pickle(data_path)
-
-        elif data_path.endswith(".npz"):
-            loaded = np.load(data_path, allow_pickle=True)
-            self.mtf_data = loaded["data"].item()  # Convert back to dict
         else:
             raise ValueError(f"Unsupported file format: {data_path}")
 
-        # 'dune' 데이터를 로드 단계에서부터 제외
+        # 'dune' 데이터를 로드 단계에서부터 제외 (if it exists)
         if 'dune' in self.mtf_data:
             del self.mtf_data['dune']
             logger.info("🚫 'dune' timeframe data excluded from loading.")
@@ -67,7 +75,7 @@ class PPOTradingEnv:
         if not isinstance(self.mtf_data, dict):
             raise ValueError("Data must be a dictionary of timeframe DataFrames")
 
-        print(f"[DATA LOAD] Available timeframes: {list(self.mtf_data.keys())}")
+        logger.info(f"[DATA LOAD] Available timeframes: {list(self.mtf_data.keys())}")
 
         # Validate reference timeframe exists
         if self.reference_timeframe not in self.mtf_data:
@@ -76,146 +84,136 @@ class PPOTradingEnv:
             )
 
     def _prepare_data(self):
-        """Prepare MTF sequences and find valid entry points"""
-        # Use reference dataframe
-        ref_df = self.mtf_data[self.reference_timeframe]
-
-        if "label" not in ref_df.columns:
-            raise ValueError(
-                f"Reference timeframe '{self.reference_timeframe}' must have 'label' column"
-            )
-
-        if self.include_all:
-            self.valid_indices = list(range(len(ref_df)))
-        else:
-            self.valid_indices = np.where(ref_df["label"] == 1)[0].tolist()
-
-        # Prepare sequences for each timeframe
-        self.sequences = {}
-        self.entry_indices = []
-
-        # Get feature columns for each timeframe (exclude timestamp, label)
+        """Prepare data for episode selection and feature extraction"""
+        self.ref_df = self.mtf_data[self.reference_timeframe]
+        
+        # Get feature columns for each timeframe (exclude timestamp, label if present)
         self.feature_cols = {}
         for tf, df in self.mtf_data.items():
-            if tf in ["btc", "dune"]:
-                # External features - keep all columns except timestamp
-                self.feature_cols[tf] = [
-                    col for col in df.columns if col not in ["timestamp"]
-                ]
+            if tf in ["btc"]:
+                self.feature_cols[tf] = [col for col in df.columns if col not in ["timestamp"]]
             else:
-                # Regular timeframes - exclude timestamp and label
-                self.feature_cols[tf] = [
-                    col for col in df.columns if col not in ["timestamp", "label"]
-                ]
+                self.feature_cols[tf] = [col for col in df.columns if col not in ["timestamp", "label"]]
 
-        # Fill NaN values for all timeframes
+        # Ensure all dataframes are float32 and fill NaNs (should be handled by collector, but for safety)
         for tf, df in self.mtf_data.items():
-            feature_cols = self.feature_cols[tf]
-            self.mtf_data[tf][feature_cols] = df[feature_cols].fillna(0.0)
+            self.mtf_data[tf] = df.astype(np.float32).fillna(0.0)
 
-        # Create aligned sequences for each timeframe
-        valid_sequences = []
+        # Determine valid starting indices for episodes
+        # An episode can start at any point where there's enough historical data (seq_len)
+        # and enough future data for at least one step + max_episode_steps
+        min_start_idx = self.seq_len - 1
+        max_start_idx = len(self.ref_df) - self.max_episode_steps - 1 # Ensure enough future data for max episode length
+        
+        self.possible_start_indices = list(range(min_start_idx, max_start_idx))
+        
+        if not self.possible_start_indices:
+            raise ValueError("Not enough data to form valid episodes. Check data length and seq_len/max_episode_steps.")
 
-        for idx in self.valid_indices:
-            # Check if we can create a full sequence for reference timeframe
-            if idx < self.seq_len - 1:
-                continue
-
-            # Extract sequences for each timeframe
-            tf_sequences = {}
-            valid_sequence = True
-
-            for tf in TIMEFRAMES + ["btc"]:
-                if tf not in self.mtf_data or self.mtf_data[tf].empty:
-                    continue
-
-                df = self.mtf_data[tf]
-                feature_cols = self.feature_cols[tf]
-
-                # For external features (btc, dune), use single latest value
-                if tf in ["btc", "dune"]:
-                    # Find the latest available data point up to the entry index
-                    available_data = df.iloc[: idx + 1]
-                    if not available_data.empty:
-                        tf_sequences[tf] = available_data[feature_cols].iloc[-1].values
-                    else:
-                        valid_sequence = False
-                        break
-                else:
-                    # For regular timeframes, create sequence
-                    if len(df) > idx:
-                        seq_data = df.iloc[max(0, idx - self.seq_len + 1) : idx + 1]
-                        if len(seq_data) == self.seq_len:
-                            tf_sequences[tf] = seq_data[feature_cols].values
-                        else:
-                            valid_sequence = False
-                            break
-                    else:
-                        valid_sequence = False
-                        break
-
-            if valid_sequence and len(tf_sequences) > 0:
-                valid_sequences.append(tf_sequences)
-                self.entry_indices.append(idx)
-
-        # Convert to arrays and store
-        if valid_sequences:
-            # Initialize sequences dict
-            for tf in valid_sequences[0].keys():
-                self.sequences[tf] = []
-
-            # Collect all sequences
-            for seq_dict in valid_sequences:
-                for tf, seq in seq_dict.items():
-                    self.sequences[tf].append(seq)
-
-            # Convert to numpy arrays
-            for tf in self.sequences:
-                self.sequences[tf] = np.array(self.sequences[tf])
-        else:
-            self.sequences = {}
-
-        self.entry_indices = np.array(self.entry_indices)
-
-        print(f"[DATA PREP] Found {len(self.entry_indices)} valid sequences")
-        for tf, seq in self.sequences.items():
-            print(f"[DATA PREP] {tf}: {seq.shape}")
+        logger.info(f"[DATA PREP] Found {len(self.possible_start_indices)} possible episode start indices.")
 
     def reset(self):
-        """Reset environment to initial state"""
-        # Shuffle order of entry indices and sequences each reset to
-        # expose the agent to diverse scenarios across epochs
-        if len(self.entry_indices) > 0:
-            perm = np.random.permutation(len(self.entry_indices))
-            self.entry_indices = self.entry_indices[perm]
-            for tf in self.sequences:
-                self.sequences[tf] = self.sequences[tf][perm]
-
-        self.ptr = 0
-        self.step_count = 0
+        """Reset environment to a new random episode"""
         self.done = False
+        self.time_in_position = 0
+        self.unrealized_pnl = 0.0
+
+        # Randomly select a starting index for the episode
+        self.start_idx = random.choice(self.possible_start_indices)
+        self.current_idx = self.start_idx
+
+        # Set initial position entry price
+        self.position_entry_price = self.ref_df.iloc[self.current_idx][self._get_close_col_name()]
+        
+        logger.debug(f"[ENV RESET] New episode starting at index {self.start_idx} (Time: {self.ref_df.index[self.start_idx]}) with entry price {self.position_entry_price:.4f}")
+
         return self._get_state()
 
-    def _get_state(self) -> Dict[str, np.ndarray]:
-        """Get current state as dictionary of timeframe sequences"""
-        if self.ptr >= len(self.entry_indices):
-            # Return empty state if no more data
-            return {tf: np.zeros_like(seq[0]) for tf, seq in self.sequences.items()}
+    def _get_close_col_name(self):
+        for col in self.feature_cols[self.reference_timeframe]:
+            if "close" in col.lower():
+                return col
+        raise ValueError(f"No 'close' column found in reference timeframe '{self.reference_timeframe}'")
 
+    def _get_high_col_name(self):
+        for col in self.feature_cols[self.reference_timeframe]:
+            if "high" in col.lower():
+                return col
+        raise ValueError(f"No 'high' column found in reference timeframe '{self.reference_timeframe}'")
+
+    def _get_low_col_name(self):
+        for col in self.feature_cols[self.reference_timeframe]:
+            if "low" in col.lower():
+                return col
+        raise ValueError(f"No 'low' column found in reference timeframe '{self.reference_timeframe}'")
+
+    def _get_state(self) -> Dict[str, np.ndarray]:
+        """Get current state as dictionary of timeframe sequences and position info"""
         state = {}
-        for tf, sequences in self.sequences.items():
-            state[tf] = sequences[self.ptr]
+        # Extract features for each timeframe dynamically
+        for tf in TIMEFRAMES + ["btc"]:
+            if tf not in self.mtf_data or self.mtf_data[tf].empty:
+                # Handle missing or empty timeframes by providing zero-filled data
+                dim = PPO_CONFIG["input_dims"].get(tf, 0) # Assuming PPO_CONFIG has input_dims now
+                if dim == 0: # Fallback if input_dims not in config
+                    if tf in ["btc"]:
+                        dim = 5 # Example default for btc (OHLCV)
+                    else:
+                        dim = 26 # Example default for 1min (OHLCV + indicators)
+
+                if tf in ["btc"]:
+                    state[tf] = np.zeros(dim, dtype=np.float32)
+                else:
+                    state[tf] = np.zeros((self.seq_len, dim), dtype=np.float32)
+                continue
+
+            df = self.mtf_data[tf]
+            feature_cols = self.feature_cols[tf]
+
+            if tf in ["btc"]:
+                # For external features (btc), use single latest value
+                # Find the latest available data point up to the current_idx
+                # Use get_indexer with 'ffill' to find the closest previous index
+                pos = df.index.get_indexer([self.ref_df.index[self.current_idx]], method='ffill')[0]
+                if pos != -1:
+                    state[tf] = df.iloc[pos][feature_cols].values
+                else:
+                    state[tf] = np.zeros(len(feature_cols), dtype=np.float32)
+            else:
+                # For regular timeframes, create sequence
+                start_loc = max(0, self.current_idx - self.seq_len + 1)
+                seq_data = df.iloc[start_loc : self.current_idx + 1][feature_cols].values
+                
+                # Pad if sequence is too short (shouldn't happen with proper possible_start_indices)
+                if len(seq_data) < self.seq_len:
+                    padding = np.zeros((self.seq_len - len(seq_data), len(feature_cols)), dtype=np.float32)
+                    seq_data = np.vstack([padding, seq_data])
+                state[tf] = seq_data
+
+        # Add position-related features to the state
+        current_price = self.ref_df.iloc[self.current_idx][self._get_close_col_name()]
+        if self.current_position_type == 'long':
+            self.unrealized_pnl = (current_price - self.position_entry_price) / self.position_entry_price
+        elif self.current_position_type == 'short':
+            self.unrealized_pnl = (self.position_entry_price - current_price) / self.position_entry_price
+        
+        position_info = np.array([
+            1.0 if self.current_position_type == 'long' else 0.0, # Is Long
+            1.0 if self.current_position_type == 'short' else 0.0, # Is Short
+            self.position_entry_price, # Entry Price
+            self.time_in_position, # Time in Position
+            self.unrealized_pnl # Unrealized PnL
+        ], dtype=np.float32)
+        state['position_info'] = position_info
+
         return state
 
-    def step(self, action):
+    def step(self, action_confidence: float):
         """
-        Take a step in the environment.
-
-        Reward calculation mirrors the labeling logic by checking
-        5-minute high/low prices over ``LABEL_HORIZON`` for TP/SL hits.
+        Take a step in the environment based on liquidation confidence.
 
         Args:
-            action: 0 (Hold), 1 (Trade)
+            action_confidence: float (0.0 to 1.0) - Model's confidence to liquidate
 
         Returns:
             state: Dict[str, np.ndarray] - Next state
@@ -223,148 +221,74 @@ class PPOTradingEnv:
             done: bool - Whether episode is finished
             info: dict - Additional information
         """
-        done = False
         reward = 0.0
         info = {}
+        self.done = False
 
-        if self.ptr >= len(self.entry_indices):
-            return self._get_state(), 0.0, True, info
+        # Get current price for reward calculation
+        prev_price = self.ref_df.iloc[self.current_idx][self._get_close_col_name()]
+        
+        # Increment index for next state calculation
+        self.current_idx += 1
+        self.time_in_position += 1
 
-        entry_idx = self.entry_indices[self.ptr]
+        # Check if episode ends due to max steps or end of data
+        if self.time_in_position >= self.max_episode_steps or self.current_idx >= len(self.ref_df):
+            # Force liquidation at end of episode
+            current_price = self.ref_df.iloc[self.current_idx - 1][self._get_close_col_name()] # Use last valid price
+            if self.current_position_type == 'long':
+                reward = (current_price - self.position_entry_price) / self.position_entry_price
+            else: # short
+                reward = (self.position_entry_price - current_price) / self.position_entry_price
+            self.done = True
+            logger.debug(f"[ENV STEP] Episode ended (Max steps or End of data). Final PnL: {reward:.4f}")
 
-        # Use reference timeframe for reward calculation
-        ref_df = self.mtf_data[self.reference_timeframe]
+        # Agent's decision based on confidence
+        elif action_confidence >= self.liquidation_threshold:
+            # Agent decides to liquidate
+            current_price = self.ref_df.iloc[self.current_idx - 1][self._get_close_col_name()] # Use last valid price
+            if self.current_position_type == 'long':
+                reward = (current_price - self.position_entry_price) / self.position_entry_price
+            else: # short
+                reward = (self.position_entry_price - current_price) / self.position_entry_price
+            self.done = True
+            logger.debug(f"[ENV STEP] Agent liquidated. Confidence: {action_confidence:.2f}, Final PnL: {reward:.4f}")
 
-        # Find close price column in reference timeframe
-        close_col = None
-        for col in self.feature_cols[self.reference_timeframe]:
-            if "close" in col.lower():
-                close_col = col
-                break
-
-        if close_col is None:
-            raise ValueError(
-                f"No 'close' column found in reference timeframe '{self.reference_timeframe}'"
-            )
-
-        entry_price = ref_df.iloc[entry_idx][close_col]
-
-        horizon_limit = min(entry_idx + self.horizon, len(ref_df) - 1)
-
-        # 5min 데이터프레임 가져오기
-        df_5m = self.mtf_data["5min"]
-        high_col = low_col = None
-        for col in self.feature_cols.get("5min", []):
-            if "high" in col.lower():
-                high_col = col
-            elif "low" in col.lower():
-                low_col = col
-        if high_col is None or low_col is None:
-            raise ValueError("No 'high' or 'low' column found in 5min timeframe")
-
-        entry_time = ref_df.index[entry_idx]
-        end_time = ref_df.index[horizon_limit]
-
-        future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
-
-        # TP/SL 가격 계산 (pretrain.py와 동일)
-        if self.direction == "long":
-            tp_price = entry_price * (1 + TP_THRESHOLD)
-            sl_price = entry_price * (1 - abs(SL_THRESHOLD))
-        else:
-            tp_price = entry_price * (1 - TP_THRESHOLD)
-            sl_price = entry_price * (1 + abs(SL_THRESHOLD))
-
-        # TP/SL 도달 여부 판단 (pretrain.py와 동일)
-        if self.direction == "long":
-            tp_hit_times = future_5m.index[future_5m[high_col] >= tp_price]
-            sl_hit_times = future_5m.index[future_5m[low_col] <= sl_price]
-        else:
-            tp_hit_times = future_5m.index[future_5m[low_col] <= tp_price]
-            sl_hit_times = future_5m.index[future_5m[high_col] >= sl_price]
-
-        tp_first_time = tp_hit_times.min() if not tp_hit_times.empty else pd.NaT
-        sl_first_time = sl_hit_times.min() if not sl_hit_times.empty else pd.NaT
-
-        is_tp_hit = pd.notna(tp_first_time)
-        is_sl_hit = pd.notna(sl_first_time)
-
-        # 보상 계산 (pretrain.py와 동일)
-        REWARD_SCALE = PPO_CONFIG.get("reward_scale", 10.0) # config에서 가져오거나 기본값 사용
-
-        def get_no_hit_reward(ret: float, direction: str) -> float:
-            neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1)
-            tp_thresh = TP_THRESHOLD
-            sl_thresh = abs(SL_THRESHOLD)
-
-            positive_neutral_thresh = tp_thresh * neutral_band
-            negative_neutral_thresh = sl_thresh * neutral_band
-
-            if direction == "long":
-                if 0 <= ret < positive_neutral_thresh:
-                    return 0.0
-                if ret >= positive_neutral_thresh:
-                    return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-                if ret < 0:
-                    return ret / sl_thresh
-            elif direction == "short":
-                if 0 <= ret < positive_neutral_thresh:
-                    return 0.0
-                if ret >= positive_neutral_thresh:
-                    return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-                if ret < 0:
-                    return ret / sl_thresh
-            return 0.0
-
-        if future_5m.empty: # future_eval_data.empty와 동일
-            reward = 0.0 # No Hit (No Future Data)
-        elif is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
-            final_price = df_5m.loc[tp_first_time][close_col]
-            ret = (final_price - entry_price) / entry_price
-            reward = 10.0 * REWARD_SCALE # TP 보상 10배
-        elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
-            final_price = df_5m.loc[sl_first_time][close_col]
-            ret = (final_price - entry_price) / entry_price
-            reward = -1.0 * REWARD_SCALE # SL 보상
-        else:
-            final_price = future_5m.iloc[-1][close_col]
-            ret = (final_price - entry_price) / entry_price
-            reward = get_no_hit_reward(ret, self.direction) * REWARD_SCALE
-
-        # Action에 따른 보상 조정 (Trade 액션만 고려)
-        if action == 1: # Trade
-            pass # 위에서 계산된 reward를 그대로 사용
-        else: # Hold (action == 0)
-            reward = 0.0 # Hold 액션에 대한 보상은 0으로 설정 (또는 작은 음수 값)
-
-        # Move to next state
-        self.ptr += 1
-        self.step_count += 1
-        if self.ptr >= len(self.entry_indices) - 1:
-            done = True
+        else: # Agent decides to HOLD
+            # Reward for holding: PnL for this single step
+            current_price = self.ref_df.iloc[self.current_idx - 1][self._get_close_col_name()] # Use last valid price
+            if self.current_position_type == 'long':
+                reward = (current_price - prev_price) / prev_price # Per-step PnL
+            else: # short
+                reward = (prev_price - current_price) / prev_price # Per-step PnL
             
-        return self._get_state(), reward, done, info
+            # Small time penalty to encourage timely exits, not just holding forever
+            reward -= 0.00001 # Very small penalty
+            logger.debug(f"[ENV STEP] Agent held. Confidence: {action_confidence:.2f}, Step PnL: {reward:.4f}")
+
+        return self._get_state(), float(reward), self.done, info
 
     def get_action_space_size(self):
-        """Get size of action space"""
-        return 2  # Hold, Trade
+        """Get size of action space (continuous output for confidence)"""
+        return 1  # Single continuous output for liquidation confidence
 
     def get_observation_space(self):
         """Get observation space information"""
         obs_space = {}
-        for tf, sequences in self.sequences.items():
-            if len(sequences) > 0:
-                obs_space[tf] = sequences[0].shape
-        return obs_space
+        # This will be dynamically determined by the first state returned by reset()
+        # For now, return a placeholder or rely on PPOPolicyNetwork to infer
+        return obs_space # PPOPolicyNetwork will infer from first observation
 
     def get_input_dims(self) -> Dict[str, int]:
         """각 타임프레임별 입력 feature 수 반환"""
         input_dims = {}
-        for tf, data in self.sequences.items():
-            if data.ndim == 3:  # (num_seq, seq_len, feature_dim)
-                input_dims[tf] = data.shape[2]
-            elif (
-                data.ndim == 2
-            ):  # (num_seq, feature_dim) for external features like btc/dune
-                input_dims[tf] = data.shape[1]
+        for tf, df in self.mtf_data.items():
+            feature_cols = self.feature_cols[tf]
+            if tf in ["btc"]:
+                input_dims[tf] = len(feature_cols)
+            else:
+                input_dims[tf] = len(feature_cols)
+        # Add position_info_dim manually as it's not from mtf_data
+        # Assuming position_info has 5 features: is_long, is_short, entry_price, time_in_position, unrealized_pnl
+        input_dims['position_info'] = 5
         return input_dims

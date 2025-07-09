@@ -47,9 +47,9 @@ def train_ppo_live(
 
     # Initialize model with appropriate input configuration
     if input_dims is not None:
-        model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"]).to(device)
+        model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"], num_value_classes=3).to(device)
     else:
-        model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=PPO_CONFIG["hidden_dim"]).to(device)
+        model = PPOPolicyNetwork(timeframe_dims={"single": input_dim}, hidden_dim=PPO_CONFIG["hidden_dim"], num_value_classes=3).to(device)
     
     model.load_model(imitation_model_path, allow_partial=True)
     logger.info("📦 모방 학습 모델 로드 완료")

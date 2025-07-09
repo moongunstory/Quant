@@ -24,6 +24,12 @@ class LivePPOEnv:
         self.seq_len = seq_len
         self.reference_timeframe = reference_timeframe
         self.current_step = 0
+
+        # Position tracking variables
+        self.current_position_type = 'none'  # 'long', 'short', 'none'
+        self.position_entry_price = None
+        self.time_in_position = 0
+        self.unrealized_pnl = 0.0
         
         # Validate reference timeframe exists
         if reference_timeframe not in mtf_data:
@@ -55,6 +61,11 @@ class LivePPOEnv:
     def reset(self):
         """Reset environment to initial state"""
         self.current_step = 0
+        # Reset position tracking variables
+        self.current_position_type = 'none'
+        self.position_entry_price = None
+        self.time_in_position = 0
+        self.unrealized_pnl = 0.0
         return self._get_observation()
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
@@ -82,15 +93,25 @@ class LivePPOEnv:
                 obs_values = obs_df.values
             
             observations[tf_name] = obs_values.astype(np.float32)
+
+        # Add position-related features to the observations
+        position_info = np.array([
+            1.0 if self.current_position_type == 'long' else 0.0,
+            1.0 if self.current_position_type == 'short' else 0.0,
+            self.position_entry_price if self.position_entry_price is not None else 0.0,
+            self.time_in_position,
+            self.unrealized_pnl
+        ], dtype=np.float32)
+        observations['position_info'] = position_info
         
         return observations
 
-    def step(self, action: str):
+    def step(self, action: int):
         """
-        Take a step in the environment
+        Take a step in the environment.
         
         Args:
-            action: "long", "short", or "hold"
+            action: 0: ATTEMPT_LONG, 1: ATTEMPT_SHORT, 2: CLOSE_POSITION, 3: NO_ACTION
             
         Returns:
             observation: Dict[str, np.ndarray] - Next observation
@@ -98,58 +119,75 @@ class LivePPOEnv:
             done: bool - Whether episode is finished
             info: dict - Additional information
         """
-        start_idx = self.current_step + 1
-        end_idx = start_idx + LABEL_HORIZON
-        
-        # Use reference timeframe for reward calculation
-        ref_df = self.mtf_data[self.reference_timeframe]
-        
-        if end_idx >= len(ref_df):
-            return self._get_observation(), 0, True, {}
-
-        # Get entry price from reference timeframe
-        entry_price = ref_df[self.price_cols['close']].iloc[self.current_step]
-        
-        # Get future data from reference timeframe
-        future = ref_df.iloc[start_idx:end_idx]
-        highs = future[self.price_cols['high']].values
-        lows = future[self.price_cols['low']].values
-
-        tp_hit = False
-        sl_hit = False
-        reward = 0
+        reward = 0.0
         done = False
+        info = {}
 
-        if action == 'long':
-            for i, (h, l) in enumerate(zip(highs, lows)):
-                if (h - entry_price) / entry_price >= TP_THRESHOLD:
-                    tp_hit = True
-                    break
-                if (l - entry_price) / entry_price <= SL_THRESHOLD:
-                    sl_hit = True
-                    break
+        # Get current price from reference timeframe
+        ref_df = self.mtf_data[self.reference_timeframe]
+        current_price = ref_df[self.price_cols['close']].iloc[self.current_step]
+
+        # Update time in position and unrealized PnL if holding a position
+        if self.current_position_type != 'none':
+            self.time_in_position += 1
+            if self.current_position_type == 'long':
+                self.unrealized_pnl = (current_price - self.position_entry_price) / self.position_entry_price
+            elif self.current_position_type == 'short':
+                self.unrealized_pnl = (self.position_entry_price - current_price) / self.position_entry_price
             
-            reward = 1 if tp_hit else -1 if sl_hit else 0
-            done = tp_hit or sl_hit or (i == LABEL_HORIZON - 1)
+            # Small penalty for holding position to encourage timely exits
+            reward -= 0.001 # Small holding penalty
 
-        elif action == 'short':
-            for i, (l, h) in enumerate(zip(lows, highs)):
-                if (entry_price - l) / entry_price >= TP_THRESHOLD:
-                    tp_hit = True
-                    break
-                if (entry_price - h) / entry_price <= SL_THRESHOLD:
-                    sl_hit = True
-                    break
+        # Action interpretation and position management
+        if action == 0: # ATTEMPT_LONG
+            if self.current_position_type == 'none':
+                self.current_position_type = 'long'
+                self.position_entry_price = current_price
+                self.time_in_position = 0
+                self.unrealized_pnl = 0.0
+            elif self.current_position_type == 'short':
+                # Close short position first, then attempt long
+                # Reward for closing short position
+                reward += (self.position_entry_price - current_price) / self.position_entry_price # Realized PnL from short
+                self.current_position_type = 'long'
+                self.position_entry_price = current_price
+                self.time_in_position = 0
+                self.unrealized_pnl = 0.0
+            # If already long, just continue holding (no change in position state, time_in_position updated above)
             
-            reward = 1 if tp_hit else -1 if sl_hit else 0
-            done = tp_hit or sl_hit or (i == LABEL_HORIZON - 1)
-
-        elif action == 'hold':
-            reward = 0  # HOLD는 중립적 행동으로 보상 없음
-            done = True  # HOLD는 즉시 종료
-
-        else:
-            raise ValueError(f"Unknown action: {action}")
+        elif action == 1: # ATTEMPT_SHORT
+            if self.current_position_type == 'none':
+                self.current_position_type = 'short'
+                self.position_entry_price = current_price
+                self.time_in_position = 0
+                self.unrealized_pnl = 0.0
+            elif self.current_position_type == 'long':
+                # Close long position first, then attempt short
+                # Reward for closing long position
+                reward += (current_price - self.position_entry_price) / self.position_entry_price # Realized PnL from long
+                self.current_position_type = 'short'
+                self.position_entry_price = current_price
+                self.time_in_position = 0
+                self.unrealized_pnl = 0.0
+            # If already short, just continue holding
+            
+        elif action == 2: # CLOSE_POSITION
+            if self.current_position_type == 'long':
+                reward += (current_price - self.position_entry_price) / self.position_entry_price # Realized PnL from long
+            elif self.current_position_type == 'short':
+                reward += (self.position_entry_price - current_price) / self.position_entry_price # Realized PnL from short
+            
+            self.current_position_type = 'none'
+            self.position_entry_price = None
+            self.time_in_position = 0
+            self.unrealized_pnl = 0.0
+            
+        elif action == 3: # NO_ACTION
+            # If no position, remain none. If holding, continue holding (time_in_position updated above)
+            pass # No explicit position change, just pass to next step
+        
+        # Ensure reward is not None
+        reward = float(reward)
 
         # Move to next step
         self.current_step += 1
@@ -160,10 +198,11 @@ class LivePPOEnv:
 
         obs = self._get_observation()
         info = {
-            'tp_hit': tp_hit,
-            'sl_hit': sl_hit,
-            'entry_price': entry_price,
-            'reference_timeframe': self.reference_timeframe
+            'current_position_type': self.current_position_type,
+            'position_entry_price': self.position_entry_price,
+            'time_in_position': self.time_in_position,
+            'unrealized_pnl': self.unrealized_pnl,
+            'current_price': current_price
         }
         
         return obs, reward, done, info
@@ -177,4 +216,4 @@ class LivePPOEnv:
     
     def get_action_space_size(self):
         """Get size of action space"""
-        return 3  # long, short, hold
+        return 4  # 0: ATTEMPT_LONG, 1: ATTEMPT_SHORT, 2: CLOSE_POSITION, 3: NO_ACTION

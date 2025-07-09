@@ -6,9 +6,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from typing import Dict, Tuple
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.preprocessing import StandardScaler
 
 # 프로젝트 루트 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,260 +20,214 @@ sys.path.append(os.path.join(PROJECT_ROOT, "BINANCE_AUTO"))
 # 내부 모듈 임포트
 from modules.config import (
     TRAIN_PICKLE_PATHS,
-    PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
     PPO_CONFIG,
-    TP_THRESHOLD, 
-    SL_THRESHOLD, 
-    LABEL_HORIZON
 )
 from modules.training.ppo.core.model import PPOPolicyNetwork
-from modules.training.ppo.imitation.train_imitation import (
-    prepare_features,
-    validate_data,
-    ProcessedData,
-)
+from torch.utils.data import DataLoader, IterableDataset
 
-# 로깅 설정 (INFO 레벨로 간소화)
+# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class ValuePretrainDataset(Dataset):
-    """가치 사전 학습을 위한 데이터셋 (상태, 실제 누적 보상)"""
-    def __init__(self, mtf_features: Dict[str, np.ndarray], returns: np.ndarray, indices: np.ndarray, input_dims: Dict[str, int]):
-        self.mtf_features = mtf_features  # 원본 데이터 유지
-        self.returns = returns
-        self.indices = indices  # 사용할 인덱스 목록
+# 보상 클래스 변환을 위한 임계값
+POSITIVE_THRESHOLD = 0.8
+NEGATIVE_THRESHOLD = -0.8
+
+def map_reward_to_class(reward: float) -> int:
+    if reward >= POSITIVE_THRESHOLD:
+        return 2  # Good
+    elif reward <= NEGATIVE_THRESHOLD:
+        return 0  # Bad
+    else:
+        return 1  # Neutral
+
+
+class ValuePretrainIterableDataset(IterableDataset):
+    """
+    가치 사전 학습을 위한 Iterable 데이터셋.
+    메모리 문제를 피하기 위해 데이터를 실시간으로 생성합니다.
+    """
+    def __init__(self, raw_data: Dict[str, pd.DataFrame], indices: np.ndarray, 
+                 class_labels: np.ndarray, input_dims: Dict[str, int], 
+                 seq_len: int, direction: str):
+        super().__init__()
+        self.raw_data = {tf: df.astype(np.float32) for tf, df in raw_data.items()}
+        self.indices = indices
+        self.class_labels = class_labels
         self.input_dims = input_dims
+        self.seq_len = seq_len
+        self.direction = direction
+        
+        self.scalers = {}
+        for tf, df in self.raw_data.items():
+            if not df.empty:
+                scaler = StandardScaler()
+                self.raw_data[tf] = pd.DataFrame(scaler.fit_transform(df), columns=df.columns, index=df.index)
+                self.scalers[tf] = scaler
+            else:
+                self.scalers[tf] = None # Handle empty dataframe case
+
+        self.ref_df = self.raw_data["1min"]
+        self.close_col = next((col for col in self.ref_df.columns if "close" in col.lower()), None)
+        self.high_col = next((col for col in self.ref_df.columns if "high" in col.lower()), "high")
+        self.low_col = next((col for col in self.ref_df.columns if "low" in col.lower()), "low")
+        self.value_horizon_steps = 60
+
+        self.clean_data = {tf: df.dropna() for tf, df in self.raw_data.items()}
+        self.df_indexers = {tf: pd.Index(df.index) for tf, df in self.clean_data.items()}
 
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, idx) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        actual_idx = self.indices[idx]  # 실제 데이터 인덱스
-        
+    def _get_features_at_idx(self, actual_idx: pd.Timestamp) -> Dict[str, torch.Tensor]:
         features = {}
-        for tf, data in self.mtf_features.items():
-            if actual_idx < len(data):
-                if tf in ['btc', 'dune']:
-                    # 외부 피처는 2D 유지
-                    features[tf] = torch.FloatTensor(data[actual_idx])
-                else:
-                    # 시계열 피처는 LSTM 입력에 맞게 시퀀스 차원 추가
-                    features[tf] = torch.FloatTensor(data[actual_idx])
-            else:
-                # 데이터가 없는 경우 제로 패딩
+        for tf, df_clean in self.clean_data.items():
+            if df_clean.empty:
                 dim = self.input_dims[tf]
-                if tf in ['btc', 'dune']:
-                    features[tf] = torch.zeros(dim, dtype=torch.float32)
-                else:
-                    features[tf] = torch.zeros(PPO_CONFIG["seq_len"], dim, dtype=torch.float32) # 시퀀스 차원 유지
-        
-        return features, torch.tensor(self.returns[actual_idx].item())
+                features[tf] = torch.zeros(self.seq_len if tf not in ['btc', 'dune'] else dim, dim, dtype=torch.float32)
+                continue
+
+            if tf in ['btc', 'dune']:
+                pos = self.df_indexers[tf].get_indexer([actual_idx], method='ffill')[0]
+                data_values = df_clean.iloc[pos].values if pos != -1 else np.zeros(len(df_clean.columns), dtype=np.float32)
+                features[tf] = torch.from_numpy(data_values)
+            else:
+                try:
+                    end_loc = df_clean.index.get_loc(actual_idx)
+                    start_loc = max(0, end_loc - self.seq_len + 1)
+                    seq_data = df_clean.iloc[start_loc:end_loc+1].values
+                    if len(seq_data) < self.seq_len:
+                        padding = np.zeros((self.seq_len - len(seq_data), len(df_clean.columns)), dtype=np.float32)
+                        seq_data = np.vstack([padding, seq_data])
+                    features[tf] = torch.from_numpy(seq_data)
+                except (KeyError, IndexError):
+                    features[tf] = torch.zeros(self.seq_len, self.input_dims[tf], dtype=torch.float32)
+        return features
+
+    def __iter__(self):
+        # 매 에포크마다 훈련 데이터의 순서를 섞음
+        shuffled_indices = np.random.permutation(len(self.indices))
+        for i in shuffled_indices:
+            actual_idx = self.indices[i]
+            features = self._get_features_at_idx(actual_idx)
+            target_class = torch.tensor(self.class_labels[i], dtype=torch.long)
+            yield features, target_class
+
 
 def compute_discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
     """주어진 보상 시퀀스로부터 할인된 누적 보상(return)을 계산"""
-    returns = np.zeros_like(rewards, dtype=float)
+    returns = np.zeros_like(rewards, dtype=np.float32)
     running_add = 0
     for t in reversed(range(len(rewards))):
         running_add = rewards[t] + gamma * running_add
         returns[t] = running_add
     return returns
 
-def generate_rewards(returns_array: np.ndarray) -> np.ndarray:
-    """
-    실제 수익률 배열을 받아 보상으로 사용합니다.
-    """
-    epsilon = 1e-6
-    reward_dist = {
-        'positive': (returns_array > 0).sum(),
-        'negative': (returns_array < 0).sum(),
-        'neutral': ((returns_array >= -epsilon) & (returns_array <= epsilon)).sum()
-    }
 
-    logger.info(f"📊 Reward 분포: +: {reward_dist['positive']}, -: {reward_dist['negative']}, 0: {reward_dist['neutral']}")
-    logger.info(f"   평균 reward: {returns_array.mean():.4f}")
-
-    return returns_array
-
-def calculate_horizon_returns(
-    df_entry: pd.DataFrame,
-    df_eval: pd.DataFrame,
-    direction: str
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    TP/SL 기반 수익률 보상 계산
-    """
-    returns_array = np.zeros(len(df_entry), dtype=float)
-    valid_samples_mask = np.ones(len(df_entry), dtype=bool)
-
-    close_col = next((col for col in df_entry.columns if "close" in col.lower()), None)
-    high_col = next((col for col in df_eval.columns if "high" in col.lower()), None)
-    low_col = next((col for col in df_eval.columns if "low" in col.lower()), None)
-
-    if not all([close_col, high_col, low_col]):
-        raise ValueError("Could not find required 'close', 'high', 'low' columns for return calculation.")
-
-    REWARD_SCALE = 10.0
-
-    def get_no_hit_reward(ret: float, direction: str) -> float:
-        neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1) # 기본값 0.1
-        
-        tp_thresh = TP_THRESHOLD
-        sl_thresh = abs(SL_THRESHOLD) # SL_THRESHOLD는 음수이므로 절대값 사용
-
-        # 중립 구간 경계 설정
-        positive_neutral_thresh = tp_thresh * neutral_band
-        negative_neutral_thresh = sl_thresh * neutral_band
-
-        if direction == "long":
-            if 0 <= ret < positive_neutral_thresh:
-                return 0.0
-            if ret >= positive_neutral_thresh:
-                # 중립 구간을 제외한 범위에서 0~1로 정규화
-                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-            if ret < 0:
-                # 손실은 SL 임계값으로 정규화 (0 ~ -1 범위)
-                return ret / sl_thresh
-
-        elif direction == "short":
-            # Short 포지션의 수익률(ret)은 (수익시 양수, 손실시 음수)로 변환되었음
-            # 따라서 ret > 0 이면 이익, ret < 0 이면 손실
-            if 0 <= ret < positive_neutral_thresh:
-                return 0.0
-            if ret >= positive_neutral_thresh:
-                # 이익 구간 (ret은 양수)
-                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-            if ret < 0:
-                # 손실 구간 (ret은 음수)
-                return ret / sl_thresh
-        
-        return 0.0 # 그 외의 경우는 0
-
-    hit_counts = {'TP': 0, 'SL': 0, 'No Hit': 0}
-
-    for i in range(len(df_entry) - LABEL_HORIZON):
-        entry_time = df_entry.index[i]
-        entry_price = df_entry.iloc[i][close_col]
-
-        if direction == "long":
-            tp_price = entry_price * (1 + TP_THRESHOLD)
-            sl_price = entry_price * (1 - abs(SL_THRESHOLD))
-        else:
-            tp_price = entry_price * (1 - TP_THRESHOLD)
-            sl_price = entry_price * (1 + abs(SL_THRESHOLD))
-
-        end_time = df_entry.index[i + LABEL_HORIZON]
-        future_eval_data = df_eval[(df_eval.index > entry_time) & (df_eval.index <= end_time)]
-
-        if future_eval_data.empty:
-            returns_array[i] = 0.0
-            valid_samples_mask[i] = False
-            hit_counts['No Hit'] += 1 # No Hit 카운트 증가
-            logger.debug(f"[{i}] No Hit (No Future Data).")
-            continue
-
-        if direction == "long":
-            tp_hit_times = future_eval_data.index[future_eval_data[high_col] >= tp_price]
-            sl_hit_times = future_eval_data.index[future_eval_data[low_col] <= sl_price]
-        else:
-            tp_hit_times = future_eval_data.index[future_eval_data[low_col] <= tp_price]
-            sl_hit_times = future_eval_data.index[future_eval_data[high_col] >= sl_price]
-
-        tp_first_time = tp_hit_times.min() if not tp_hit_times.empty else pd.NaT
-        sl_first_time = sl_hit_times.min() if not sl_hit_times.empty else pd.NaT
-
-        is_tp_hit = pd.notna(tp_first_time)
-        is_sl_hit = pd.notna(sl_first_time)
-
-        logger.debug(f"[{i}] is_tp_hit: {is_tp_hit}, is_sl_hit: {is_sl_hit}")
-        logger.debug(f"[{i}] tp_first_time: {tp_first_time}, sl_first_time: {sl_first_time}")
-        # logger.debug(f"[{i}] future_eval_data:\n{future_eval_data.to_string()}") # 너무 많은 로그가 발생할 수 있으므로 필요시 주석 해제
-
-        if is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
-            final_price = df_eval.loc[tp_first_time][close_col]
-            hit_counts['TP'] += 1
-            logger.debug(f"[{i}] TP Hit. final_price: {final_price:.4f}")
-        elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
-            final_price = df_eval.loc[sl_first_time][close_col]
-            hit_counts['SL'] += 1
-            logger.debug(f"[{i}] SL Hit. final_price: {final_price:.4f}")
-        else:
-            final_price = future_eval_data.iloc[-1][close_col]
-            hit_counts['No Hit'] += 1
-            logger.debug(f"[{i}] No Hit. final_price: {final_price:.4f}")
-
-        # 순수 수익률 계산 (부호 변경 없음)
-        ret = (final_price - entry_price) / entry_price
-        logger.debug(f"[{i}] Calculated ret: {ret:.4f}")
-        
-        reward = (
-            10.0 if is_tp_hit else
-            -1.0 if is_sl_hit else
-            get_no_hit_reward(ret, direction) # 순수 ret을 전달
-        )
-        logger.debug(f"[{i}] Final reward: {reward:.4f}")
-        returns_array[i] = reward * REWARD_SCALE
-
-    logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {sum(hit_counts.values())}건)")
-
-    return returns_array, valid_samples_mask, hit_counts
-
-def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePretrainDataset, Dict]:
-    logger.info(f"🛠️  [{direction.upper()}] 가치 사전 학습 데이터 준비 시작")
-    raw_data = pd.read_pickle(TRAIN_PICKLE_PATHS[direction])
-
-    # 1. 리팩토링된 prepare_features 호출 (ProcessedData 객체 반환)
-    processed_data = prepare_features(raw_data)
+def create_pretrain_data(direction: str) -> Tuple[IterableDataset, IterableDataset, Dict]:
+    """가치 사전 학습용 데이터 생성 (메모리 효율적인 생성기 방식)"""
+    logger.info(f"🛠️  [{direction.upper()}] 가치 사전 학습 데이터 준비 시작 (생성기 방식)")
     
-    features_dict = processed_data.features
-    input_dims = processed_data.input_dims
-    final_seq_index = processed_data.final_index # 시퀀싱 후의 최종 인덱스
-    raw_features_df = processed_data.raw_features_for_pretrain
+    raw_data = pd.read_pickle(TRAIN_PICKLE_PATHS[direction])
+    
+    # 임시로 데이터 10%만 샘플링
+    SAMPLE_RATIO = 0.1 
+    if SAMPLE_RATIO < 1.0:
+        logger.info(f"📊 전체 데이터의 {SAMPLE_RATIO*100:.0f}%만 샘플링하여 사용합니다.")
+        sampled_raw_data = {}
+        for tf, df in raw_data.items():
+            # 날짜 인덱스를 유지하며 랜덤 샘플링
+            sampled_indices = sorted(np.random.choice(df.index, size=int(len(df) * SAMPLE_RATIO), replace=False))
+            sampled_raw_data[tf] = df.loc[sampled_indices]
+        raw_data = sampled_raw_data
 
-    # 2. 보상 계산을 위한 데이터프레임 준비
-    entry_tf, eval_tf = "15min", "5min"
-    df_entry = raw_features_df[entry_tf]
-    df_eval = raw_features_df[eval_tf]
+    ref_df = raw_data["1min"]
+    seq_len = PPO_CONFIG["seq_len"]
+    valid_indices = ref_df.index[seq_len-1:]
+    input_dims = {tf: len(df.columns) for tf, df in raw_data.items()}
 
-    # 3. 보상 및 유효 샘플 마스크 계산 (시퀀싱 전 인덱스 기준)
-    rewards_array, valid_samples_mask, _ = calculate_horizon_returns(df_entry, df_eval, direction)
+    logger.info("📊 전체 데이터에 대한 보상을 미리 계산합니다...")
+    close_col = next((col for col in ref_df.columns if "close" in col.lower()), None)
+    if not close_col:
+        raise ValueError("Could not find 'close' column for return calculation.")
 
-    # 4. 보상과 마스크를 pandas Series로 변환하여, 최종 인덱스로 정렬 (핵심 수정)
-    rewards_series = pd.Series(rewards_array, index=df_entry.index)
-    mask_series = pd.Series(valid_samples_mask, index=df_entry.index)
+    VALUE_HORIZON_STEPS = 60
+    MIN_PROFIT_TARGET = PPO_CONFIG["min_profit_target"]
+    MAX_LOSS_TOLERANCE = PPO_CONFIG["max_loss_tolerance"]
+    
+    rewards_list, final_valid_indices = [], []
+    for current_time_idx in valid_indices:
+        try:
+            entry_price = ref_df.loc[current_time_idx, close_col]
+            current_loc = ref_df.index.get_loc(current_time_idx)
+            
+            next_loc = current_loc + 1 # 1분 뒤 스텝
+            if next_loc >= len(ref_df): # 데이터 끝에 도달
+                continue # 다음 스텝이 없으면 건너뛰기
 
-    # 시퀀싱 후의 최종 인덱스(final_seq_index)를 사용하여 완벽하게 정렬
-    aligned_rewards = rewards_series.loc[final_seq_index]
-    aligned_mask = mask_series.loc[final_seq_index]
+            # 미래 데이터 슬라이싱 (VALUE_HORIZON_STEPS + 1분 더 필요)
+            future_slice = ref_df.iloc[current_loc + 1 : current_loc + 1 + VALUE_HORIZON_STEPS + 1]
+            
+            if future_slice.empty or len(future_slice) <= VALUE_HORIZON_STEPS: # +1 for the actual 60th minute
+                continue
 
-    # 5. 정렬된 마스크를 사용하여 모든 피처와 보상 필터링
-    filtered_rewards = aligned_rewards[aligned_mask].values
-    filtered_data_len = len(filtered_rewards)
+            tp_level = entry_price * (1 + MIN_PROFIT_TARGET)
+            sl_level = entry_price * (1 - MAX_LOSS_TOLERANCE)
 
-    filtered_features = {}
-    for tf, data_array in features_dict.items():
-        # 이제 features_dict와 aligned_mask는 길이가 동일하므로 직접 필터링 가능
-        filtered_features[tf] = data_array[aligned_mask.values]
+            tp_hit = (future_slice['high'] >= tp_level).any()
+            sl_hit = (future_slice['low'] <= sl_level).any()
 
-    # 6. 보상 생성 및 데이터셋 구성
-    rewards = generate_rewards(filtered_rewards)
-    returns = compute_discounted_returns(rewards, PPO_CONFIG["gamma"])
+            reward = 0.0 # Default to 0.0
 
-    indices = np.arange(filtered_data_len)
-    train_size = int(0.8 * filtered_data_len)
-    train_indices, val_indices = indices[:train_size], indices[train_size:]
+            if tp_hit and not sl_hit:
+                reward = 1.0
+            elif sl_hit and not tp_hit:
+                reward = -1.0
+            else:
+                # Use price_t_plus_1 as final_price for the continuous reward
+                final_price = ref_df.iloc[next_loc][close_col]
+                if entry_price == 0: # Prevent division by zero
+                    log_return = 0.0
+                else:
+                    log_return = np.log(final_price / entry_price)
+                
+                clipped_ret = np.clip(log_return, -0.01, 0.01)
+                reward = clipped_ret * 10
+            
+            # Apply reward clipping as per new strategy
+            reward = np.clip(reward, -1.0, 1.0)
 
-    returns_mean, returns_std = returns[train_indices].mean(), returns[train_indices].std() + 1e-8
-    normalized_returns = (returns - returns_mean) / returns_std
+            # Filter out meaningless samples
+            if abs(reward) > 0.05: # Only include samples where reward is significant
+                rewards_list.append(reward)
+                final_valid_indices.append(current_time_idx)
 
-    train_dataset = ValuePretrainDataset(filtered_features, normalized_returns, train_indices, input_dims)
-    val_dataset = ValuePretrainDataset(filtered_features, normalized_returns, val_indices, input_dims)
+        except (KeyError, IndexError): 
+            continue
+    
+    rewards_array = np.array(rewards_list, dtype=np.float32)
+    final_valid_indices = np.array(final_valid_indices)
+    
+    logger.info(f"📊 Reward 분포: +: {(rewards_array > 0).sum()}, -: {(rewards_array < 0).sum()}, 0: {(rewards_array == 0).sum()}")
+    logger.info(f"   평균 reward: {rewards_array.mean():.6f}")
+    logger.info(f"[DEBUG] rewards mean/std = {rewards_array.mean():.6f} / {rewards_array.std():.6f}")
 
-    original_data_len = len(next(iter(raw_data.values())))
-    logger.info(f"   - 데이터 준비 완료: Train {len(train_dataset)}개, Val {len(val_dataset)}개 (원본 {original_data_len}개 중 유효 {filtered_data_len}개)")
+    train_size = int(0.8 * len(rewards_array))
+    train_indices, val_indices = final_valid_indices[:train_size], final_valid_indices[train_size:]
+    train_rewards, val_rewards = rewards_array[:train_size], rewards_array[train_size:]
+
+    # 보상을 클래스 레이블로 변환
+    train_class_labels = np.array([map_reward_to_class(r) for r in train_rewards], dtype=np.int64)
+    val_class_labels = np.array([map_reward_to_class(r) for r in val_rewards], dtype=np.int64)
+
+    train_dataset = ValuePretrainIterableDataset(raw_data, train_indices, train_class_labels, input_dims, seq_len, direction)
+    val_dataset = ValuePretrainIterableDataset(raw_data, val_indices, val_class_labels, input_dims, seq_len, direction)
+
+    logger.info(f"✅ 데이터 준비 완료: Train {len(train_dataset)}개, Val {len(val_dataset)}개 (전체 데이터 사용)")
     return train_dataset, val_dataset, input_dims
+
 
 def run_value_pretraining_for(direction: str):
     """지정된 방향에 대해 가치망 사전 학습 실행"""
@@ -280,43 +235,52 @@ def run_value_pretraining_for(direction: str):
     
     # 1. 데이터 준비
     train_ds, val_ds, input_dims = create_pretrain_data(direction)
-    train_loader = DataLoader(train_ds, batch_size=PPO_CONFIG["batch_size"], shuffle=True)
+    # IterableDataset은 shuffle=False 또는 shuffle 미지정
+    train_loader = DataLoader(train_ds, batch_size=PPO_CONFIG["batch_size"], shuffle=False)
     val_loader = DataLoader(val_ds, batch_size=PPO_CONFIG["batch_size"], shuffle=False)
 
-    # 2. 모델 준비
+    # 2. 모델 준비 (가치망만 학습)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 정책망과 가치망을 모두 가진 모델 생성
     model = PPOPolicyNetwork(
         timeframe_dims=input_dims, 
+        position_info_dim=5,
         hidden_dim=PPO_CONFIG["hidden_dim"], 
         action_dim=PPO_CONFIG["action_dim"],
-        create_value_head=True
+        create_value_head=True,
+        num_value_classes=3 # 3개의 클래스 (bad, neutral, good)
     ).to(device)
 
-    # 3. 모방학습된 정책망 가중치 로드
-    imitation_policy_path = PPO_IMITATION_MODEL_PATHS[direction]
-    logger.info(f"   - 모방 정책 로드: {imitation_policy_path}")
-    # strict=False로 설정하여 가치망 부분은 로드하지 않음
-    model.load_state_dict(torch.load(imitation_policy_path, map_location=device), strict=False)
+    # 가치망 초기화
+    for m in model.value_head.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.01) # 작은 표준편차로 초기화
+            nn.init.constant_(m.bias, 0.0) # 바이어스 0으로 초기화
 
-    # 4. 가치망만 학습하도록 설정
+    # 3. 가치망만 학습하도록 설정
     for name, param in model.named_parameters():
-        param.requires_grad = False  # 모든 파라미터를 기본적으로 동결
+        param.requires_grad = False  # 모든 파라미터 동결
     
-    # 가치망(value_head)의 파라미터만 학습 가능하도록 설정
+    # 가치망과 feature_combiner만 학습 가능하도록 설정
     for name, param in model.value_head.named_parameters():
         param.requires_grad = True
+    
+    for name, param in model.feature_combiner.named_parameters():
+        param.requires_grad = True
 
-    # 5. 가치망 학습
-    criterion = nn.MSELoss()
-    # value_head의 파라미터만 학습하도록 필터링
-    optimizer = optim.Adam(model.value_head.parameters(), lr=PPO_CONFIG["learning_rate"])
+    # 4. 학습 설정
+    criterion = nn.CrossEntropyLoss() # MSELoss 대신 CrossEntropyLoss 사용
+    optimizer = optim.Adam([
+        {'params': model.value_head.parameters()}, 
+        {'params': model.feature_combiner.parameters()}
+    ], lr=PPO_CONFIG["learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
+    # 5. 학습 루프
     best_val_loss = float('inf')
-    epochs = PPO_CONFIG.get("pretrain_epochs", 10)  # 사전학습 epoch 설정
+    epochs = PPO_CONFIG.get("pretrain_epochs", 10)
 
     for epoch in range(epochs):
+        # 훈련
         model.train()
         train_loss = 0
         for features, returns in train_loader:
@@ -324,8 +288,8 @@ def run_value_pretraining_for(direction: str):
             returns = returns.to(device)
 
             optimizer.zero_grad()
-            _, value = model(features)
-            loss = criterion(value.squeeze(), returns)
+            _, _, value = model(features)
+            loss = criterion(value, returns)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -336,38 +300,67 @@ def run_value_pretraining_for(direction: str):
         model.eval()
         val_loss = 0
         all_returns, all_preds = [], []
+        
         with torch.no_grad():
-            for features, returns in val_loader:
+            for batch_idx, (features, returns) in enumerate(val_loader):
                 features = {tf: data.to(device) for tf, data in features.items()}
                 returns = returns.to(device)
-                _, value = model(features)
-                val_loss += criterion(value.squeeze(), returns).item()
+                _, _, value = model(features)
+                
+                # Softmax 확률 및 클래스 예측 계산
+                probabilities = torch.softmax(value, dim=-1)
+                predicted_classes = torch.argmax(probabilities, dim=-1)
+
+                # 🔍 디버깅 로그 추가 - 첫 배치만
+                if batch_idx == 0:
+                    logger.info(f"[DEBUG] returns[:5] = {returns[:5].cpu().numpy()}")
+                    logger.info(f"[DEBUG] value_logits[:5] = {value[:5].cpu().numpy()}")
+                    logger.info(f"[DEBUG] probabilities[:5] = {probabilities[:5].cpu().numpy()}")
+                    logger.info(f"[DEBUG] predicted_classes[:5] = {predicted_classes[:5].cpu().numpy()}")
+
+                val_loss += criterion(value, returns).item()
                 all_returns.extend(returns.cpu().numpy())
-                all_preds.extend(value.squeeze().cpu().numpy())
-        
+                all_preds.extend(predicted_classes.cpu().numpy())
+
         val_loss /= len(val_loader)
-        val_mae = mean_absolute_error(all_returns, all_preds)
-        val_r2 = r2_score(all_returns, all_preds)
+        # 분류 정확도 계산
+        val_accuracy = np.mean(np.array(all_returns) == np.array(all_preds))
+        val_precision = precision_score(all_returns, all_preds, average='weighted', zero_division=0)
+        val_recall = recall_score(all_returns, all_preds, average='weighted', zero_division=0)
+        val_f1 = f1_score(all_returns, all_preds, average='weighted', zero_division=0)
+        cm = confusion_matrix(all_returns, all_preds)
+
         current_lr = optimizer.param_groups[0]['lr']
 
-        logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val MAE: {val_mae:.6f} | Val R2: {val_r2:.6f} | LR: {current_lr:.1e}")
+        logger.info(f"Epoch {epoch+1}/{epochs} | "
+                   f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+                   f"Val Accuracy: {val_accuracy:.6f} | Val Precision: {val_precision:.6f} | "
+                   f"Val Recall: {val_recall:.6f} | Val F1: {val_f1:.6f} | LR: {current_lr:.1e}")
+        logger.info(f"Confusion Matrix:\n{cm}")
+        
         scheduler.step(val_loss)
 
+        # 6. 최고 성능 모델 저장
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             output_path = VALUE_PRETRAIN_OUTPUT_PATH[direction]
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
             # 가치망의 state_dict만 저장
             torch.save(model.value_head.state_dict(), output_path)
+            logger.info(f"💾 Best model saved: {output_path}")
 
     logger.info(f"\n{'='*60}\n✅ [{direction.upper()}] 가치망 사전 학습 완료\n{'='*60}")
 
+
 def main():
+    """메인 실행 함수"""
     for direction in ['long', 'short']:
         try:
             run_value_pretraining_for(direction)
         except Exception as e:
-            logger.error(f"❌ [{direction.upper()}] 처리 중 심각한 오류 발생: {e}", exc_info=True)
+            logger.error(f"❌ [{direction.upper()}] 처리 중 오류 발생: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     main()

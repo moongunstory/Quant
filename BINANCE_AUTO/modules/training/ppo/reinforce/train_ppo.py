@@ -6,6 +6,7 @@ import sys
 import logging
 import joblib 
 from typing import Dict, Any
+from sklearn.utils.class_weight import compute_class_weight
 
 # 로깅 설정
 logging.basicConfig(
@@ -61,10 +62,14 @@ def convert_obs_to_tensor(
     obs: Dict[str, np.ndarray], device: torch.device
 ) -> Dict[str, torch.Tensor]:
     """MTF numpy 관찰값을 torch 텐서로 변환"""
-    return {
-        tf: torch.tensor(obs_data, dtype=torch.float32).unsqueeze(0).to(device)
-        for tf, obs_data in obs.items()
-    }
+    # Ensure position_info is handled correctly as a float32 tensor
+    tensor_obs = {}
+    for tf, obs_data in obs.items():
+        if tf == 'position_info':
+            tensor_obs[tf] = torch.tensor(obs_data, dtype=torch.float32).unsqueeze(0).to(device)
+        else:
+            tensor_obs[tf] = torch.tensor(obs_data, dtype=torch.float32).unsqueeze(0).to(device)
+    return tensor_obs
 
 def squeeze_obs_dict(obs_tensor: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """MTF 관찰값 텐서에서 배치 차원 제거"""
@@ -89,6 +94,7 @@ def train_ppo(
     value_model_path: str,
     save_path: str,
     total_epochs: int = PPO_CONFIG["epochs"],
+    update_epochs: int = 10,  # 🔥 추가: 업데이트 반복 횟수
     batch_size: int = PPO_CONFIG["batch_size"],
     gamma: float = PPO_CONFIG["gamma"],
     lam: float = PPO_CONFIG["lambda"],
@@ -118,15 +124,23 @@ def train_ppo(
 
     # MTF 지원 PPO 모델 초기화
     # 정책망과 가치망을 모두 갖춘 모델 생성
-    model = PPOPolicyNetwork(timeframe_dims=input_dims, hidden_dim=PPO_CONFIG["hidden_dim"], create_value_head=True).to(device)
+    model = PPOPolicyNetwork(
+        timeframe_dims=input_dims,
+        position_info_dim=5, # Added position_info_dim
+        hidden_dim=PPO_CONFIG["hidden_dim"],
+        action_dim=PPO_CONFIG["action_dim"], # Use action_dim from config (now 1)
+        create_value_head=True,
+        num_value_classes=3 # 🔥 수정: 가치망 출력을 3개 클래스로 설정
+    ).to(device)
 
-    # 1. 모방 학습된 정책망 로드
-    if os.path.exists(imitation_model_path):
-        logger.info(f"📦 [{direction.upper()}] 모방 학습된 정책망 로딩: {imitation_model_path}")
-        # strict=False로 설정하여 정책망만 로드하고 가치망은 무시
-        model.load_state_dict(torch.load(imitation_model_path, map_location=device), strict=False)
-    else:
-        logger.warning(f"⚠️ [{direction.upper()}] 모방 학습된 정책망 ({imitation_model_path})을 찾을 수 없습니다. 정책망을 랜덤 초기화합니다.")
+    # 1. 모방 학습된 정책망 로드 (이제 정책망은 연속형 출력이므로, 모방 학습은 의미가 없음)
+    # 이 부분은 주석 처리하거나 제거하는 것이 좋습니다.
+    # if os.path.exists(imitation_model_path):
+    #     logger.info(f"📦 [{direction.upper()}] 모방 학습된 정책망 로딩: {imitation_model_path}")
+    #     # strict=False로 설정하여 정책망만 로드하고 가치망은 무시
+    #     model.load_state_dict(torch.load(imitation_model_path, map_location=device), strict=False)
+    # else:
+    #     logger.warning(f"⚠️ [{direction.upper()}] 모방 학습된 정책망 ({imitation_model_path})을 찾을 수 없습니다. 정책망을 랜덤 초기화합니다.")
 
     # 2. 사전 학습된 가치망 로드
     if os.path.exists(value_model_path):
@@ -151,7 +165,7 @@ def train_ppo(
 
     optimizer = optim.Adam([
         {'params': policy_params, 'lr': lr},
-        {'params': value_params, 'lr': lr * 20.0}  # 5배 → 20배로 증가
+        {'params': value_params, 'lr': lr * 10.0}  # 🔥 수정: 가치 함수 학습률 배수 10.0으로 변경
     ])
     
     initial_entropy_coef = entropy_coef
@@ -163,14 +177,20 @@ def train_ppo(
     running_return_mean = 0.0
     running_return_std = 1.0
     alpha = 0.1  # exponential moving average factor
+    alpha = 0.1  # exponential moving average factor
 
     for epoch in range(total_epochs):
+        # 학습률 선형 감소
+        current_lr = lr * (1 - epoch / total_epochs)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
         entropy_coef = max(
             initial_entropy_coef * (1 - epoch / total_epochs), min_entropy_coef
         )
         logger.info(
             f"📈 [{direction.upper()}] Epoch {epoch+1}/{total_epochs} 시작 "
-            f"(entropy_coef={entropy_coef:.4f})"
+            f"(entropy_coef={entropy_coef:.4f}, lr={current_lr:.2e})"
         )
 
         debug_epoch = epoch < 2
@@ -184,14 +204,17 @@ def train_ppo(
         # 롤아웃 수집
         while not done and len(buffer.rewards) < max_steps:
             obs_tensor = convert_obs_to_tensor(obs, device)
-            action, log_prob, value, _ = model.get_action(obs_tensor)
-            env_action = action.item()
+            action_confidence, log_prob, value, _ = model.get_action(obs_tensor) # action_confidence는 텐서
+            
+            # env.step에 전달할 실제 행동 (확신도 값)
+            env_action = action_confidence.item() 
+            
             next_obs, reward, done, _ = env.step(env_action)
             obs_cpu = squeeze_obs_dict(obs_tensor)
 
             buffer.add(
                 obs_cpu,
-                action.item(),
+                action_confidence.item(), # 연속형 행동 값 저장
                 reward,
                 done,
                 log_prob.item(),
@@ -206,22 +229,36 @@ def train_ppo(
             obs_tensor = convert_obs_to_tensor(obs, device)
             _, _, last_value, _ = model.get_action(obs_tensor)
 
-        # 🔥 수정된 GAE 계산 - 정규화 비활성화
-        buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=lam, normalize=False)
+        # 🔥 수정된 GAE 계산 - 정규화 활성화
+        buffer.compute_returns_and_advantages(last_value.item(), gamma=gamma, lam=lam, normalize=True)
 
-        # 🔥 수동으로 Return 정규화 (이동평균 사용)
-        raw_returns = buffer.returns.clone()
-        if epoch == 0:
-            running_return_mean = raw_returns.mean().item()
-            running_return_std = raw_returns.std().item() + 1e-8
-        else:
-            running_return_mean = alpha * raw_returns.mean().item() + (1 - alpha) * running_return_mean
-            running_return_std = alpha * raw_returns.std().item() + (1 - alpha) * running_return_std
+        # 🔥 GAE에서 정규화를 수행하므로 수동 정규화 로직은 제거됨
+        # raw_returns = buffer.returns.clone()
+        # if epoch == 0:
+        #     running_return_mean = raw_returns.mean().item()
+        #     running_return_std = raw_returns.std().item() + 1e-8
+        # else:
+        #     running_return_mean = alpha * raw_returns.mean().item() + (1 - alpha) * running_return_mean
+        #     running_return_std = alpha * raw_returns.std().item() + (1 - alpha) * running_return_std
+        # 
+        # # 정규화된 returns 계산
+        # buffer.returns = (raw_returns - running_return_mean) / (running_return_std + 1e-8)
+        # 
+        # logger.info(f"📊 Return 정규화: mean={running_return_mean:.3f}, std={running_return_std:.3f}")
+
+        # Return 정규화 제거
+        # raw_returns = buffer.returns.clone()
+        # if epoch == 0:
+        #     running_return_mean = raw_returns.mean().item()
+        #     running_return_std = raw_returns.std().item() + 1e-8
+        # else:
+        #     running_return_mean = alpha * raw_returns.mean().item() + (1 - alpha) * running_return_mean
+        #     running_return_std = alpha * raw_returns.std().item() + (1 - alpha) * running_return_std
         
-        # 정규화된 returns 계산
-        buffer.returns = (raw_returns - running_return_mean) / (running_return_std + 1e-8)
+        # # 정규화된 returns 계산
+        # buffer.returns = (raw_returns - running_return_mean) / (running_return_std + 1e-8)
         
-        logger.info(f"📊 Return 정규화: mean={running_return_mean:.3f}, std={running_return_std:.3f}")
+        # logger.info(f"📊 Return 정규화: mean={running_return_mean:.3f}, std={running_return_std:.3f}")
 
         if logger.isEnabledFor(logging.DEBUG):
             rewards_arr = np.array(episode_rewards)
@@ -239,7 +276,19 @@ def train_ppo(
         total_reward = np.sum(episode_rewards)
         logger.info(f"🏆 [{direction.upper()}] 롤아웃: {len(episode_rewards)} steps, Total Reward: {total_reward:.3f}")
 
-        # PPO 업데이트
+        # Calculate class weights for value function
+        # Replicate the labeling logic from compute_value_loss
+        returns_for_weights = buffer.returns.cpu().numpy()
+        target_labels_for_weights = np.ones_like(returns_for_weights, dtype=int)
+        target_labels_for_weights[returns_for_weights >= 0.5] = 2
+        target_labels_for_weights[returns_for_weights <= -0.5] = 0
+
+        classes = np.array([0, 1, 2])
+        class_weights_np = compute_class_weight('balanced', classes=classes, y=target_labels_for_weights)
+        class_weights = torch.tensor(class_weights_np, dtype=torch.float32).to(device)
+        logger.info(f"📊 Value Class Weights: {class_weights.cpu().numpy()}")
+
+        # PPO 업데이트 (여러 에포크 반복)
         model.train()
         policy_losses = []
         value_losses = []
@@ -252,70 +301,87 @@ def train_ppo(
         epoch_values_list = []
         epoch_returns_list = []
 
-        for (
-            obs_batch,
-            action_batch,
-            return_batch,
-            adv_batch,
-            old_logprob_batch,
-        ) in buffer.get_batches(batch_size):
-            obs_batch = move_obs_to_device(obs_batch, device)
-            action_batch = action_batch.to(device)
-            return_batch = return_batch.to(device)
-            adv_batch = adv_batch.to(device)
-            old_logprob_batch = old_logprob_batch.to(device)
-            
-            log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
-            
-            # 🔥 가치 함수 클리핑 제거됨 (이미 적용됨)
-            entropy = torch.clamp(entropy, min=0.005, max=2.0)
+        for i in range(update_epochs):
+            for (
+                obs_batch,
+                action_batch,
+                return_batch,
+                adv_batch,
+                old_logprob_batch,
+            ) in buffer.get_batches(batch_size):
+                obs_batch = move_obs_to_device(obs_batch, device)
+                action_batch = action_batch.to(device)
+                return_batch = return_batch.to(device)
+                adv_batch = adv_batch.to(device)
+                old_logprob_batch = old_logprob_batch.to(device)
+                
+                log_probs, entropy, values = model.evaluate_action(obs_batch, action_batch)
+                
+                # 🔥 가치 함수 클리핑 제거됨 (이미 적용됨)
+                entropy = torch.clamp(entropy, min=0.005, max=2.0)
 
-            if debug_epoch and val_check_count < 20:
-                for v, r in zip(values.detach().cpu(), return_batch.detach().cpu()):
-                    if val_check_count >= 20:
-                        break
-                    error = v.item() - r.item()
-                    if abs(error) >= 0.5:
-                        logger.debug(
-                            f"[VAL-CHECK] value={v.item():.3f}, return={r.item():.3f}, error={error:.3f}"
-                        )
+                if debug_epoch and val_check_count < 20:
+                    for v, r in zip(values.detach().cpu(), return_batch.detach().cpu()):
+                        if val_check_count >= 20:
+                            break
+                        error = v.item() - r.item()
+                        if abs(error) >= 0.5:
+                            logger.debug(
+                                f"[VAL-CHECK] value={v.item():.3f}, return={r.item():.3f}, error={error:.3f}"
+                            )
+                        val_check_count += 1
+                
+                # Debugging: Log value and return batch statistics
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG_VAL] values mean={values.mean().item():.3f}, std={values.std().item():.3f}")
+                    logger.debug(f"[DEBUG_VAL] return_batch mean={return_batch.mean().item():.3f}, std={return_batch.std().item():.3f}")
+
+                policy_loss = compute_ppo_loss(log_probs, old_logprob_batch, adv_batch, clip_eps)
+                
+                # 🔥 정규화된 리턴 사용
+                value_loss = compute_value_loss(values, return_batch, class_weights=class_weights)  # 이미 정규화됨
+                
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                # [DEBUG LOG] 가치망 그래디언트 크기 확인
+                if logger.isEnabledFor(logging.DEBUG):
+                    value_grad_norm = 0.0
+                    for name, param in model.named_parameters():
+                        if 'value_head' in name and param.grad is not None:
+                            value_grad_norm += param.grad.norm().item() ** 2
+                    value_grad_norm = value_grad_norm ** 0.5
+                    if value_grad_norm > 10.0 or value_grad_norm < 0.1:
+                        logger.debug(f"[GRAD_CHECK] Value Head Grad Norm: {value_grad_norm:.4f}")
+
+                # [DEBUG LOG] 가치 예측과 실제 리턴 샘플 비교 (학습 초반)
+                if debug_epoch and val_check_count < 2:
+                    logger.debug("------ Value vs. Return Samples (Batch) ------")
+                    for i in range(min(5, len(values))):
+                        val = values[i].item()
+                        ret = return_batch[i].item()
+                        logger.debug(f"Sample {i}: Predicted Value={val:.4f}, Actual Return={ret:.4f}, Error={val-ret:.4f}")
                     val_check_count += 1
-                    
-            policy_loss = compute_ppo_loss(log_probs, old_logprob_batch, adv_batch, clip_eps)
-            
-            # 🔥 정규화된 리턴 사용
-            value_loss = compute_value_loss(values, return_batch, normalize=False)  # 이미 정규화됨
-            
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+                    logger.debug("------------------------------------------")
 
-            optimizer.zero_grad()
-            loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
 
-            if debug_epoch:
-                grad_squares = []
-                for name, param in model.named_parameters():
-                    if 'value_head' in name and param.grad is not None:
-                        grad_squares.append(param.grad.norm() ** 2)
-                if grad_squares:
-                    grad_norm = float(torch.sqrt(sum(grad_squares)))
-                    if grad_norm < 0.05 or grad_norm > 5.0:
-                        logger.debug(f"[GRAD] Value head grad norm = {grad_norm:.6f}")
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+                entropies.append(entropy.mean().item())
+                batch_advantages.append(adv_batch.mean().item())
+                batch_values.append(values.mean().item())
+                batch_returns.append(return_batch.mean().item())
+                batch_evs.append(
+                    compute_explained_variance(values.detach(), return_batch.detach()).item()
+                )
+                value_ranges.append((values.min().item(), values.max().item()))
 
-            optimizer.step()
-
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
-            entropies.append(entropy.mean().item())
-            batch_advantages.append(adv_batch.mean().item())
-            batch_values.append(values.mean().item())
-            batch_returns.append(return_batch.mean().item())
-            batch_evs.append(
-                compute_explained_variance(values.detach(), return_batch.detach()).item()
-            )
-            value_ranges.append((values.min().item(), values.max().item()))
-
-            epoch_values_list.extend(values.detach().cpu().numpy().tolist())
-            epoch_returns_list.extend(return_batch.detach().cpu().numpy().tolist())
+                epoch_values_list.extend(values.detach().cpu().numpy().tolist())
+                epoch_returns_list.extend(return_batch.detach().cpu().numpy().tolist())
 
         # 에폭 통계
         avg_advantage = np.mean(batch_advantages)
@@ -415,7 +481,7 @@ if __name__ == "__main__":
 
     results = []
 
-    for direction in ["long", "short"]:
+    for direction in ["long"]:
         result = train_ppo(
             direction=direction,
             csv_path=TRAIN_PICKLE_PATHS[direction],

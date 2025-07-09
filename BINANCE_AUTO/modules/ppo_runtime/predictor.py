@@ -11,20 +11,22 @@ from modules.training.ppo.core.model import PPOPolicyNetwork
 
 
 class Predictor:
-    def __init__(self, timeframe_dims: Dict[str, int]):
+    def __init__(self, timeframe_dims: Dict[str, int], position_info_dim: int = 5):
         """
         MTF Predictor
         
         Args:
             timeframe_dims: Dictionary mapping timeframe names to their input dimensions
                           Example: {"5min": 16, "15min": 32, "30min": 8, "1H": 6, "btc": 15, "dune": 20}
+            position_info_dim: Dimension of position-related features (default to 5)
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.timeframe_dims = timeframe_dims
+        self.position_info_dim = position_info_dim
 
         self.models = {
-            'long': PPOPolicyNetwork(timeframe_dims=timeframe_dims, hidden_dim=256).to(self.device),
-            'short': PPOPolicyNetwork(timeframe_dims=timeframe_dims, hidden_dim=256).to(self.device)
+            'long': PPOPolicyNetwork(timeframe_dims=timeframe_dims, position_info_dim=self.position_info_dim, hidden_dim=256, action_dim=4).to(self.device),
+            'short': PPOPolicyNetwork(timeframe_dims=timeframe_dims, position_info_dim=self.position_info_dim, hidden_dim=256, action_dim=4).to(self.device)
         }
 
         self.models['long'].load_model(PPO_FINAL_MODEL_PATHS['long'])
@@ -58,6 +60,11 @@ class Predictor:
         processed_state = {}
         
         for tf_name, array in mtf_state.items():
+            if tf_name == 'position_info':
+                # Position info is a 1D array, convert directly to tensor
+                processed_state[tf_name] = torch.tensor(array, dtype=torch.float32).unsqueeze(0).to(self.device)
+                continue
+
             if tf_name not in self.timeframe_dims:
                 continue
                 
@@ -86,16 +93,15 @@ class Predictor:
         
         return processed_state
 
-    def predict_policy(self, mtf_state: Dict[str, np.ndarray], direction: str = None) -> Tuple[str, Optional[float], float, float]:
+    def predict_policy(self, mtf_state: Dict[str, np.ndarray]) -> Tuple[int, float, float, torch.Tensor]:
         """
-        학습용: 모델이 뽑은 행동과 log_prob (PPO 학습용), ENTER 확률 (로그 출력용) 모두 반환
+        학습용: 모델이 뽑은 행동과 log_prob (PPO 학습용), value, probs 모두 반환
         
         Args:
             mtf_state: MTF state dictionary
-            direction: "long" or "short", if None then compare both
             
         Returns:
-            Tuple of (action_str, log_prob, value, prob)
+            Tuple of (action_idx, log_prob, value, probs)
         """
         state_tensors = self._preprocess(mtf_state)
         
@@ -106,48 +112,65 @@ class Predictor:
             if tensor.numel() > 0:
                 print(f"[LOG]   {tf_name}: sample = {tensor.flatten()[:5]}")
 
-        if direction:
-            with torch.no_grad():
-                action, log_prob, value, probs = self.models[direction].get_action(state_tensors)
+        with torch.no_grad():
+            action, log_prob, value, probs = self.models['long'].get_action(state_tensors) # Use 'long' model for action prediction
 
-            action_str = direction if action.item() == 0 else 'hold'
-            prob = float(probs[0, 0].item())
-            return action_str, float(log_prob.item()), float(value.item()), prob
+        return action.item(), float(log_prob.item()), float(value.item()), probs.squeeze(0)
 
-        else:
-            # 양방향 비교 (확신도 높은 방향 선택, 샘플링은 없음)
-            result = {}
-            for dir_ in ['long', 'short']:
-                with torch.no_grad():
-                    _, _, value, probs = self.models[dir_].get_action(state_tensors)
-                    prob = float(probs[0, 0].item())
-                    result[dir_] = {'prob': prob, 'value': float(value.item())}
-
-            if result['long']['prob'] > result['short']['prob']:
-                return 'long', None, result['long']['value'], result['long']['prob']
-            else:
-                return 'short', None, result['short']['value'], result['short']['prob']
-
-    def predict_filtered(self, mtf_state: Dict[str, np.ndarray], direction: str = None) -> Tuple[str, float, float]:
+    def predict_filtered(self, mtf_state: Dict[str, np.ndarray]) -> Tuple[str, float, float]:
         """
-        실전용: threshold 적용. 확신도 없으면 HOLD 반환
+        실전용: threshold 적용. 확신도 없으면 NO_ACTION 반환
         
         Args:
             mtf_state: MTF state dictionary
-            direction: "long" or "short"
             
         Returns:
             Tuple of (action_str, prob, value)
         """
-        action, log_prob, value, prob = self.predict_policy(mtf_state, direction)
+        action_idx, log_prob, value, probs = self.predict_policy(mtf_state)
 
-        threshold = LONG_THRESHOLD if direction == 'long' else SHORT_THRESHOLD
-        print(f"[DEBUG] [predict_filtered()] dir = {direction} | prob = {prob:.3f} | threshold = {threshold}")
+        # Extract probabilities for specific actions
+        long_prob = probs[0].item() # ATTEMPT_LONG
+        short_prob = probs[1].item() # ATTEMPT_SHORT
+        close_prob = probs[2].item() # CLOSE_POSITION
+        no_action_prob = probs[3].item() # NO_ACTION
 
-        if prob >= threshold and action == direction:
-            return direction, prob, value
+        # Determine the action based on probabilities and thresholds
+        final_action_str = 'no_action'
+        final_prob = no_action_prob
+
+        # Check for ATTEMPT_LONG
+        long_condition = long_prob >= LONG_THRESHOLD
+        # Check for ATTEMPT_SHORT
+        short_condition = short_prob >= SHORT_THRESHOLD
+
+        if long_condition and short_condition:
+            # Both conditions met, choose the one with higher probability
+            if long_prob > short_prob:
+                final_action_str = 'attempt_long'
+                final_prob = long_prob
+            else:
+                final_action_str = 'attempt_short'
+                final_prob = short_prob
+        elif long_condition:
+            final_action_str = 'attempt_long'
+            final_prob = long_prob
+        elif short_condition:
+            final_action_str = 'attempt_short'
+            final_prob = short_prob
         else:
-            return 'hold', prob, value
+            # If neither long nor short conditions are met, consider CLOSE_POSITION or NO_ACTION
+            # Prioritize CLOSE_POSITION if its probability is higher than NO_ACTION
+            if close_prob > no_action_prob:
+                final_action_str = 'close_position'
+                final_prob = close_prob
+            else:
+                final_action_str = 'no_action'
+                final_prob = no_action_prob
+
+        print(f"[DEBUG] [predict_filtered()] long_prob={long_prob:.3f} (thresh={LONG_THRESHOLD}) | short_prob={short_prob:.3f} (thresh={SHORT_THRESHOLD}) | close_prob={close_prob:.3f} | no_action_prob={no_action_prob:.3f} -> Final Action: {final_action_str} (Prob: {final_prob:.3f})")
+
+        return final_action_str, final_prob, value
 
     def validate_input(self, mtf_state: Dict[str, np.ndarray]) -> bool:
         """
