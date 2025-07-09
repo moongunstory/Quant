@@ -17,7 +17,7 @@ from modules.config import (
     DUNE_API_KEY, BINANCE_API_KEY, BINANCE_SECRET_KEY,
     TIMEFRAMES, START_DATE, END_DATE,
     FEATURE_CATEGORIES_BY_TF, DUNE_QUERY_PARTS,
-    RAW_DATA_PATH, BINANCE_INTERVAL_MAP, FUTURES_SYMBOL
+    RAW_DATA_PATH, BINANCE_INTERVAL_MAP, FUTURES_SYMBOL, AUX_TIMEFRAMES
 )
 
 logger = logging.getLogger(__name__)
@@ -275,23 +275,25 @@ def collect_all_market_data() -> dict:
         
         print(f"[완료] {tf}: {len(result[tf])} rows, {len(result[tf].columns)} features")
     
-    # 2. BTC 피처 독립 수집
-    print("[수집] BTC 피처...")
-    btc_df = fetch_btc_historical_features(START_DATE, END_DATE)
-    result["btc"] = btc_df.copy()
-    print(f"[완료] BTC: {len(result['btc'])} rows, {len(result['btc'].columns)} features")
-    
-    # 3. DUNE 온체인 데이터 독립 수집
-    print("[수집] DUNE 온체인 데이터...")
-    dune_df = collect_all_dune_data()
-    if not dune_df.empty:
-        result["dune"] = dune_df.copy()
-        print(f"[완료] DUNE: {len(result['dune'])} rows, {len(result['dune'].columns)} features")
-    else:
-        result["dune"] = pd.DataFrame()
-        print("[경고] DUNE 데이터 수집 실패")
-    
-    # 4. 선택적 저장 (딕셔너리 구조 유지)
+    # 2. 보조 자산 및 외부 데이터 수집 (AUX_TIMEFRAMES 기준으로 통제)
+    for aux in AUX_TIMEFRAMES:
+        if aux == "btc":
+            print("[수집] BTC 피처...")
+            btc_df = fetch_btc_historical_features(START_DATE, END_DATE)
+            result["btc"] = btc_df.copy()
+            print(f"[완료] BTC: {len(result['btc'])} rows, {len(result['btc'].columns)} features")
+
+        elif aux == "dune":
+            print("[수집] DUNE 온체인 데이터...")
+            dune_df = collect_all_dune_data()
+            if not dune_df.empty:
+                result["dune"] = dune_df.copy()
+                print(f"[완료] DUNE: {len(result['dune'])} rows, {len(result['dune'].columns)} features")
+            else:
+                result["dune"] = pd.DataFrame()
+                print("[경고] DUNE 데이터 수집 실패")
+
+    # 3. 선택적 저장 (딕셔너리 구조 유지)
     save_dir = os.path.dirname(os.path.join(PROJECT_ROOT, RAW_DATA_PATH))
     os.makedirs(save_dir, exist_ok=True)
     

@@ -100,12 +100,15 @@ def calculate_horizon_returns(
     df_entry: pd.DataFrame,
     df_eval: pd.DataFrame,
     direction: str
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """
-    TP/SL 기반 수익률 보상 계산
+    TP/SL 기반 수익률 보상 계산 (시퀀스 마지막 시점 기준으로 reward 생성)
     """
+    seq_len = PPO_CONFIG["seq_len"]
+    max_index = len(df_entry) - LABEL_HORIZON - seq_len + 1
+
     returns_array = np.zeros(len(df_entry), dtype=float)
-    valid_samples_mask = np.ones(len(df_entry), dtype=bool)
+    valid_samples_mask = np.zeros(len(df_entry), dtype=bool)
 
     close_col = next((col for col in df_entry.columns if "close" in col.lower()), None)
     high_col = next((col for col in df_eval.columns if "high" in col.lower()), None)
@@ -115,46 +118,33 @@ def calculate_horizon_returns(
         raise ValueError("Could not find required 'close', 'high', 'low' columns for return calculation.")
 
     REWARD_SCALE = 10.0
-
-    def get_no_hit_reward(ret: float, direction: str) -> float:
-        neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1) # 기본값 0.1
-        
-        tp_thresh = TP_THRESHOLD
-        sl_thresh = abs(SL_THRESHOLD) # SL_THRESHOLD는 음수이므로 절대값 사용
-
-        # 중립 구간 경계 설정
-        positive_neutral_thresh = tp_thresh * neutral_band
-        negative_neutral_thresh = sl_thresh * neutral_band
-
-        if direction == "long":
-            if 0 <= ret < positive_neutral_thresh:
-                return 0.0
-            if ret >= positive_neutral_thresh:
-                # 중립 구간을 제외한 범위에서 0~1로 정규화
-                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-            if ret < 0:
-                # 손실은 SL 임계값으로 정규화 (0 ~ -1 범위)
-                return ret / sl_thresh
-
-        elif direction == "short":
-            # Short 포지션의 수익률(ret)은 (수익시 양수, 손실시 음수)로 변환되었음
-            # 따라서 ret > 0 이면 이익, ret < 0 이면 손실
-            if 0 <= ret < positive_neutral_thresh:
-                return 0.0
-            if ret >= positive_neutral_thresh:
-                # 이익 구간 (ret은 양수)
-                return (ret - positive_neutral_thresh) / (tp_thresh - positive_neutral_thresh)
-            if ret < 0:
-                # 손실 구간 (ret은 음수)
-                return ret / sl_thresh
-        
-        return 0.0 # 그 외의 경우는 0
-
     hit_counts = {'TP': 0, 'SL': 0, 'No Hit': 0}
 
-    for i in range(len(df_entry) - LABEL_HORIZON):
-        entry_time = df_entry.index[i]
-        entry_price = df_entry.iloc[i][close_col]
+    def get_no_hit_reward(ret: float, direction: str) -> float:
+        neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1)
+        tp_thresh = TP_THRESHOLD
+        sl_thresh = abs(SL_THRESHOLD)
+        pos_thresh = tp_thresh * neutral_band
+
+        if direction == "long":
+            if 0 <= ret < pos_thresh:
+                return 0.0
+            if ret >= pos_thresh:
+                return (ret - pos_thresh) / (tp_thresh - pos_thresh)
+            if ret < 0:
+                return ret / sl_thresh
+        else:
+            if 0 <= ret < pos_thresh:
+                return 0.0
+            if ret >= pos_thresh:
+                return (ret - pos_thresh) / (tp_thresh - pos_thresh)
+            if ret < 0:
+                return ret / sl_thresh
+        return 0.0
+
+    for i in range(max_index):
+        final_index = df_entry.index[i + seq_len - 1]
+        entry_price = df_entry.loc[final_index][close_col]
 
         if direction == "long":
             tp_price = entry_price * (1 + TP_THRESHOLD)
@@ -163,13 +153,14 @@ def calculate_horizon_returns(
             tp_price = entry_price * (1 - TP_THRESHOLD)
             sl_price = entry_price * (1 + abs(SL_THRESHOLD))
 
-        end_time = df_entry.index[i + LABEL_HORIZON]
-        future_eval_data = df_eval[(df_eval.index > entry_time) & (df_eval.index <= end_time)]
+        future_start = final_index
+        future_end = df_entry.index[i + seq_len - 1 + LABEL_HORIZON]
+        future_eval_data = df_eval[(df_eval.index > future_start) & (df_eval.index <= future_end)]
 
         if future_eval_data.empty:
-            returns_array[i] = 0.0
-            valid_samples_mask[i] = False
-            hit_counts['No Hit'] += 1 # No Hit 카운트 증가
+            returns_array[i + seq_len - 1] = 0.0
+            valid_samples_mask[i + seq_len - 1] = False
+            hit_counts['No Hit'] += 1
             logger.debug(f"[{i}] No Hit (No Future Data).")
             continue
 
@@ -186,34 +177,29 @@ def calculate_horizon_returns(
         is_tp_hit = pd.notna(tp_first_time)
         is_sl_hit = pd.notna(sl_first_time)
 
-        logger.debug(f"[{i}] is_tp_hit: {is_tp_hit}, is_sl_hit: {is_sl_hit}")
-        logger.debug(f"[{i}] tp_first_time: {tp_first_time}, sl_first_time: {sl_first_time}")
-        # logger.debug(f"[{i}] future_eval_data:\n{future_eval_data.to_string()}") # 너무 많은 로그가 발생할 수 있으므로 필요시 주석 해제
-
         if is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
             final_price = df_eval.loc[tp_first_time][close_col]
             hit_counts['TP'] += 1
-            logger.debug(f"[{i}] TP Hit. final_price: {final_price:.4f}")
         elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
             final_price = df_eval.loc[sl_first_time][close_col]
             hit_counts['SL'] += 1
-            logger.debug(f"[{i}] SL Hit. final_price: {final_price:.4f}")
         else:
             final_price = future_eval_data.iloc[-1][close_col]
             hit_counts['No Hit'] += 1
-            logger.debug(f"[{i}] No Hit. final_price: {final_price:.4f}")
 
-        # 순수 수익률 계산 (부호 변경 없음)
         ret = (final_price - entry_price) / entry_price
-        logger.debug(f"[{i}] Calculated ret: {ret:.4f}")
-        
         reward = (
             10.0 if is_tp_hit else
             -1.0 if is_sl_hit else
-            get_no_hit_reward(ret, direction) # 순수 ret을 전달
+            get_no_hit_reward(ret, direction)
         )
-        logger.debug(f"[{i}] Final reward: {reward:.4f}")
-        returns_array[i] = reward * REWARD_SCALE
+        reward_scaled = reward * REWARD_SCALE
+
+        reward_index = i + seq_len - 1
+        returns_array[reward_index] = reward_scaled
+        valid_samples_mask[reward_index] = True
+
+        logger.debug(f"[{i}] Final reward: {reward_scaled:.4f}")
 
     logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {sum(hit_counts.values())}건)")
 
@@ -250,6 +236,7 @@ def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePre
     # 5. 정렬된 마스크를 사용하여 모든 피처와 보상 필터링
     filtered_rewards = aligned_rewards[aligned_mask].values
     filtered_data_len = len(filtered_rewards)
+    logger.info(f"[DEBUG]  Mask된 학습 시퀀스 수: {len(filtered_rewards)} / 전체 시퀀스 수: {len(final_seq_index)}")
 
     filtered_features = {}
     for tf, data_array in features_dict.items():
@@ -259,6 +246,8 @@ def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePre
     # 6. 보상 생성 및 데이터셋 구성
     rewards = generate_rewards(filtered_rewards)
     returns = compute_discounted_returns(rewards, PPO_CONFIG["gamma"])
+    # discounted return 계산 직후 추가
+    logger.info(f"[DEBUG]  Discounted Return 통계: mean={returns.mean():.4f}, std={returns.std():.4f}, min={returns.min():.4f}, max={returns.max():.4f}")
 
     indices = np.arange(filtered_data_len)
     train_size = int(0.8 * filtered_data_len)
@@ -329,6 +318,20 @@ def run_value_pretraining_for(direction: str):
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+
+            # 각 배치 학습 후 추가
+            if epoch == 0 or (epoch+1) % 2 == 0:
+                with torch.no_grad():
+                    value_np = value.squeeze().detach().cpu().numpy()
+                    logger.info(f"[DEBUG]  Value 예측 분포 (배치): mean={value_np.mean():.4f}, std={value_np.std():.4f}, min={value_np.min():.4f}, max={value_np.max():.4f}")
+                    
+                total_norm = 0.0
+                for p in model.value_head.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                logger.info(f"[DEBUG]  Gradient L2 Norm (value_head): {total_norm:.6f}")
         
         train_loss /= len(train_loader)
 
@@ -349,6 +352,11 @@ def run_value_pretraining_for(direction: str):
         val_mae = mean_absolute_error(all_returns, all_preds)
         val_r2 = r2_score(all_returns, all_preds)
         current_lr = optimizer.param_groups[0]['lr']
+
+        # 에폭 마지막에 추가
+        sample_idx = np.random.randint(0, len(all_returns), size=5)
+        for idx in sample_idx:
+            logger.info(f"[DEBUG]  예측 비교: GT={all_returns[idx]:.4f}, Pred={all_preds[idx]:.4f}")
 
         logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val MAE: {val_mae:.6f} | Val R2: {val_r2:.6f} | LR: {current_lr:.1e}")
         scheduler.step(val_loss)

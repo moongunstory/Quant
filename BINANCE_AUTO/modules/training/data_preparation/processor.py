@@ -89,68 +89,55 @@ def apply_feature_processing(df: pd.DataFrame, data_type: str) -> pd.DataFrame:
     log_ohlcv_nans(df_processed, data_type, stage="after_process")
     return df_processed
 
-def create_labels(df_dict: Dict[str, pd.DataFrame], label_horizon: int = 4, direction: str = "long") -> pd.DataFrame:
+def create_labels(df_dict: Dict[str, pd.DataFrame], direction: str = "long") -> pd.DataFrame:
     """
-    15분봉 기준 라벨 생성 (5분봉 기준 TP/SL 도달 판별) -> 라벨만 반환
+    15분봉 기준 라벨 생성 (미래 정보 유출 방지 - 고정 시간 지평 수익률 기반)
     direction: 'long' 또는 'short'에 따라 라벨링 로직 변경
+    
+    **주의: 이 라벨링 방식은 TP/SL 도달 여부가 아닌, 단순히 LABEL_HORIZON 후의 가격 변화를 기반으로 합니다.**
+    **이는 미래 정보 유출을 방지하기 위함이며, 기존 TP/SL 기반 라벨링과는 의미가 다릅니다.**
     """
-    if "15min" not in df_dict or "5min" not in df_dict:
-        raise ValueError("Label creation requires both '15min' and '5min' data.")
+    if "15min" not in df_dict:
+        raise ValueError("Label creation requires '15min' data.")
 
     df_15m = df_dict["15min"].copy()
-    df_5m = df_dict["5min"].copy()
 
-    # Find close, high, low columns robustly
     close_col = next((col for col in df_15m.columns if "close" in col.lower()), None)
-    high_col = next((col for col in df_5m.columns if "high" in col.lower()), None)
-    low_col = next((col for col in df_5m.columns if "low" in col.lower()), None)
 
-    if not all([close_col, high_col, low_col]):
-        raise ValueError("Could not find required 'close', 'high', 'low' columns.")
+    if not close_col:
+        raise ValueError("Could not find required 'close' column in 15min data.")
 
     labels = pd.Series('hold', index=df_15m.index, name='label')
 
-    for i in range(len(df_15m) - label_horizon):
+    # 미래 정보 유출 방지를 위해 LABEL_HORIZON 후의 종가만 사용
+    # df_15m의 인덱스를 기준으로 LABEL_HORIZON 만큼 시프트된 종가를 가져옴
+    future_close_prices = df_15m[close_col].shift(-LABEL_HORIZON)
+
+    for i in range(len(df_15m) - LABEL_HORIZON):
         entry_time = df_15m.index[i]
         entry_price = df_15m.iloc[i][close_col]
+        
+        # LABEL_HORIZON 후의 종가
+        future_close_price = future_close_prices.iloc[i]
 
-        # 방향에 따른 TP/SL 가격 계산
-        if direction == "long":
-            tp_price = entry_price * (1 + TP_THRESHOLD)
-            sl_price = entry_price * (1 + SL_THRESHOLD)
-        elif direction == "short":
-            tp_price = entry_price * (1 + SL_THRESHOLD)
-            sl_price = entry_price * (1 + TP_THRESHOLD)
-        else:
-            raise ValueError("Direction must be 'long' or 'short'.")
-
-        end_time = df_15m.index[i + label_horizon]
-        future_5m = df_5m[(df_5m.index > entry_time) & (df_5m.index <= end_time)]
-
-        if future_5m.empty:
+        # NaN 값은 라벨링하지 않음 (데이터 끝 부분)
+        if pd.isna(future_close_price):
             continue
 
-        # 방향에 따른 TP/SL 도달 조건
         if direction == "long":
-            tp_reached_times = future_5m.index[future_5m[high_col] >= tp_price]
-            sl_reached_times = future_5m.index[future_5m[low_col] <= sl_price]
-        else:
-            tp_reached_times = future_5m.index[future_5m[low_col] <= tp_price]
-            sl_reached_times = future_5m.index[future_5m[high_col] >= sl_price]
-
-        tp_first_time = tp_reached_times.min() if not tp_reached_times.empty else pd.NaT
-        sl_first_time = sl_reached_times.min() if not sl_reached_times.empty else pd.NaT
-
-        # 라벨 할당
-        if pd.notna(tp_first_time) and pd.notna(sl_first_time):
-            if tp_first_time <= sl_first_time:
+            # LABEL_HORIZON 후 가격이 상승했으면 'long'
+            if future_close_price > entry_price:
                 labels.iloc[i] = direction
             else:
-                labels.iloc[i] = 'hold'
-        elif pd.notna(tp_first_time):
-            labels.iloc[i] = direction
-        elif pd.notna(sl_first_time):
-            labels.iloc[i] = 'hold'
+                labels.iloc[i] = 'hold' # 하락 또는 변화 없으면 'hold'
+        elif direction == "short":
+            # LABEL_HORIZON 후 가격이 하락했으면 'short'
+            if future_close_price < entry_price:
+                labels.iloc[i] = direction
+            else:
+                labels.iloc[i] = 'hold' # 상승 또는 변화 없으면 'hold'
+        else:
+            raise ValueError("Direction must be 'long' or 'short'.")
 
     return labels.to_frame()
 
@@ -218,8 +205,8 @@ def main():
 
     # 2. 라벨 생성 (방향별 라벨링)
     print("[방향별 라벨링 시작]")
-    df_labels_long = create_labels(mtf_data, LABEL_HORIZON, direction="long")
-    df_labels_short = create_labels(mtf_data, LABEL_HORIZON, direction="short")
+    df_labels_long = create_labels(mtf_data, direction="long")
+    df_labels_short = create_labels(mtf_data, direction="short")
     print("[방향별 라벨링 완료]")
 
     # 3. 깨끗한 15분봉 데이터에 라벨 병합 (데이터 유출 방지)
