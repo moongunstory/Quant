@@ -159,30 +159,35 @@ def load_mtf_data() -> Dict[str, pd.DataFrame]:
 def fit_and_save_scaler(data_dict: Dict[str, pd.DataFrame]):
     """모든 타임프레임의 피처를 결합하여 StandardScaler를 학습하고 저장합니다."""
     # 모든 타임프레임의 데이터프레임을 외부 조인으로 결합
-    combined_df = pd.DataFrame()
-    for key, df in data_dict.items():
-        if combined_df.empty:
-            combined_df = df
-        else:
-            combined_df = combined_df.join(df, how='outer', rsuffix=f'_{key}')
+    # 각 데이터프레임의 원본 컬럼 이름을 유지하기 위해 접미사(suffix)를 사용하지 않음
+    all_dfs = [df.copy() for df in data_dict.values()]
+    combined_df = pd.concat(all_dfs, axis=1)
     
-    # 모든 수치형 데이터에 대해 ffill을 적용하여 NaN 최소화
-    combined_df.ffill(inplace=True)
-    combined_df.bfill(inplace=True) # 시작 부분의 NaN도 채움
-    
+    # 중복된 인덱스를 제거하고 타임스탬프 순으로 정렬
+    combined_df = combined_df[~combined_df.index.duplicated(keep='first')].sort_index()
+
     # 라벨과 같은 비-피처 컬럼 제외
-    if 'label' in combined_df.columns:
-        combined_df = combined_df.drop(columns=['label'])
+    feature_df = combined_df.select_dtypes(include=np.number)
+    if 'label' in feature_df.columns:
+        feature_df = feature_df.drop(columns=['label'])
+
+    # 모든 수치형 데이터에 대해 ffill/bfill을 적용하여 NaN 최소화
+    feature_df.ffill(inplace=True)
+    feature_df.bfill(inplace=True)
+    
+    # NaN이 여전히 남아있다면 0으로 채움
+    feature_df.fillna(0, inplace=True)
 
     # 스케일러 학습
     scaler = StandardScaler()
-    scaler.fit(combined_df)
+    scaler.fit(feature_df)
     
     # 스케일러 저장
     os.makedirs(os.path.dirname(SCALER_PATH), exist_ok=True)
     with open(SCALER_PATH, 'wb') as f:
         pickle.dump(scaler, f)
     logger.info(f"✅ 스케일러 학습 완료 및 저장: {SCALER_PATH}")
+    logger.info(f"   - 총 {len(scaler.feature_names_in_)}개의 피처로 학습되었습니다.")
     return scaler
 
 def main():
@@ -205,7 +210,6 @@ def main():
         mtf_data["dune"] = apply_feature_processing(mtf_data["dune"], "dune")
         print("[DUNE 피처 처리 완료]")
 
-    # ✅ 추가: 스케일러 학습 및 저장 단계
     # 라벨링 전, 순수 피처 데이터만으로 스케일러를 학습
     fit_and_save_scaler(mtf_data)
 

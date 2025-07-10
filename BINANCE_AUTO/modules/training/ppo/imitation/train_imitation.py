@@ -65,44 +65,51 @@ def prepare_features(raw_data: Dict[str, pd.DataFrame], seq_len: int) -> Process
 
     all_feature_names = list(scaler.feature_names_in_)
     
+    # 기준이 될 15min 데이터와 라벨 분리
+    main_df_orig = raw_data['15min']
+    labels = main_df_orig['label']
+    target_index = main_df_orig.index
+
     processed_dfs = {}
-    for tf, df in raw_data.items():
-        if tf == '15min': # 15분봉 데이터는 라벨을 포함하고 있을 수 있음
-            label_series = df.get('label')
-            feature_df = df.drop(columns=['label'], errors='ignore')
-        else:
-            feature_df = df
-            label_series = None
+    for tf, df_orig in raw_data.items():
+        df = df_orig.copy().drop(columns=['label'], errors='ignore')
+        
+        missing_cols = set(all_feature_names) - set(df.columns)
+        if missing_cols:
+            padding_df = pd.DataFrame(0, index=df.index, columns=list(missing_cols))
+            df = pd.concat([df, padding_df], axis=1)
+        
+        df = df[all_feature_names]
+        
+        scaled_values = scaler.transform(df)
+        scaled_df = pd.DataFrame(scaled_values, index=df.index, columns=df.columns)
+        
+        original_cols = [col for col in df_orig.columns if col in scaled_df.columns and col != 'label']
+        processed_dfs[tf] = scaled_df[original_cols]
 
-        for col in all_feature_names:
-            if col not in feature_df.columns:
-                feature_df[col] = 0
-        processed_dfs[tf] = feature_df[all_feature_names]
-        if label_series is not None:
-            processed_dfs['label'] = label_series
-
-    scaled_dfs = {}
+    # target_index(15min) 기준으로 모든 데이터 재정렬
+    aligned_dfs = {}
     for tf, df in processed_dfs.items():
-        if tf == 'label': continue
-        scaled_data = scaler.transform(df)
-        scaled_dfs[tf] = pd.DataFrame(scaled_data, index=df.index, columns=df.columns)
-        logger.info(f"[{tf}] 스케일링 완료.")
+        aligned_dfs[tf] = df.reindex(target_index, method='ffill').fillna(0)
+        logger.info(f"[🔄 {tf}] 데이터를 target_index에 정렬 완료. Shape: {aligned_dfs[tf].shape}")
 
-    main_df = scaled_dfs["15min"]
-    aligned_dfs = {tf: df.reindex(main_df.index, method='ffill').fillna(0) for tf, df in scaled_dfs.items()}
-
-    sequences = {tf: [] for tf in scaled_dfs.keys()}
-    for i in range(len(main_df) - seq_len + 1):
-        for tf in scaled_dfs.keys():
-            window = aligned_dfs[tf].iloc[i : i + seq_len].values
-            sequences[tf].append(window)
+    sequences = {tf: [] for tf in aligned_dfs.keys()}
+    if len(target_index) >= seq_len:
+        for i in range(len(target_index) - seq_len + 1):
+            for tf, df in aligned_dfs.items():
+                window = df.iloc[i : i + seq_len].values
+                sequences[tf].append(window)
     
     final_features = {tf: np.array(arr) for tf, arr in sequences.items()}
-    final_index = main_df.index[seq_len - 1:]
-    input_dims = {tf: df.shape[1] for tf, df in scaled_dfs.items()}
+    final_index = target_index[seq_len - 1:]
+    input_dims = {tf: df.shape[2] for tf, df in final_features.items()} # shape[2]로 수정
     
-    # 라벨도 최종 인덱스에 맞게 슬라이싱
-    final_labels = processed_dfs['label'].reindex(final_index, method='ffill')
+    final_labels = labels.reindex(final_index)
+
+    # 라벨에 NaN이 없는지 확인
+    if final_labels.isnull().any():
+        logger.warning(f"라벨에 {final_labels.isnull().sum()}개의 NaN 값이 있습니다. 0으로 채웁니다.")
+        final_labels = final_labels.fillna(0)
 
     return ProcessedData(final_features, final_labels, input_dims, final_index)
 

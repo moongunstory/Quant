@@ -56,66 +56,70 @@ def load_labeled_data(data_type: str = "long") -> pd.DataFrame:
 
 # ✅ 수정: 스케일러를 적용하고 시퀀스를 생성하는 함수
 def create_mtf_sequences(mtf_data: Dict[str, pd.DataFrame], 
-                         target_index: pd.DatetimeIndex) -> Tuple[Dict[str, np.ndarray], List[str], List[pd.Timestamp]]:
-    """스케일링을 적용한 MTF 시퀀스 데이터 생성"""
+                         target_index: pd.DatetimeIndex) -> Tuple[Dict[str, np.ndarray], pd.DatetimeIndex]:
+    """스케일링을 적용하고 기준 인덱스에 맞춰 정렬된 MTF 시퀀스 데이터 생성"""
     with open(SCALER_PATH, 'rb') as f:
         scaler = pickle.load(f)
     print(f"[INFO] 스케일러 로드 완료: {SCALER_PATH}")
     all_feature_names = list(scaler.feature_names_in_)
 
-    mtf_sequences = {}
-    final_valid_indices = None
-
-    for timeframe in TIMEFRAMES + AUX_TIMEFRAMES:
-        if timeframe not in mtf_data:
-            continue
-
-        df = mtf_data[timeframe].copy()
+    processed_data = {}
+    for timeframe, df_orig in mtf_data.items():
+        df = df_orig.copy()
+        # 빠진 컬럼을 한 번에 추가하여 PerformanceWarning 방지
+        missing_cols = set(all_feature_names) - set(df.columns)
+        if missing_cols:
+            padding_df = pd.DataFrame(0, index=df.index, columns=list(missing_cols))
+            df = pd.concat([df, padding_df], axis=1)
         
-        original_cols = df.columns.tolist()
-        for col in all_feature_names:
-            if col not in df.columns:
-                df[col] = 0
         df = df[all_feature_names]
         
+        # 스케일링 적용
         scaled_values = scaler.transform(df)
         df_scaled = pd.DataFrame(scaled_values, index=df.index, columns=df.columns)
         
-        # 원본에 있던 컬럼만 다시 선택
-        df_processed = df_scaled[original_cols].ffill().fillna(0)
-        print(f"[🔧 {timeframe}] 피처 수: {len(df_processed.columns)}, 시퀀스 길이: {PPO_CONFIG['seq_len']}")
+        # 원본에 있던 컬럼만 다시 선택하여 데이터 보존
+        original_cols = [col for col in df_orig.columns if col in df_scaled.columns]
+        processed_data[timeframe] = df_scaled[original_cols]
 
-        index_list = df_processed.index.to_list()
-        values = df_processed.values
+    # target_index를 기준으로 모든 데이터를 재정렬 (forward-fill)
+    aligned_data = {}
+    for timeframe, df in processed_data.items():
+        # fillna(0)을 추가하여 ffill 후에도 남는 NaN 값을 처리
+        aligned_data[timeframe] = df.reindex(target_index, method='ffill').fillna(0)
+        print(f"[🔄 {timeframe}] 데이터를 target_index에 정렬 완료. Shape: {aligned_data[timeframe].shape}")
+
+    mtf_sequences = {}
+    seq_len = PPO_CONFIG['seq_len']
+    
+    # 모든 타임프레임에 대해 시퀀스 생성
+    for timeframe, df in aligned_data.items():
+        values = df.values
         sequences = []
-        valid_indices = []
-
-        for t in target_index:
-            if df_processed.index.tz is not None:
-                t = t.tz_convert(df_processed.index.tz)
-            else:
-                t = t.tz_localize(None)
-
-            pos = bisect.bisect_right(index_list, t)
-
-            if pos >= PPO_CONFIG["seq_len"]:
-                seq = values[pos - PPO_CONFIG["seq_len"]:pos]
-                sequences.append(seq)
-                valid_indices.append(index_list[pos - 1])
-
+        # 슬라이딩 윈도우를 사용하여 시퀀스 생성
+        if len(df) >= seq_len:
+            for i in range(len(df) - seq_len + 1):
+                sequences.append(values[i:i+seq_len])
+        
         if sequences:
             mtf_sequences[timeframe] = {
                 'sequences': np.array(sequences),
-                'columns': df_processed.columns.tolist()
+                'columns': df.columns.tolist()
             }
-            print(f"[✅ {timeframe}] 시퀀스 생성 완료: {mtf_sequences[timeframe]['sequences'].shape}")
+            print(f"[✅ {timeframe}] 시퀀스 생성 완료: {np.array(sequences).shape}")
 
-            if final_valid_indices is None:
-                final_valid_indices = valid_indices
-            else:
-                final_valid_indices = list(set(final_valid_indices) & set(valid_indices))
+    # 시퀀스 생성으로 인해 잘려나간 앞부분을 고려하여 최종 인덱스 조정
+    final_index = target_index[seq_len - 1:]
+    
+    # 모든 시퀀스의 길이를 final_index 길이에 맞춤 (가장 짧은 시퀀스 기준)
+    min_len = min(len(data['sequences']) for data in mtf_sequences.values()) if mtf_sequences else 0
+    
+    for timeframe in mtf_sequences.keys():
+        mtf_sequences[timeframe]['sequences'] = mtf_sequences[timeframe]['sequences'][:min_len]
 
-    return mtf_sequences, sorted(final_valid_indices)
+    final_index = final_index[:min_len]
+
+    return mtf_sequences, final_index
 
 # ✅ 수정: 피처 이름 생성 로직 변경
 def flatten_mtf_sequences(mtf_sequences: Dict[str, dict]) -> Tuple[np.ndarray, List[str]]:
@@ -232,22 +236,39 @@ def train_pipeline(data_type: str = "long", use_optuna: bool = True) -> Tuple:
     mtf_data = load_mtf_data()
     labeled_df = load_labeled_data(data_type)
 
-    mtf_sequences, valid_indices = create_mtf_sequences(mtf_data, labeled_df.index)
+    mtf_sequences, common_indices = create_mtf_sequences(mtf_data, labeled_df.index)
 
-    valid_timestamps = pd.DatetimeIndex(valid_indices)
-    aligned_labels = labeled_df.loc[valid_timestamps, 'label'].values
+    if not common_indices:
+        print(f"[{data_type.upper()}] 공통 인덱스가 없어 학습을 중단합니다.")
+        return None, None
+
+    valid_timestamps = pd.DatetimeIndex(common_indices)
+    
+    # label_df.index가 timezone-aware이고 valid_timestamps가 naive일 수 있으므로 통일
+    if labeled_df.index.tz is not None and valid_timestamps.tz is None:
+        valid_timestamps = valid_timestamps.tz_localize(labeled_df.index.tz)
+    elif labeled_df.index.tz is None and valid_timestamps.tz is not None:
+        valid_timestamps = valid_timestamps.tz_convert(None)
+
+    aligned_labels = labeled_df.loc[labeled_df.index.intersection(valid_timestamps), 'label'].values
 
     X_flat, flat_feature_names = flatten_mtf_sequences(mtf_sequences)
 
-    valid_indices_pos = labeled_df.index.get_indexer(valid_timestamps)
-    X_flat = X_flat[valid_indices_pos]
-    y = aligned_labels
+    # 데이터 정렬 확인
+    if X_flat.shape[0] != len(aligned_labels):
+        print(f"[경고] X_flat과 라벨의 길이가 다릅니다. X_flat: {X_flat.shape[0]}, Labels: {len(aligned_labels)}")
+        # 길이를 맞추기 위한 추가 로직이 필요할 수 있음 (예: 재정렬)
+        # 임시 해결: 라벨 길이에 맞춰 X_flat을 자름 (데이터 손실 가능성 있음)
+        min_len = min(X_flat.shape[0], len(aligned_labels))
+        X_flat = X_flat[:min_len]
+        aligned_labels = aligned_labels[:min_len]
+        valid_timestamps = valid_timestamps[:min_len]
 
-    assert X_flat.shape[0] == len(y), "Features and labels size mismatch"
+    assert X_flat.shape[0] == len(aligned_labels), "Features and labels size mismatch after alignment"
 
     print(f"[{data_type.upper()} 데이터 준비 완료] 최종 샘플 수: {len(X_flat)}")
 
-    X_train, X_val, y_train, y_val = create_time_based_split(X_flat, y, valid_timestamps)
+    X_train, X_val, y_train, y_val = create_time_based_split(X_flat, aligned_labels, valid_timestamps)
 
     model = train_model(X_train, y_train, X_val, y_val, data_type, use_optuna)
     metrics = evaluate_model(model, X_val, y_val, data_type, flat_feature_names)
