@@ -190,12 +190,24 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
     # Heikin-Ashi
     if any(f.startswith(prefix + "smoothed_ha") for f in features):
-        # ✅ 수정: pandas-ta 라이브러리 문제 우회를 위해 직접 구현
         ha_df = df.copy()
         ha_df['HA_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
 
-        # 첫 번째 HA_open 계산
+        # ✅ HA_open 컬럼 먼저 생성 (0으로 초기화)
+        ha_df['HA_open'] = 0.0
+
+        # ✅ 첫 HA_open 수동 지정
         ha_df.iloc[0, ha_df.columns.get_loc('HA_open')] = (df.iloc[0]['open'] + df.iloc[0]['close']) / 2
+
+        # ✅ 나머지 HA_open은 재귀 계산
+        for i in range(1, len(ha_df)):
+            ha_df.iloc[i, ha_df.columns.get_loc('HA_open')] = (
+                ha_df.iloc[i - 1]['HA_open'] + ha_df.iloc[i - 1]['HA_close']
+            ) / 2
+
+        # ✅ high/low 계산
+        ha_df['HA_high'] = ha_df[['high', 'HA_open', 'HA_close']].max(axis=1)
+        ha_df['HA_low'] = ha_df[['low', 'HA_open', 'HA_close']].min(axis=1)
 
         # 나머지 HA_open 계산 (루프 사용)
         for i in range(1, len(ha_df)):
