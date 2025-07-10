@@ -10,7 +10,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
 # === Time & Symbol Settings ===
 TZ = 'UTC'
-TIMEFRAMES = ["1min", "5min", "15min", "1H"] 
+TIMEFRAMES = ["5min", "15min", "30min", "1H"] 
 AUX_TIMEFRAMES = ["btc", "dune"] # "dune" < 일단 빼버림
 TRADE_SYMBOL = "ETHUSDT"
 FUTURES_SYMBOL = "ETHUSDT"
@@ -104,13 +104,6 @@ IMITATION_CONFIG = {
 
 # === Features Per Timeframe ===
 FEATURE_CATEGORIES_BY_TF = {
-    "1min": [
-        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
-        "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
-        "sma_10", "sma_20", "ema_10", "ema_20", "adx", "plus_di", "minus_di",
-        "atr", "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
-        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
-    ],
     "5min": [
         "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
         "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
@@ -119,6 +112,12 @@ FEATURE_CATEGORIES_BY_TF = {
         "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
     ],
     "15min": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
+        "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
+    ],
+    "30min": [
         "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
         "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
         "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
