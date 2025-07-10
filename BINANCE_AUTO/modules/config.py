@@ -10,7 +10,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
 # === Time & Symbol Settings ===
 TZ = 'UTC'
-TIMEFRAMES = ["5min", "15min", "30min", "1H"] 
+TIMEFRAMES = ["1min", "5min", "15min", "1H"] 
 AUX_TIMEFRAMES = ["btc", "dune"] # "dune" < 일단 빼버림
 TRADE_SYMBOL = "ETHUSDT"
 FUTURES_SYMBOL = "ETHUSDT"
