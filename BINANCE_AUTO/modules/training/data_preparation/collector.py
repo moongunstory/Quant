@@ -190,7 +190,20 @@ def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
     # Heikin-Ashi
     if any(f.startswith(prefix + "smoothed_ha") for f in features):
-        ha_df = ta.ha(df["open"], df["high"], df["low"], df["close"])
+        # ✅ 수정: pandas-ta 라이브러리 문제 우회를 위해 직접 구현
+        ha_df = df.copy()
+        ha_df['HA_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+
+        # 첫 번째 HA_open 계산
+        ha_df.iloc[0, ha_df.columns.get_loc('HA_open')] = (df.iloc[0]['open'] + df.iloc[0]['close']) / 2
+
+        # 나머지 HA_open 계산 (루프 사용)
+        for i in range(1, len(ha_df)):
+            ha_df.iloc[i, ha_df.columns.get_loc('HA_open')] = (ha_df.iloc[i-1]['HA_open'] + ha_df.iloc[i-1]['HA_close']) / 2
+
+        ha_df['HA_high'] = ha_df[['high', 'HA_open', 'HA_close']].max(axis=1)
+        ha_df['HA_low'] = ha_df[['low', 'HA_open', 'HA_close']].min(axis=1)
+
         if ha_df is not None and not ha_df.empty:
             if prefix + "smoothed_ha_open" in features: result_df[prefix + "smoothed_ha_open"] = ha_df["HA_open"].rolling(window=5).mean()
             if prefix + "smoothed_ha_close" in features: result_df[prefix + "smoothed_ha_close"] = ha_df["HA_close"].rolling(window=5).mean()
