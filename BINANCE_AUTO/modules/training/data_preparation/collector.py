@@ -101,14 +101,11 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
 
         all_klines.extend(klines)
 
-        # 다음 요청을 위해 마지막 캔들의 close_time + 1ms로 이동
-        last_close_time = klines[-1][6]  # close_time
+        last_close_time = klines[-1][6]
         if last_close_time >= end_ms:
             break
 
         start_ms = last_close_time + 1
-
-        # Binance API 요청 제한 대응을 위해 약간 대기 (optional)
         time.sleep(0.2)
 
     if not all_klines:
@@ -130,130 +127,92 @@ def fetch_ohlcv_with_extended_period(symbol, interval, start_str, end_str):
     df = df.dropna()
     return df
 
+# ✅ 수정: 확장된 피처를 모두 계산하도록 로직 업데이트
 def add_indicators_with_validation(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """기술적 지표 추가 + OHLCV 컬럼 포함"""
-    prefix = f"{tf}_"
+    """기술적 지표 추가 (확장된 피처 목록 사용)"""
+    is_btc = (tf == 'btc')
+    prefix = "btc_" if is_btc else ""
     features = FEATURE_CATEGORIES_BY_TF.get(tf, [])
     
-    # ⬇️ OHLCV 컬럼 포함시키기
-    result_df = df[["open", "high", "low", "close", "volume"]].copy()
+    result_df = pd.DataFrame(index=df.index)
 
-    # 1. 공통 지표 계산 (모든 TF에서 config 기반 적용)
-    if "rsi" in features and len(df) >= 14:
-        result_df[prefix + "rsi"] = ta.rsi(df["close"], length=14)
+    # 기본 OHLCV 및 파생 피처
+    if prefix + "open" in features: result_df[prefix + "open"] = df["open"]
+    if prefix + "high" in features: result_df[prefix + "high"] = df["high"]
+    if prefix + "low" in features: result_df[prefix + "low"] = df["low"]
+    if prefix + "close" in features: result_df[prefix + "close"] = df["close"]
+    if prefix + "volume" in features: result_df[prefix + "volume"] = df["volume"]
+    if prefix + "returns" in features: result_df[prefix + "returns"] = ta.percent_return(df["close"], append=True)
+    if prefix + "high_low_range" in features: result_df[prefix + "high_low_range"] = df["high"] - df["low"]
+    if prefix + "open_close_range" in features: result_df[prefix + "open_close_range"] = df["open"] - df["close"]
 
-    if "stochastic_k" in features and len(df) >= 14:
-        stoch = ta.stoch(df["high"], df["low"], df["close"], k=14)
+    # 기술적 지표
+    if prefix + "rsi" in features: result_df[prefix + "rsi"] = ta.rsi(df["close"], length=14)
+    if prefix + "stoch_k" in features or prefix + "stoch_d" in features:
+        stoch = ta.stoch(df["high"], df["low"], df["close"], k=14, d=3, append=True)
         if stoch is not None and not stoch.empty:
-            result_df[prefix + "stochastic_k"] = stoch["STOCHk_14_3_3"]
-
-    if "cci" in features and len(df) >= 20:
-        result_df[prefix + "cci"] = ta.cci(df["high"], df["low"], df["close"], length=20)
-
-    if "roc" in features and len(df) >= 10:
-        result_df[prefix + "roc"] = ta.roc(df["close"], length=10)
-
-    if "mom" in features and len(df) >= 10:
-        result_df[prefix + "mom"] = ta.mom(df["close"], length=10)
-
-    if "macd" in features and len(df) >= 26:
-        macd = ta.macd(df["close"])
+            if prefix + "stoch_k" in features: result_df[prefix + "stoch_k"] = stoch["STOCHk_14_3_3"]
+            if prefix + "stoch_d" in features: result_df[prefix + "stoch_d"] = stoch["STOCHd_14_3_3"]
+    
+    if prefix + "macd" in features or prefix + "macd_signal" in features or prefix + "macd_hist" in features:
+        macd = ta.macd(df["close"], fast=12, slow=26, signal=9, append=True)
         if macd is not None and not macd.empty:
-            result_df[prefix + "macd"] = macd["MACD_12_26_9"]
-            if "macd_signal" in features:
-                result_df[prefix + "macd_signal"] = macd["MACDs_12_26_9"]
-            if "macd_histogram" in features:
-                result_df[prefix + "macd_histogram"] = macd["MACDh_12_26_9"]
+            if prefix + "macd" in features: result_df[prefix + "macd"] = macd["MACD_12_26_9"]
+            if prefix + "macd_signal" in features: result_df[prefix + "macd_signal"] = macd["MACDs_12_26_9"]
+            if prefix + "macd_hist" in features: result_df[prefix + "macd_hist"] = macd["MACDh_12_26_9"]
 
-    if "ema_20" in features and len(df) >= 20:
-        result_df[prefix + "ema_20"] = ta.ema(df["close"], length=20)
+    if prefix + "cci" in features: result_df[prefix + "cci"] = ta.cci(df["high"], df["low"], df["close"], length=20)
+    if prefix + "roc" in features: result_df[prefix + "roc"] = ta.roc(df["close"], length=10)
+    if prefix + "sma_10" in features: result_df[prefix + "sma_10"] = ta.sma(df["close"], length=10)
+    if prefix + "sma_20" in features: result_df[prefix + "sma_20"] = ta.sma(df["close"], length=20)
+    if prefix + "sma_50" in features: result_df[prefix + "sma_50"] = ta.sma(df["close"], length=50)
+    if prefix + "ema_10" in features: result_df[prefix + "ema_10"] = ta.ema(df["close"], length=10)
+    if prefix + "ema_20" in features: result_df[prefix + "ema_20"] = ta.ema(df["close"], length=20)
+    if prefix + "ema_50" in features: result_df[prefix + "ema_50"] = ta.ema(df["close"], length=50)
 
-    if "ema_50" in features and len(df) >= 50:
-        result_df[prefix + "ema_50"] = ta.ema(df["close"], length=50)
+    if prefix + "adx" in features or prefix + "plus_di" in features or prefix + "minus_di" in features:
+        adx = ta.adx(df["high"], df["low"], df["close"], length=14, append=True)
+        if adx is not None and not adx.empty:
+            if prefix + "adx" in features: result_df[prefix + "adx"] = adx["ADX_14"]
+            if prefix + "plus_di" in features: result_df[prefix + "plus_di"] = adx["DMP_14"]
+            if prefix + "minus_di" in features: result_df[prefix + "minus_di"] = adx["DMN_14"]
 
-    if "sma_20" in features and len(df) >= 20:
-        result_df[prefix + "sma_20"] = ta.sma(df["close"], length=20)
+    if prefix + "atr" in features: result_df[prefix + "atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+    
+    if prefix + "bb_percent_b" in features or prefix + "bb_bandwidth" in features:
+        bbs = ta.bbands(df["close"], length=20, std=2, append=True)
+        if bbs is not None and not bbs.empty:
+            if prefix + "bb_percent_b" in features: result_df[prefix + "bb_percent_b"] = bbs["BBP_20_2.0"]
+            if prefix + "bb_bandwidth" in features: result_df[prefix + "bb_bandwidth"] = bbs["BBB_20_2.0"]
 
-    if "sma_50" in features and len(df) >= 50:
-        result_df[prefix + "sma_50"] = ta.sma(df["close"], length=50)
+    if prefix + "obv" in features: result_df[prefix + "obv"] = ta.obv(df["close"], df["volume"])
+    if prefix + "volume_ma_20" in features: result_df[prefix + "volume_ma_20"] = df["volume"].rolling(window=20).mean()
 
-    if "adx" in features and len(df) >= 14:
-        adx_result = ta.adx(df["high"], df["low"], df["close"], length=14)
-        if adx_result is not None and not adx_result.empty:
-            result_df[prefix + "adx"] = adx_result["ADX_14"]
+    # Heikin-Ashi
+    if any(f.startswith(prefix + "smoothed_ha") for f in features):
+        ha_df = ta.ha(df["open"], df["high"], df["low"], df["close"])
+        if ha_df is not None and not ha_df.empty:
+            if prefix + "smoothed_ha_open" in features: result_df[prefix + "smoothed_ha_open"] = ha_df["HA_open"].rolling(window=5).mean()
+            if prefix + "smoothed_ha_close" in features: result_df[prefix + "smoothed_ha_close"] = ha_df["HA_close"].rolling(window=5).mean()
+            if prefix + "smoothed_ha_high" in features: result_df[prefix + "smoothed_ha_high"] = ha_df["HA_high"].rolling(window=5).mean()
+            if prefix + "smoothed_ha_low" in features: result_df[prefix + "smoothed_ha_low"] = ha_df["HA_low"].rolling(window=5).mean()
 
-    if "atr" in features and len(df) >= 14:
-        result_df[prefix + "atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-
-    if "obv" in features:
-        result_df[prefix + "obv"] = ta.obv(df["close"], df["volume"])
-
-    if "volume_ratio" in features and len(df) >= 20:
-        volume_ma = df["volume"].rolling(window=20).mean()
-        result_df[prefix + "volume_ratio"] = df["volume"] / volume_ma
-
-    # 2. 5분봉 전용 확장 피처
-    if tf == "5min":
-        if "rsi_mean_6" in features and prefix + "rsi" in result_df.columns:
-            result_df[prefix + "rsi_mean_6"] = result_df[prefix + "rsi"].rolling(6).mean()
-        if "rsi_std_6" in features and prefix + "rsi" in result_df.columns:
-            result_df[prefix + "rsi_std_6"] = result_df[prefix + "rsi"].rolling(6).std()
-        if "macd_slope_6" in features and prefix + "macd" in result_df.columns:
-            result_df[prefix + "macd_slope_6"] = result_df[prefix + "macd"].diff().rolling(6).mean()
-        if "stochk_range_6" in features and prefix + "stochastic_k" in result_df.columns:
-            result_df[prefix + "stochk_range_6"] = result_df[prefix + "stochastic_k"].rolling(6).apply(lambda x: x.max() - x.min(), raw=True)
-
-    # Log warm-up NaNs before clipping
     log_ohlcv_nans(result_df, tf, stage="warmup")
-
-    # Drop warm-up rows where indicators produced NaNs
     result_df = result_df.dropna()
-
-    # Log after drop to confirm cleanliness
     log_ohlcv_nans(result_df, tf, stage="post_drop")
 
     return result_df
 
+# ✅ 수정: BTC 피처 생성 로직을 add_indicators_with_validation 함수로 통합
 def fetch_btc_historical_features(start_date: str, end_date: str, interval: str = "1h") -> pd.DataFrame:
     """BTC 피처 수집"""
     btc_df = fetch_ohlcv_with_extended_period("BTCUSDT", interval, start_date, end_date)
     log_ohlcv_nans(btc_df, "btc", stage="after_load")
     
-    btc_features = pd.DataFrame(index=btc_df.index)
+    # add_indicators_with_validation 함수를 사용하여 BTC 피처 계산
+    btc_features = add_indicators_with_validation(btc_df, "btc")
     
-    # BTC 피처 계산
-    btc_features["btc_return_1h"] = btc_df["close"].pct_change()
-    btc_features["btc_high_low_diff"] = (btc_df["high"] - btc_df["low"]) / btc_df["close"]
-    btc_features["btc_close_vs_high"] = (btc_df["close"] - btc_df["high"]) / btc_df["high"]
-    btc_features["btc_close_vs_low"] = (btc_df["close"] - btc_df["low"]) / btc_df["low"]
-    
-    # 캔들 패턴
-    body_size = abs(btc_df["close"] - btc_df["open"])
-    candle_range = btc_df["high"] - btc_df["low"]
-    
-    btc_features["btc_bullish"] = (btc_df["close"] > btc_df["open"]).astype(float)
-    btc_features["btc_bearish"] = (btc_df["close"] < btc_df["open"]).astype(float)
-    btc_features["btc_doji"] = (body_size < 0.1 * candle_range).astype(float)
-    
-    # doji인 경우 bullish/bearish는 0으로 설정
-    doji_mask = btc_features["btc_doji"] == 1.0
-    btc_features.loc[doji_mask, "btc_bullish"] = 0.0
-    btc_features.loc[doji_mask, "btc_bearish"] = 0.0
-    
-    # 트렌드 패턴
-    btc_features["btc_uptrend"] = ((btc_features["btc_return_1h"] > 0.005) & 
-                                  (btc_features["btc_bullish"] == 1.0)).astype(float)
-    btc_features["btc_downtrend"] = ((btc_features["btc_return_1h"] < -0.005) & 
-                                    (btc_features["btc_bearish"] == 1.0)).astype(float)
-    btc_features["btc_recovery"] = ((btc_features["btc_return_1h"] > 0) & 
-                                   (btc_features["btc_bearish"] == 1.0)).astype(float)
-    btc_features["btc_correction"] = ((btc_features["btc_return_1h"] < 0) & 
-                                     (btc_features["btc_bullish"] == 1.0)).astype(float)
-    btc_features["btc_sideways"] = ((btc_features["btc_uptrend"] + btc_features["btc_downtrend"] +
-                                    btc_features["btc_recovery"] + btc_features["btc_correction"]) == 0).astype(float)
-
-    btc_features = btc_features.fillna(0)
-    log_ohlcv_nans(btc_df, "btc", stage="post_indicator")
+    log_ohlcv_nans(btc_features, "btc", stage="post_indicator")
     return btc_features
 
 def collect_all_market_data() -> dict:
@@ -269,13 +228,12 @@ def collect_all_market_data() -> dict:
         eth_indicators = add_indicators_with_validation(eth_df, tf)
         log_ohlcv_nans(eth_indicators, tf, stage="post_indicator")
         
-        # 시작 날짜부터 필터링
         target_start_dt = pd.to_datetime(START_DATE, utc=True)
         result[tf] = eth_indicators[eth_indicators.index >= target_start_dt].copy()
         
         print(f"[완료] {tf}: {len(result[tf])} rows, {len(result[tf].columns)} features")
     
-    # 2. 보조 자산 및 외부 데이터 수집 (AUX_TIMEFRAMES 기준으로 통제)
+    # 2. 보조 자산 및 외부 데이터 수집
     for aux in AUX_TIMEFRAMES:
         if aux == "btc":
             print("[수집] BTC 피처...")
@@ -293,11 +251,10 @@ def collect_all_market_data() -> dict:
                 result["dune"] = pd.DataFrame()
                 print("[경고] DUNE 데이터 수집 실패")
 
-    # 3. 선택적 저장 (딕셔너리 구조 유지)
+    # 3. 데이터 저장
     save_dir = os.path.dirname(os.path.join(PROJECT_ROOT, RAW_DATA_PATH))
     os.makedirs(save_dir, exist_ok=True)
     
-    # 각 타임프레임별로 개별 저장
     for key, df in result.items():
         if not df.empty:
             save_path = os.path.join(save_dir, f"market_data_{key}.pkl")

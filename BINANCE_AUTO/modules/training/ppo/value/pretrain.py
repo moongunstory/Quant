@@ -9,6 +9,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Tuple
 from sklearn.metrics import mean_absolute_error, r2_score
+import pickle
+from sklearn.preprocessing import StandardScaler
 
 # 프로젝트 루트 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,55 +23,101 @@ from modules.config import (
     TRAIN_PICKLE_PATHS,
     PPO_IMITATION_MODEL_PATHS,
     VALUE_PRETRAIN_OUTPUT_PATH,
+    SCALER_PATH, # 스케일러 경로 추가
     PPO_CONFIG,
     TP_THRESHOLD, 
     SL_THRESHOLD, 
     LABEL_HORIZON
 )
 from modules.training.ppo.core.model import PPOPolicyNetwork
-from modules.training.ppo.imitation.train_imitation import (
-    prepare_features,
-    validate_data,
-    ProcessedData,
-)
+# train_imitation의 prepare_features를 더 이상 사용하지 않음
 
-# 로깅 설정 (INFO 레벨로 간소화)
+# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# ✅ 추가: 스케일러를 적용하는 새로운 prepare_features 함수
+class ProcessedData:
+    def __init__(self, features, input_dims, final_index, raw_features_for_pretrain):
+        self.features = features
+        self.input_dims = input_dims
+        self.final_index = final_index
+        self.raw_features_for_pretrain = raw_features_for_pretrain
+
+def prepare_features(raw_data: Dict[str, pd.DataFrame], seq_len: int) -> ProcessedData:
+    logger.info("데이터 전처리 및 스케일링 시작...")
+    
+    # 스케일러 로드
+    with open(SCALER_PATH, 'rb') as f:
+        scaler = pickle.load(f)
+    logger.info(f"스케일러 로드 완료: {SCALER_PATH}")
+
+    # 모든 타임프레임의 컬럼을 스케일러의 순서에 맞게 정렬
+    all_feature_names = list(scaler.feature_names_in_)
+    
+    processed_dfs = {}
+    for tf, df in raw_data.items():
+        # 현재 데이터프레임에 없는 스케일러 피처는 0으로 채움
+        for col in all_feature_names:
+            if col not in df.columns:
+                df[col] = 0
+        # 스케일러 순서에 맞게 컬럼 정렬
+        processed_dfs[tf] = df[all_feature_names]
+
+    # 스케일링 적용
+    scaled_dfs = {}
+    for tf, df in processed_dfs.items():
+        scaled_data = scaler.transform(df)
+        scaled_dfs[tf] = pd.DataFrame(scaled_data, index=df.index, columns=df.columns)
+        logger.info(f"[{tf}] 스케일링 완료.")
+
+    # 시퀀스 데이터 생성
+    # ... (기존 train_imitation.py의 prepare_features 로직과 유사하게 진행)
+    # 여기서는 15min 데이터를 기준으로 시퀀스를 생성합니다.
+    main_df = scaled_dfs["15min"]
+    
+    # 모든 타임프레임의 데이터를 15분봉 인덱스에 맞게 재정렬
+    aligned_dfs = {tf: df.reindex(main_df.index, method='ffill').fillna(0) for tf, df in scaled_dfs.items()}
+
+    # Numpy 배열로 변환 및 시퀀스 생성
+    sequences = {tf: [] for tf in scaled_dfs.keys()}
+    for i in range(len(main_df) - seq_len + 1):
+        for tf in scaled_dfs.keys():
+            window = aligned_dfs[tf].iloc[i : i + seq_len].values
+            sequences[tf].append(window)
+    
+    final_features = {tf: np.array(arr) for tf, arr in sequences.items()}
+    final_index = main_df.index[seq_len - 1:]
+    input_dims = {tf: df.shape[1] for tf, df in scaled_dfs.items()}
+
+    return ProcessedData(final_features, input_dims, final_index, raw_data)
+
+
 class ValuePretrainDataset(Dataset):
     """가치 사전 학습을 위한 데이터셋 (상태, 실제 누적 보상)"""
     def __init__(self, mtf_features: Dict[str, np.ndarray], returns: np.ndarray, indices: np.ndarray, input_dims: Dict[str, int]):
-        self.mtf_features = mtf_features  # 원본 데이터 유지
-        self.returns = returns
-        self.indices = indices  # 사용할 인덱스 목록
+        self.mtf_features = {tf: data for tf, data in mtf_features.items()} # 데이터 복사
+        self.returns = returns.copy()
+        self.indices = indices.copy()
         self.input_dims = input_dims
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        actual_idx = self.indices[idx]  # 실제 데이터 인덱스
+        actual_idx = self.indices[idx]
         
         features = {}
         for tf, data in self.mtf_features.items():
-            if actual_idx < len(data):
-                if tf in ['btc', 'dune']:
-                    # 외부 피처는 2D 유지
-                    features[tf] = torch.FloatTensor(data[actual_idx])
-                else:
-                    # 시계열 피처는 LSTM 입력에 맞게 시퀀스 차원 추가
-                    features[tf] = torch.FloatTensor(data[actual_idx])
-            else:
-                # 데이터가 없는 경우 제로 패딩
-                dim = self.input_dims[tf]
-                if tf in ['btc', 'dune']:
-                    features[tf] = torch.zeros(dim, dtype=torch.float32)
-                else:
-                    features[tf] = torch.zeros(PPO_CONFIG["seq_len"], dim, dtype=torch.float32) # 시퀀스 차원 유지
-        
+            feature_data = data[actual_idx]
+            features[tf] = torch.FloatTensor(feature_data)
+
         return features, torch.tensor(self.returns[actual_idx].item())
+
+def soft_clip(x: np.ndarray, max_abs: float = 5.0) -> np.ndarray:
+    """tanh를 이용해 보상 값을 부드럽게 클리핑"""
+    return np.tanh(x / max_abs) * max_abs
 
 def compute_discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
     """주어진 보상 시퀀스로부터 할인된 누적 보상(return)을 계산"""
@@ -100,15 +148,16 @@ def calculate_horizon_returns(
     df_entry: pd.DataFrame,
     df_eval: pd.DataFrame,
     direction: str
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
     """
-    TP/SL 기반 수익률 보상 계산 (시퀀스 마지막 시점 기준으로 reward 생성)
+    TP/SL 기반 수익률 보상 계산 및 NoHit 마스크 반환
     """
     seq_len = PPO_CONFIG["seq_len"]
     max_index = len(df_entry) - LABEL_HORIZON - seq_len + 1
 
     returns_array = np.zeros(len(df_entry), dtype=float)
     valid_samples_mask = np.zeros(len(df_entry), dtype=bool)
+    nohit_mask = np.zeros(len(df_entry), dtype=bool) # NoHit 샘플 식별용 마스크
 
     close_col = next((col for col in df_entry.columns if "close" in col.lower()), None)
     high_col = next((col for col in df_eval.columns if "high" in col.lower()), None)
@@ -120,30 +169,9 @@ def calculate_horizon_returns(
     REWARD_SCALE = 10.0
     hit_counts = {'TP': 0, 'SL': 0, 'No Hit': 0}
 
-    def get_no_hit_reward(ret: float, direction: str) -> float:
-        neutral_band = PPO_CONFIG.get("neutral_band_ratio", 0.1)
-        tp_thresh = TP_THRESHOLD
-        sl_thresh = abs(SL_THRESHOLD)
-        pos_thresh = tp_thresh * neutral_band
-
-        if direction == "long":
-            if 0 <= ret < pos_thresh:
-                return 0.0
-            if ret >= pos_thresh:
-                return (ret - pos_thresh) / (tp_thresh - pos_thresh)
-            if ret < 0:
-                return ret / sl_thresh
-        else:
-            if 0 <= ret < pos_thresh:
-                return 0.0
-            if ret >= pos_thresh:
-                return (ret - pos_thresh) / (tp_thresh - pos_thresh)
-            if ret < 0:
-                return ret / sl_thresh
-        return 0.0
-
     for i in range(max_index):
-        final_index = df_entry.index[i + seq_len - 1]
+        reward_index = i + seq_len - 1
+        final_index = df_entry.index[reward_index]
         entry_price = df_entry.loc[final_index][close_col]
 
         if direction == "long":
@@ -154,14 +182,13 @@ def calculate_horizon_returns(
             sl_price = entry_price * (1 + abs(SL_THRESHOLD))
 
         future_start = final_index
-        future_end = df_entry.index[i + seq_len - 1 + LABEL_HORIZON]
+        future_end = df_entry.index[reward_index + LABEL_HORIZON]
         future_eval_data = df_eval[(df_eval.index > future_start) & (df_eval.index <= future_end)]
 
         if future_eval_data.empty:
-            returns_array[i + seq_len - 1] = 0.0
-            valid_samples_mask[i + seq_len - 1] = False
+            returns_array[reward_index] = 0.0
+            valid_samples_mask[reward_index] = False
             hit_counts['No Hit'] += 1
-            logger.debug(f"[{i}] No Hit (No Future Data).")
             continue
 
         if direction == "long":
@@ -177,77 +204,83 @@ def calculate_horizon_returns(
         is_tp_hit = pd.notna(tp_first_time)
         is_sl_hit = pd.notna(sl_first_time)
 
+        is_no_hit = False
         if is_tp_hit and (not is_sl_hit or tp_first_time <= sl_first_time):
-            final_price = df_eval.loc[tp_first_time][close_col]
             hit_counts['TP'] += 1
+            reward = 10.0
         elif is_sl_hit and (not is_tp_hit or sl_first_time < tp_first_time):
-            final_price = df_eval.loc[sl_first_time][close_col]
             hit_counts['SL'] += 1
+            reward = -1.0
         else:
-            final_price = future_eval_data.iloc[-1][close_col]
             hit_counts['No Hit'] += 1
+            is_no_hit = True
+            reward = 0
 
-        ret = (final_price - entry_price) / entry_price
-        reward = (
-            10.0 if is_tp_hit else
-            -1.0 if is_sl_hit else
-            get_no_hit_reward(ret, direction)
-        )
         reward_scaled = reward * REWARD_SCALE
-
-        reward_index = i + seq_len - 1
         returns_array[reward_index] = reward_scaled
         valid_samples_mask[reward_index] = True
+        nohit_mask[reward_index] = is_no_hit
 
-        logger.debug(f"[{i}] Final reward: {reward_scaled:.4f}")
-
+    logger.info(f"[DEBUG]  Reward (raw) 분포: mean={np.mean(returns_array[valid_samples_mask]):.4f}, std={np.std(returns_array[valid_samples_mask]):.4f}")
     logger.info(f"   - 보상 집계: TP {hit_counts['TP']}건, SL {hit_counts['SL']}건, No Hit {hit_counts['No Hit']}건 (총 {sum(hit_counts.values())}건)")
 
-    return returns_array, valid_samples_mask, hit_counts
+    return returns_array, valid_samples_mask, nohit_mask, hit_counts
 
 def create_pretrain_data(direction: str) -> Tuple[ValuePretrainDataset, ValuePretrainDataset, Dict]:
     logger.info(f"🛠️  [{direction.upper()}] 가치 사전 학습 데이터 준비 시작")
-    raw_data = pd.read_pickle(TRAIN_PICKLE_PATHS[direction])
+    with open(TRAIN_PICKLE_PATHS[direction], 'rb') as f:
+        raw_data = pickle.load(f)
 
-    # 1. 리팩토링된 prepare_features 호출 (ProcessedData 객체 반환)
-    processed_data = prepare_features(raw_data)
+    # ✅ 수정: 스케일러를 적용하는 새로운 prepare_features 함수 사용
+    processed_data = prepare_features(raw_data, PPO_CONFIG["seq_len"])
     
     features_dict = processed_data.features
     input_dims = processed_data.input_dims
-    final_seq_index = processed_data.final_index # 시퀀싱 후의 최종 인덱스
+    final_seq_index = processed_data.final_index
     raw_features_df = processed_data.raw_features_for_pretrain
 
-    # 2. 보상 계산을 위한 데이터프레임 준비
     entry_tf, eval_tf = "15min", "5min"
     df_entry = raw_features_df[entry_tf]
     df_eval = raw_features_df[eval_tf]
 
-    # 3. 보상 및 유효 샘플 마스크 계산 (시퀀싱 전 인덱스 기준)
-    rewards_array, valid_samples_mask, _ = calculate_horizon_returns(df_entry, df_eval, direction)
+    rewards_array, valid_samples_mask, nohit_mask, _ = calculate_horizon_returns(df_entry, df_eval, direction)
 
-    # 4. 보상과 마스크를 pandas Series로 변환하여, 최종 인덱스로 정렬 (핵심 수정)
     rewards_series = pd.Series(rewards_array, index=df_entry.index)
     mask_series = pd.Series(valid_samples_mask, index=df_entry.index)
+    nohit_series = pd.Series(nohit_mask, index=df_entry.index)
 
-    # 시퀀싱 후의 최종 인덱스(final_seq_index)를 사용하여 완벽하게 정렬
-    aligned_rewards = rewards_series.loc[final_seq_index]
-    aligned_mask = mask_series.loc[final_seq_index]
+    aligned_rewards = rewards_series.reindex(final_seq_index, fill_value=0)
+    aligned_mask = mask_series.reindex(final_seq_index, fill_value=False)
+    aligned_nohit = nohit_series.reindex(final_seq_index, fill_value=False)
 
-    # 5. 정렬된 마스크를 사용하여 모든 피처와 보상 필터링
-    filtered_rewards = aligned_rewards[aligned_mask].values
+    valid_indices = final_seq_index[aligned_mask]
+    tp_sl_indices = valid_indices[~aligned_nohit.loc[valid_indices]]
+    nohit_indices = valid_indices[aligned_nohit.loc[valid_indices]]
+
+    if len(tp_sl_indices) > 0:
+        target_nohit_len = min(len(nohit_indices), 2 * len(tp_sl_indices))
+        sampled_nohit_idx = np.random.choice(nohit_indices, size=target_nohit_len, replace=False)
+        final_indices_list = np.concatenate([tp_sl_indices, sampled_nohit_idx])
+    else:
+        final_indices_list = nohit_indices
+        
+    final_indices = pd.Index(final_indices_list).sort_values()
+
+    final_mask = final_seq_index.isin(final_indices)
+
+    filtered_features = {tf: data[final_mask] for tf, data in features_dict.items()}
+    filtered_rewards = aligned_rewards[final_mask].values
     filtered_data_len = len(filtered_rewards)
-    logger.info(f"[DEBUG]  Mask된 학습 시퀀스 수: {len(filtered_rewards)} / 전체 시퀀스 수: {len(final_seq_index)}")
 
-    filtered_features = {}
-    for tf, data_array in features_dict.items():
-        # 이제 features_dict와 aligned_mask는 길이가 동일하므로 직접 필터링 가능
-        filtered_features[tf] = data_array[aligned_mask.values]
+    logger.info(f"[DEBUG]  Downsampled 학습 시퀀스 수: {filtered_data_len} / 유효 시퀀스 수: {aligned_mask.sum()}")
 
-    # 6. 보상 생성 및 데이터셋 구성
     rewards = generate_rewards(filtered_rewards)
-    returns = compute_discounted_returns(rewards, PPO_CONFIG["gamma"])
-    # discounted return 계산 직후 추가
-    logger.info(f"[DEBUG]  Discounted Return 통계: mean={returns.mean():.4f}, std={returns.std():.4f}, min={returns.min():.4f}, max={returns.max():.4f}")
+    
+    logger.info(f"[DEBUG]  Raw Reward 통계: mean={rewards.mean():.4f}, std={rewards.std():.4f}, min={rewards.min():.4f}, max={rewards.max():.4f}")
+    rewards = soft_clip(rewards, max_abs=5.0)
+    logger.info(f"[DEBUG]  Clipped Reward 통계: mean={rewards.mean():.4f}, std={rewards.std():.4f}, min={rewards.min():.4f}, max={rewards.max():.4f}")
+    
+    returns = rewards
 
     indices = np.arange(filtered_data_len)
     train_size = int(0.8 * filtered_data_len)
@@ -267,14 +300,11 @@ def run_value_pretraining_for(direction: str):
     """지정된 방향에 대해 가치망 사전 학습 실행"""
     logger.info(f"\n{'='*60}\n🎯 [{direction.upper()}] 가치망 사전 학습 시작\n{'='*60}")
     
-    # 1. 데이터 준비
     train_ds, val_ds, input_dims = create_pretrain_data(direction)
     train_loader = DataLoader(train_ds, batch_size=PPO_CONFIG["batch_size"], shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=PPO_CONFIG["batch_size"], shuffle=False)
 
-    # 2. 모델 준비
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 정책망과 가치망을 모두 가진 모델 생성
     model = PPOPolicyNetwork(
         timeframe_dims=input_dims, 
         hidden_dim=PPO_CONFIG["hidden_dim"], 
@@ -282,32 +312,42 @@ def run_value_pretraining_for(direction: str):
         create_value_head=True
     ).to(device)
 
-    # 3. 모방학습된 정책망 가중치 로드
+    hidden_dim = PPO_CONFIG["hidden_dim"]
+    model.value_head = nn.Sequential(
+        nn.Linear(hidden_dim, hidden_dim * 2),
+        nn.LayerNorm(hidden_dim * 2),
+        nn.ReLU(),
+        nn.Linear(hidden_dim * 2, 1)
+    ).to(device)
+
     imitation_policy_path = PPO_IMITATION_MODEL_PATHS[direction]
     logger.info(f"   - 모방 정책 로드: {imitation_policy_path}")
-    # strict=False로 설정하여 가치망 부분은 로드하지 않음
     model.load_state_dict(torch.load(imitation_policy_path, map_location=device), strict=False)
 
-    # 4. 가치망만 학습하도록 설정
     for name, param in model.named_parameters():
-        param.requires_grad = False  # 모든 파라미터를 기본적으로 동결
+        param.requires_grad = False
     
-    # 가치망(value_head)의 파라미터만 학습 가능하도록 설정
     for name, param in model.value_head.named_parameters():
         param.requires_grad = True
+        if "weight" in name and "norm" not in name:
+            nn.init.normal_(param, mean=0.0, std=0.1)
+        elif "bias" in name:
+            nn.init.constant_(param, 0)
 
-    # 5. 가치망 학습
     criterion = nn.MSELoss()
-    # value_head의 파라미터만 학습하도록 필터링
-    optimizer = optim.Adam(model.value_head.parameters(), lr=PPO_CONFIG["learning_rate"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    optimizer = optim.Adam(model.value_head.parameters(), lr=1e-4)
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=2, verbose=True)
 
     best_val_loss = float('inf')
-    epochs = PPO_CONFIG.get("pretrain_epochs", 10)  # 사전학습 epoch 설정
+    epochs = PPO_CONFIG.get("pretrain_epochs", 10)
 
     for epoch in range(epochs):
         model.train()
         train_loss = 0
+        batch_debug_limit = 5
+        batch_idx = 0
+
         for features, returns in train_loader:
             features = {tf: data.to(device) for tf, data in features.items()}
             returns = returns.to(device)
@@ -319,12 +359,11 @@ def run_value_pretraining_for(direction: str):
             optimizer.step()
             train_loss += loss.item()
 
-            # 각 배치 학습 후 추가
-            if epoch == 0 or (epoch+1) % 2 == 0:
+            if batch_idx < batch_debug_limit and (epoch == 0 or (epoch+1) % 2 == 0):
                 with torch.no_grad():
                     value_np = value.squeeze().detach().cpu().numpy()
                     logger.info(f"[DEBUG]  Value 예측 분포 (배치): mean={value_np.mean():.4f}, std={value_np.std():.4f}, min={value_np.min():.4f}, max={value_np.max():.4f}")
-                    
+                
                 total_norm = 0.0
                 for p in model.value_head.parameters():
                     if p.grad is not None:
@@ -332,10 +371,11 @@ def run_value_pretraining_for(direction: str):
                         total_norm += param_norm.item() ** 2
                 total_norm = total_norm ** 0.5
                 logger.info(f"[DEBUG]  Gradient L2 Norm (value_head): {total_norm:.6f}")
+
+            batch_idx += 1
         
         train_loss /= len(train_loader)
 
-        # 검증
         model.eval()
         val_loss = 0
         all_returns, all_preds = [], []
@@ -353,19 +393,19 @@ def run_value_pretraining_for(direction: str):
         val_r2 = r2_score(all_returns, all_preds)
         current_lr = optimizer.param_groups[0]['lr']
 
-        # 에폭 마지막에 추가
-        sample_idx = np.random.randint(0, len(all_returns), size=5)
-        for idx in sample_idx:
-            logger.info(f"[DEBUG]  예측 비교: GT={all_returns[idx]:.4f}, Pred={all_preds[idx]:.4f}")
+        if len(all_returns) > 5:
+            sample_idx = np.random.randint(0, len(all_returns), size=5)
+            for idx in sample_idx:
+                logger.info(f"[DEBUG]  예측 비교: GT={all_returns[idx]:.4f}, Pred={all_preds[idx]:.4f}")
 
         logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val MAE: {val_mae:.6f} | Val R2: {val_r2:.6f} | LR: {current_lr:.1e}")
+        
         scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             output_path = VALUE_PRETRAIN_OUTPUT_PATH[direction]
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            # 가치망의 state_dict만 저장
             torch.save(model.value_head.state_dict(), output_path)
 
     logger.info(f"\n{'='*60}\n✅ [{direction.upper()}] 가치망 사전 학습 완료\n{'='*60}")

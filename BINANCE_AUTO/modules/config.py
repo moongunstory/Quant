@@ -47,20 +47,19 @@ VALUE_PRETRAIN_OUTPUT_PATH = {
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo_staging", "value_short.pt"),
 }
 
-# If True, PPO training loads policy weights from imitation models
-# and value weights from VALUE_PRETRAIN_OUTPUT_PATH.
-# If False, both heads are loaded from VALUE_PRETRAIN_OUTPUT_PATH.
-USE_POLICY_FROM_IMITATION = True
-
 PPO_FINAL_MODEL_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_long.pt"),
     "short": os.path.join(PROJECT_ROOT, "data", "models", "ppo", "ppo_short.pt"),
 }
 
+SCALER_PATH = os.path.join(PROJECT_ROOT, "data", "models", "ppo", "scaler.pkl")
+
 PPO_BUFFER_PATHS = {
     "long": os.path.join(PROJECT_ROOT, "data", "buffer", "long_rollout.pkl"),
     "short": os.path.join(PROJECT_ROOT, "data", "buffer", "short_rollout.pkl"),
 }
+
+USE_POLICY_FROM_IMITATION = True
 
 # === Cache Directories ===
 CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
@@ -105,20 +104,38 @@ IMITATION_CONFIG = {
 
 # === Features Per Timeframe ===
 FEATURE_CATEGORIES_BY_TF = {
-    "15min": [
-        "rsi", "stochastic_k", "cci", "roc", "mom",
-        "macd", "macd_signal", "macd_histogram",
-        "ema_20", "ema_50", "sma_20", "sma_50",
-        "adx", "atr", "obv", "volume_ratio"
+    "1min": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
+        "sma_10", "sma_20", "ema_10", "ema_20", "adx", "plus_di", "minus_di",
+        "atr", "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
     ],
     "5min": [
-        "rsi", "stochastic_k", "macd", "macd_signal",
-        "rsi_mean_6", "rsi_std_6",
-        "macd_slope_6",
-        "stochk_range_6"
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "stoch_k", "stoch_d", "macd", "macd_signal", "macd_hist", "cci", "roc",
+        "sma_20", "sma_50", "ema_20", "ema_50", "adx", "plus_di", "minus_di",
+        "atr", "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
     ],
-    "30min": ["rsi", "macd", "ema_20", "adx"],
-    "1H": ["rsi", "ema_20", "sma_50", "adx"]
+    "15min": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
+        "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
+    ],
+    "1H": [
+        "open", "high", "low", "close", "volume", "returns", "high_low_range", "open_close_range",
+        "rsi", "macd", "macd_signal", "macd_hist", "sma_50", "ema_50", "adx", "atr",
+        "bb_percent_b", "bb_bandwidth", "obv", "volume_ma_20",
+        "smoothed_ha_open", "smoothed_ha_close", "smoothed_ha_high", "smoothed_ha_low"
+    ],
+    "btc": [ # BTC는 별도 처리 (BINANCE_INTERVAL_MAP 불필요)
+        "btc_open", "btc_high", "btc_low", "btc_close", "btc_volume",
+        "btc_returns", "btc_high_low_range", "btc_open_close_range",
+        "btc_rsi", "btc_macd", "btc_macd_signal", "btc_macd_hist",
+        "btc_smoothed_ha_open", "btc_smoothed_ha_close", "btc_smoothed_ha_high", "btc_smoothed_ha_low"
+    ]
 }
 
 # === Dune Queries ===
