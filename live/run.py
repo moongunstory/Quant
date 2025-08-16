@@ -58,7 +58,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # ~/ai_binance
 MODEL_DIR = BASE_DIR / "data" / "model"
 LOGS_DIR = BASE_DIR / "data" / "logs"
 ENABLE_TRADING = True
-TRADING_MODE = "paper"          # live / paper / shadow
+TRADING_MODE = "live"          # live / paper 
 ENABLE_ONLINE_LEARNING = True
 
 # === 텔레그램 봇 실행 옵션 ===

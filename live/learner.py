@@ -35,6 +35,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.buffers import RolloutBuffer
 import torch as th
+import copy
 
 # -----------------------
 # 경로 & 상수 (수정 가능)
@@ -353,8 +354,8 @@ class OnlineLearner:
         # RolloutBuffer 구성
         rb = RolloutBuffer(
             buffer_size=T,
-            observation_space=self.model.observation_space,
-            action_space=self.model.action_space,
+            observation_space=self.model.policy.observation_space,
+            action_space=self.model.policy.action_space,
             device=self.model.device,
             gamma=gamma,
             gae_lambda=gae_lambda,
@@ -370,10 +371,7 @@ class OnlineLearner:
 
         # 백업(롤백 대비)
         prev_state = {k: v.clone() for k, v in self.model.policy.state_dict().items()}
-        prev_optimizer = {
-            k: v.clone() for k, v in self.model.policy.optimizer.state_dict().items()
-            if isinstance(v, th.Tensor)
-        }
+        prev_optimizer = copy.deepcopy(self.model.policy.optimizer.state_dict())
 
         # 훈련 하이퍼 임시 조정
         old_lr_fn = self.model.lr_schedule
@@ -391,13 +389,14 @@ class OnlineLearner:
         # approx KL 측정: old_logp vs new_logp
         with th.no_grad():
             obs_th = th.as_tensor(obs, device=self.model.device)
-            act_th = th.as_tensor(actions, device=self.model.device)
+            act_th = th.as_tensor(actions, device=obs_th.device)
             dist = self.model.policy.get_distribution(obs_th)
             new_logp = dist.log_prob(act_th)
-            # 일부 action space에서 차원 합 필요할 수 있음 → 평균으로 스칼라화
             if new_logp.ndim > 1:
                 new_logp = new_logp.sum(-1)
-            approx_kl = float((th.as_tensor(log_probs, device=self.model.device) - new_logp).mean().abs().item())
+            approx_kl = float((th.as_tensor(log_probs, device=self.model.device) - new_logp).mean().item())
+            if approx_kl < 0:
+                approx_kl = 0.0  # 수치 잡음 보호
 
         # 하이퍼 복원
         self.model.lr_schedule = old_lr_fn
@@ -407,11 +406,7 @@ class OnlineLearner:
         # KL 가드: 초과 시 롤백
         if approx_kl > max_kl:
             self.model.policy.load_state_dict(prev_state, strict=True)
-            opt_state = self.model.policy.optimizer.state_dict()
-            for k, v in prev_optimizer.items():
-                if k in opt_state:
-                    opt_state[k] = v
-            self.model.policy.optimizer.load_state_dict(opt_state)
+            self.model.policy.optimizer.load_state_dict(prev_optimizer)
             print(f"[온라인 학습기] ❌ KL 초과({approx_kl:.4f} > {max_kl:.4f}) → 롤백")
             return False
 

@@ -8,6 +8,7 @@ Trader for ETHUSDT Futures (PPO)
 - 모드: "live" | "paper" (실제 API 주문 vs 가상 처리)
 - (추가) 온라인 학습용 롤아웃(obs/action/reward/logp/value/done) 수집 후 learn_q로 전송
 - (변경) live 모드에서는 CSV/리포트 파일 저장 비활성화(콘솔만)
+- (추가) live 모드 진입 시: 기존 TP/SL(모든 미체결) 취소 후, 3.5% SL(STOP_MARKET closePosition) 자동 예약
 
 사용:
     from queue import Queue
@@ -33,6 +34,7 @@ from queue import Queue, Empty
 from stable_baselines3 import PPO
 
 from ai_binance.live.reporting import update_trade_log, generate_report
+from ai_binance.live.execution import BinanceExecutor  # ← 신규 실행 어댑터
 
 # =====================
 # 설정
@@ -42,6 +44,7 @@ MODEL_DIR = os.path.join(BASE_DIR, "data", "model")
 REPORT_DIR = os.path.join(BASE_DIR, "data", "reports")
 LOG_DIR = os.path.join(BASE_DIR, "data", "logs")
 
+SYMBOL = "ETHUSDT"         # 실주문 대상 심볼
 WINDOW = 48                # 관찰 윈도우(학습과 동일, 4h)
 COMMISSION_SIDE = 0.0005   # 0.05%/side (진입/청산 각각)
 SLIPPAGE = 0.0001          # 0.01% 체결 슬리피지
@@ -59,6 +62,12 @@ INITIAL_CAPITAL = 100_000.0
 
 # 온라인 학습 전송 단위
 ROLLOUT_STEPS = 4096
+
+# 라이브 주문 시 기본 사이징(환경변수로 오버라이드 가능)
+# - 고정 명목 (USDT) 우선 적용, 없으면 위험비율(계좌에 적용) 사용
+DEFAULT_FIXED_USDT = float(os.getenv("TRADER_FIXED_USDT", "0") or 0)
+DEFAULT_RISK_PCT = float(os.getenv("TRADER_RISK_PCT", "0") or 0)  # 예: 0.005 = 0.5%
+DEFAULT_LEVERAGE = int(os.getenv("TRADER_LEVERAGE", "0") or 0) or None   # 미지정시 거래소 설정 그대로
 
 
 class Trader:
@@ -122,6 +131,19 @@ class Trader:
         self._roll_values: list[float] = []
         self._roll_logps: list[float] = []
         self._roll_step = 0
+
+        # ---- 라이브 실행기 ----
+        self.exec: Optional[BinanceExecutor] = None
+        self.fixed_usdt = DEFAULT_FIXED_USDT
+        self.risk_pct = DEFAULT_RISK_PCT
+        self.leverage = DEFAULT_LEVERAGE
+        if self.mode == "live" and self.api_key and self.secret_key:
+            try:
+                self.exec = BinanceExecutor(self.api_key, self.secret_key)
+                print("[트레이더] 실행 어댑터 준비 완료 (BinanceExecutor)")
+            except Exception as e:
+                print(f"[트레이더] 실행 어댑터 초기화 실패 → paper 경로로 진행: {e}")
+                self.exec = None
 
     def _get_stats(self) -> Dict:
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
@@ -193,6 +215,25 @@ class Trader:
         pnl_amount = self.eq * pnl_pct
         return pnl_amount, pnl_pct * 100.0
 
+    # ---- 라이브 주문 사이징 ----
+    def _calc_order_qty(self, price: float) -> Optional[float]:
+        """
+        실행 수량 계산:
+        - 고정 명목(USDT) 우선 → 없으면 위험비율(계좌 * risk_pct * leverage)
+        - 수량 라운딩은 execution 쪽 LOT_SIZE 필터에서 처리
+        """
+        if price <= 0:
+            return None
+        if self.fixed_usdt and self.fixed_usdt > 0:
+            nominal = float(self.fixed_usdt)
+        elif self.risk_pct and self.risk_pct > 0:
+            lev = self.leverage if self.leverage else 1
+            nominal = float(self.eq) * float(self.risk_pct) * float(lev)
+        else:
+            return None
+        qty = nominal / price
+        return max(qty, 0.0)
+
     def _open(self, side: int, price: float, ts: pd.Timestamp):
         px = price * (1 + SLIPPAGE if side == 1 else 1 - SLIPPAGE)
         fee = self.eq * COMMISSION_SIDE
@@ -202,6 +243,26 @@ class Trader:
         self.entry_time = ts
         side_str = "LONG" if side == 1 else "SHORT"
 
+        # === LIVE 주문 경로: 기존 TP/SL 취소 → 시장가 진입 → 3.5% SL 예약 ===
+        if self.mode == "live" and self.exec is not None:
+            try:
+                qty = self._calc_order_qty(px)
+                if qty is None or qty <= 0:
+                    print("[트레이더] 경고: 주문 수량이 설정되지 않아 실주문을 건너뜁니다. (TRADER_FIXED_USDT 또는 TRADER_RISK_PCT 설정 필요)")
+                else:
+                    side_str_api = "BUY" if side == 1 else "SELL"
+                    resp = self.exec.entry_with_stop(
+                        symbol=SYMBOL,
+                        side=side_str_api,
+                        quantity=qty,
+                        last_price=px,   # 체결 근사, 거래소 fillPrice로 보강 가능
+                        sl_rate=0.035    # 3.5% SL
+                    )
+                    print(f"[트레이더] LIVE 주문 실행: cancel→entry→SL 완료: {resp.get('entry', {}).get('orderId', 'n/a')}")
+            except Exception as e:
+                print(f"[트레이더] LIVE 주문 실패: {e}")
+
+        # paper/shadow 로깅은 파일 기록(단, live는 비활성)
         if self.mode != "live":
             trade_info = {
                 'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'),
@@ -336,7 +397,6 @@ class Trader:
             self.last_price = p1
 
             # ---- 거래 실행(수수료는 계좌에 반영됨) + RL 보상 계산 ----
-            original_pos = self.pos
             tx_cost = 0.0
             if target != self.pos:
                 # RL 보상용 수수료(동형화)
