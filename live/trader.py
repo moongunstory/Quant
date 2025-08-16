@@ -54,7 +54,7 @@ FUNDING_SPLIT = 96         # 8h 이벤트를 5분봉으로 분배(보상 동형�
 COOLDOWN_BARS = 12         # 전환 후 최소 대기(≈1h)
 
 # 정책 신뢰도(최대 행동확률) 필터 — 0이면 비활성
-CONF_THRESHOLD = 0.6       # 0.70=70% 이상일 때만 신규 포지션 허용 (0이면 끔)
+CONF_THRESHOLD = 0.7       # 0.70=70% 이상일 때만 신규 포지션 허용 (0이면 끔)
 
 # 로깅/저장
 PRINT_EVERY_BARS = 1       # 리포트 갱신 주기: 1바 = 5분
@@ -135,7 +135,8 @@ class Trader:
         # ---- 라이브 실행기 ----
         self.exec: Optional[BinanceExecutor] = None
         self.fixed_usdt = DEFAULT_FIXED_USDT
-        self.risk_pct = DEFAULT_RISK_PCT
+        # 사용자의 요청에 따라, 주문 수량을 자산의 99%로 고정합니다.
+        self.risk_pct = 0.99
         self.leverage = DEFAULT_LEVERAGE
         if self.mode == "live" and self.api_key and self.secret_key:
             try:
