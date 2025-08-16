@@ -49,7 +49,11 @@ from ai_binance.live.realtime_ingest import RealtimeIngest
 from ai_binance.live.trader import Trader
 from ai_binance.live.learner import OnlineLearner
 
-load_dotenv()
+# .env 파일의 절대 경로를 명시적으로 지정하여 로드합니다.
+# 이렇게 하면 스크립트가 어느 위치에서 실행되든 정확한 경로의 .env 파일을 찾을 수 있습니다.
+from pathlib import Path
+dotenv_path = Path(__file__).resolve().parent.parent.parent / '.env'
+load_dotenv(dotenv_path=dotenv_path)
 
 # =========================
 # 설정 (절대경로 버전)
