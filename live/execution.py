@@ -138,7 +138,7 @@ class BinanceExecutor:
             "symbol": symbol,
             "side": side.upper(),
             "type": "MARKET",
-            "quantity": f"{qty:.8f}",
+            "quantity": str(qty),
             "reduceOnly": "true" if reduce_only else "false",
             # "newClientOrderId": ...  # 필요시
         }
