@@ -317,11 +317,18 @@ class Trader:
         """행동/로그확률/가치 추정치를 한 번에 계산"""
         obs_t = torch.as_tensor(obs).float().unsqueeze(0)
         action, _ = self.model.predict(obs, deterministic=deterministic)
+
+        # 분포 및 로그확률 계산
         dist = self.model.policy.get_distribution(obs_t)
-        act_t = torch.as_tensor([action], dtype=torch.long, device=obs_t.device)
+        if isinstance(action, torch.Tensor):
+            act_t = action.to(dtype=torch.long, device=obs_t.device)
+        else:
+            act_t = torch.tensor(int(action), dtype=torch.long, device=obs_t.device)
+
         logp = dist.log_prob(act_t)
         if logp.ndim > 1:
             logp = logp.sum(-1)
+
         value = self.model.policy.predict_values(obs_t)
         return int(action), float(logp.cpu().item()), float(value.cpu().item())
 
