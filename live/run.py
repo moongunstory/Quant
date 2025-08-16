@@ -58,15 +58,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # ~/ai_binance
 MODEL_DIR = BASE_DIR / "data" / "model"
 LOGS_DIR = BASE_DIR / "data" / "logs"
 ENABLE_TRADING = True
-TRADING_MODE = "paper"
+TRADING_MODE = "paper"          # live / paper / shadow
 ENABLE_ONLINE_LEARNING = True
 
 # === 텔레그램 봇 실행 옵션 ===
 ENABLE_TELEGRAM_BOT = True
 TELEGRAM_BOT_PATH = BASE_DIR / "telegram_bot.py"  # .env는 telegram_bot.py가 자체 로드
 
-MIN_BUFFER_BARS   = 20_000
-TRIGGER_EVERY_BARS = 10_000
+# === 미세학습 주기(보수 프로파일) ===
+MIN_BUFFER_BARS     = 15_000   # ~52일 @5m
+TRIGGER_EVERY_BARS  = 5_000    # ~17.4일 @5m
+PROMO_COOLDOWN_BARS = 576      # 승격 후 48h 쿨다운
+
 LIVE_OUT_NAME = "best_model_live.zip"
 LIVE_OUT_PATH = MODEL_DIR / LIVE_OUT_NAME
 INGEST_QUEUE_MAX = 2
@@ -75,9 +78,6 @@ LEARN_QUEUE_MAX  = 2
 BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
 BINANCE_SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 
-# =========================
-# CSV 로거 설정
-# ========================= 
 # =========================
 # CSV 로거 설정
 # =========================
@@ -93,35 +93,39 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
-CSV_HEADER = ['timestamp', 'level', 'threadName', 'message']
-if not os.path.exists(log_file_path):
-    with open(log_file_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        writer.writeheader()
-
-class CsvFileHandler(logging.FileHandler):
-    def __init__(self, filename, mode='a', encoding=None, delay=False):
-        super().__init__(filename, mode, encoding, delay)
-    def emit(self, record):
-        msg = self.format(record)
-        row = {
-            'timestamp': datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-            'level': record.levelname,
-            'threadName': record.threadName,
-            'message': msg
-        }
-        with open(self.baseFilename, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-            writer.writerow(row)
-
-csv_handler = CsvFileHandler(log_file_path)
-csv_handler.setFormatter(logging.Formatter('%(message)s'))
-csv_handler.addFilter(TradingLogFilter())  # <-- 필터 추가
-logger.addHandler(csv_handler)
-
+# 콘솔 로거(항상 사용)
 console_handler = logging.StreamHandler(sys.__stdout__)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
+
+# 라이브 모드에서는 CSV 파일 저장 비활성화
+CSV_HEADER = ['timestamp', 'level', 'threadName', 'message']
+csv_handler = None
+if TRADING_MODE != "live":
+    if not os.path.exists(log_file_path):
+        with open(log_file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+            writer.writeheader()
+
+    class CsvFileHandler(logging.FileHandler):
+        def __init__(self, filename, mode='a', encoding=None, delay=False):
+            super().__init__(filename, mode, encoding, delay)
+        def emit(self, record):
+            msg = self.format(record)
+            row = {
+                'timestamp': datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'level': record.levelname,
+                'threadName': record.threadName,
+                'message': msg
+            }
+            with open(self.baseFilename, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+                writer.writerow(row)
+
+    csv_handler = CsvFileHandler(log_file_path)
+    csv_handler.setFormatter(logging.Formatter('%(message)s'))
+    csv_handler.addFilter(TradingLogFilter())  # <-- Trader 스레드 로그만 CSV 저장
+    logger.addHandler(csv_handler)
 
 # warnings를 로깅 WARNING 레벨로 송신 (stderr로 ERROR 찍히는 것 방지)
 logging.captureWarnings(True)
@@ -129,7 +133,8 @@ pywarn = logging.getLogger("py.warnings")
 pywarn.setLevel(logging.WARNING)
 pywarn.handlers = []
 pywarn.addHandler(console_handler)
-pywarn.addHandler(csv_handler)
+if csv_handler is not None:  # live 모드가 아니면 파일에도
+    pywarn.addHandler(csv_handler)
 
 # === stdout/stderr → logger 리다이렉트 ===
 class _StdToLog:
@@ -225,29 +230,70 @@ class OnlineLearnWorker(threading.Thread):
         self.learn_q = learn_q
         self.X_tail: Optional[pd.DataFrame] = None
         self.close_tail: Optional[pd.Series] = None
+        self.funding_tail: Optional[pd.Series] = None
         self.bars_seen = 0
         self.last_trigger_bars = 0
+        self.last_promo_bars = 0
         self.ol = OnlineLearner(out_model_name=LIVE_OUT_NAME)
         self.name = "Learner"
+
     def run(self):
         logger.info("온라인 학습 워커 시작됨")
         while True:
             pkt = self.learn_q.get()
+
+            # ---- (A) Trader → 온라인 롤아웃 패킷 처리 ----
+            # 필수 키가 있으면 rollout으로 간주
+            if isinstance(pkt, dict) and {"obs", "actions", "rewards", "dones", "values", "log_probs"} <= set(pkt.keys()):
+                try:
+                    improved = self.ol.update_from_rollout(
+                        pkt,
+                        max_kl=0.02, epochs=1, batch_size=1024, lr=5e-5,
+                        # (옵션) 최근 꼬리로 짧은 VAL도 할 수 있음
+                        X_val=self.X_tail.iloc[-3000:] if isinstance(self.X_tail, pd.DataFrame) and len(self.X_tail) >= 3000 else None,
+                        close_val=self.close_tail.iloc[-3000:] if isinstance(self.close_tail, pd.Series) and len(self.close_tail) >= 3000 else None,
+                        funding_val=self.funding_tail.iloc[-3000:] if isinstance(self.funding_tail, pd.Series) and len(self.funding_tail) >= 3000 else None,
+                        save_if_improved=True
+                    )
+                    if improved:
+                        logger.info("✅ 온라인 업데이트 저장 완료")
+                    else:
+                        logger.info("ℹ️ 온라인 업데이트 미적용(KL 초과/조건 미충족)")
+                except Exception as e:
+                    logger.error(f"온라인 업데이트 실패: {e}", exc_info=True)
+                continue  # 다음 루프
+
+            # ---- (B) Ingest → 오프라인 미세학습 패킷 처리 ----
             X: pd.DataFrame = pkt["X"]
             close: pd.Series = pkt["close"]
+            funding: Optional[pd.Series] = pkt.get("funding")  # 있을 경우 사용
+
             want_tail = max(MIN_BUFFER_BARS + TRIGGER_EVERY_BARS + 5000, 30000)
             X = X.iloc[-want_tail:].copy()
             close = close.reindex(X.index).ffill().bfill()
+            if funding is not None:
+                funding = funding.reindex(X.index).ffill().bfill()
+
             self.X_tail = X
             self.close_tail = close
+            self.funding_tail = funding
             self.bars_seen = len(X)
+
+            # 트리거 & 쿨다운
             if (self.bars_seen >= MIN_BUFFER_BARS) and (self.bars_seen - self.last_trigger_bars >= TRIGGER_EVERY_BARS):
+                # 승격 쿨다운 체크
+                if (self.bars_seen - self.last_promo_bars) < PROMO_COOLDOWN_BARS:
+                    remain = PROMO_COOLDOWN_BARS - (self.bars_seen - self.last_promo_bars)
+                    logger.info(f"쿨다운 중: {remain} bars 남음 — 미세학습 스킵")
+                    continue
+
                 self.last_trigger_bars = self.bars_seen
                 try:
                     logger.info(f"미세조정 트리거 (bars={self.bars_seen:,})")
-                    improved = self.ol.finetune_on_recent(self.X_tail, self.close_tail)
+                    improved = self.ol.finetune_on_recent(self.X_tail, self.close_tail, funding=self.funding_tail)
                     if improved:
                         logger.info("✅ 모델 성능 향상 및 저장 완료")
+                        self.last_promo_bars = self.bars_seen
                     else:
                         logger.info("❌ 성능 향상 없음")
                 except Exception as e:
@@ -305,6 +351,11 @@ def main():
             api_key=BINANCE_API_KEY,
             secret_key=BINANCE_SECRET_KEY
         )
+        # 온라인 학습 연결(Trader가 롤아웃을 직접 learn_q로 보낼 수 있도록)
+        try:
+            setattr(trader, "learn_q", learn_q)
+        except Exception:
+            pass
 
     disp = Dispatcher(ingest_q, trader_q if ENABLE_TRADING else Queue(1), learn_q if ENABLE_ONLINE_LEARNING else Queue(1))
     learn_worker = None
@@ -327,7 +378,7 @@ def main():
 
     # === 텔레그램 봇 시작 ===
     tg_runner = None
-    if ENABLE_TELEGRAM_BOT and TELEGRAM_BOT_PATH.exists():
+    if ENABLE_TELEGRAM_BOT and TRADING_MODE != "live" and TELEGRAM_BOT_PATH.exists():
         if not os.getenv("TELEGRAM_BOT_TOKEN"):
             logger.warning("텔레그램 토큰(.env: TELEGRAM_BOT_TOKEN) 미설정 — 봇 미시작")
         else:
@@ -335,7 +386,10 @@ def main():
             tg_runner.start()
             logger.info(f"텔레그램 봇 시작: {TELEGRAM_BOT_PATH}")
     else:
-        logger.warning("텔레그램 봇 비활성 또는 파일 없음")
+        if TRADING_MODE == "live":
+            logger.info("live 모드: 텔레그램/파일 로그 비활성화")
+        else:
+            logger.warning("텔레그램 봇 비활성 또는 파일 없음")
 
     try:
         while True:

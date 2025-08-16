@@ -8,7 +8,7 @@ RL Training — PPO (Enhanced, no early stop, global phase fix)
 - 탐색(엔트로피) 동적 스케줄(콜백에서 실시간 적용)
 - 조기 종료 제거: 최고 성능(VAL) 자동 저장만 유지
 - 평가 안정화: TimeLimit + n_eval_episodes=3
-- 단순 보상: reward = pos * log_return − (전환 시 수수료)
+- 보상: reward = pos * log_return − fee(거래) - fee(펀딩)
 - 에피소드 길이 제한(10k)로 피드백 주기 단축
 - 콘솔 간결, CSV 진단 기록
 """
@@ -19,7 +19,7 @@ import os
 import csv
 import time
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import gymnasium as gym
@@ -117,11 +117,17 @@ def _load_norm(split: str) -> pd.DataFrame:
         feats: List[str] = json.load(f)
     return X.reindex(columns=feats).dropna()
 
-def _load_price(split: str) -> pd.Series:
-    df = pd.read_parquet(os.path.join(RAW_DIR, f"fut_{split}_data_5m.parquet"))
+def _load_aux_data(split: str) -> Tuple[pd.Series, pd.Series]:
+    path = os.path.join(RAW_DIR, f"fut_{split}_data_5m.parquet")
+    if not os.path.exists(path):
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    df = pd.read_parquet(path)
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
-    return df.sort_index()["Close"].astype(float)
+    df = df.sort_index()
+    close = df["Close"].astype(float)
+    funding_rate = df.get("FundingRate", pd.Series(0.0, index=df.index)).astype(float)
+    return close, funding_rate
 
 # -----------------
 # 콜백: 엔트로피(탐색) 스케줄
@@ -134,15 +140,16 @@ class EntropyCoefScheduler(BaseCallback):
         return True
 
 # -----------------
-# 환경 (게이트 + 히스테리시스 + 단순 보상)
+# 환경 (게이트 + 히스테리시스 + 펀딩비 보상)
 # -----------------
 class TradingEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, X: pd.DataFrame, close: pd.Series):
+    def __init__(self, X: pd.DataFrame, close: pd.Series, funding_rate: pd.Series):
         super().__init__()
         self.X = X
         self.close = close.reindex(X.index).ffill().bfill().astype(float)
+        self.funding_rate = funding_rate.reindex(X.index).ffill().bfill().astype(float)
         self.features = X.columns.tolist()
         self.n_feat = len(self.features)
 
@@ -167,9 +174,8 @@ class TradingEnv(gym.Env):
         self.pos = 0               # -1/0/+1
         self.entry = None
         self.equity = 1.0
-        self.entry_t = None          # 포지션 진입 시점(t) 기록
+        self.entry_t = None
         self.episode_start = self.t
-        # self.total_steps_global 는 리셋하지 않음 (Phase 유지/진행)
         self.diag = {
             "n_steps": 0,
             "n_switch": 0,
@@ -195,15 +201,12 @@ class TradingEnv(gym.Env):
         return self._obs(), {}
 
     def step(self, action: int):
-        # 매 스텝 Phase 적용(게이트 강도 자동 조절)
         cfg = self._apply_phase()
         k_sigma = cfg["k_sigma"]
 
-        # 액션→목표 포지션: 0=홀드(0), 1=롱(+1), 2=숏(-1)
         requested = 0 if action == 0 else (1 if action == 1 else -1)
         target = requested
 
-        # 히스테리시스 + 변동성 게이트
         if requested != self.pos:
             volatility = float(self.vol.iloc[self.t])
             current_return = float(self.logret.iloc[self.t])
@@ -211,7 +214,7 @@ class TradingEnv(gym.Env):
             if self.pos == 0:  # 진입
                 thr_enter = FEE_BUFFER + k_sigma * volatility
                 if abs(current_return) < thr_enter:
-                    target = self.pos  # 진입 거부
+                    target = self.pos
             else:               # 청산/전환
                 thr_exit = (FEE_BUFFER + k_sigma * volatility) * HYSTERESIS_RATIO
                 if requested == 0:  # 청산
@@ -226,49 +229,42 @@ class TradingEnv(gym.Env):
         p_curr = float(self.close.iloc[self.t])
         log_ret = float(np.log(p_curr / p_prev))
 
-        # 행동(action)에 따라 목표 포지션을 먼저 확정
         original_pos = self.pos
         
-        # 전환이 발생했는지 확인하고 비용 계산
         transaction_cost = 0.0
         if target != original_pos:
             self.diag["n_switch"] += 1
-            if original_pos != 0:  # 기존 포지션 청산 비용
+            if original_pos != 0:
                 transaction_cost += COMMISSION_SIDE
-            if target != 0:        # 신규 포지션 진입 비용
+            if target != 0:
                 transaction_cost += COMMISSION_SIDE
                 self.entry = p_curr
-                self.entry_t = self.t      # << 진입 시점(t) 기록
+                self.entry_t = self.t
             else:
                 self.entry = None
-                self.entry_t = None      # << 청산 시 리셋
-            self.pos = target  # 포지션 업데이트
+                self.entry_t = None
+            self.pos = target
         
-        # 새 포지션 기준의 수익 계산
         holding_reward = float(self.pos * log_ret)
 
-        # 포지션 보유 기간 페널티 (Time Decay)
-        time_decay_penalty = 0.0
-        if self.pos != 0 and self.entry_t is not None:
-            holding_period = self.t - self.entry_t
-            grace_period_steps = 18  # 90분 / 5분/스텝 = 18 스텝
-            if holding_period > grace_period_steps:
-                time_decay_penalty = 0.00001 # 유예 기간 이후, 보유하는 매 스텝마다 작은 페널티 부과
-        
-        # 최종 보상 = 수익 - 거래 비용 - 시간 페널티
-        reward = holding_reward - transaction_cost - time_decay_penalty
+        # 펀딩비용 계산 (8시간마다 1회 적용; UTC 00:00/08:00/16:00)
+        current_funding_rate = float(self.funding_rate.iloc[self.t])
+        ts = self.X.index[self.t]
+        # 5분봉 기준: 정각(minute==0) & 8시간 배수 시각에서만 부과
+        is_funding_event = (ts.minute == 0) and (ts.hour % 8 == 0)
+        funding_fee_cost = self.pos * current_funding_rate if is_funding_event else 0.0
 
-        # 자본 업데이트(보상과 동일한 값으로 일관 반영)
+        # 최종 보상 = 보유 수익 - 거래 비용 - 펀딩 비용
+        reward = holding_reward - transaction_cost - funding_fee_cost
+
         self.equity *= float(np.exp(reward))
 
-        # 진단 누적
         self.diag["n_steps"] += 1
         self.diag["act_hist"][action] += 1
         self.diag["r_sum"] += reward
 
-        # 스텝 진행
         self.t += 1
-        self.total_steps_global += 1  # 전역 누적 증가 (Phase 경계 통과 가능)
+        self.total_steps_global += 1
 
         terminated = (
             self.t >= self._episode_len - 1
@@ -313,7 +309,6 @@ class MidLogger(BaseCallback):
             elapsed = time.time() - self._t0
 
             inner = unwrap_to_trading_env(self.model.get_env())
-            # (안전) 로그 시점에도 최신 Phase 적용
             inner._apply_phase()
 
             d = inner.diag
@@ -335,7 +330,6 @@ class MidLogger(BaseCallback):
                         act0, act1, act2, round(switch_rate, 6), round(r_mean, 8),
                         phase, k_sigma
                     ])
-            # 누적 리셋 (phase/k_sigma는 유지)
             inner.diag = {
                 "n_steps": 0,
                 "n_switch": 0,
@@ -352,26 +346,22 @@ class MidLogger(BaseCallback):
 def main():
     print("[info] Enhanced RL Training Started")
     print("🔧 Gate+Hysteresis, LR schedule, Entropy schedule, (no early stopping)")
-
-    # SB3 및 텐서보드 로그 관련 디렉토리 생성 로직을 비활성화했습니다.
-    # log_dir = os.path.join(MODEL_DIR, "sb3_logs")
-    # os.makedirs(log_dir, exist_ok=True)
+    print("✅ FundingRate cost included in reward.")
 
     # 데이터 로드
     X_train = _load_norm("train")
     X_val = _load_norm("val")
-    close_train = _load_price("train")
-    close_val = _load_price("val")
+    close_train, funding_rate_train = _load_aux_data("train")
+    close_val, funding_rate_val = _load_aux_data("val")
 
     def make_train():
-        return Monitor(TimeLimit(TradingEnv(X_train, close_train), max_episode_steps=MAX_EPISODE_STEPS))
+        return Monitor(TimeLimit(TradingEnv(X_train, close_train, funding_rate_train), max_episode_steps=MAX_EPISODE_STEPS))
     def make_val():
-        return Monitor(TimeLimit(TradingEnv(X_val, close_val), max_episode_steps=MAX_EPISODE_STEPS))
+        return Monitor(TimeLimit(TradingEnv(X_val, close_val, funding_rate_val), max_episode_steps=MAX_EPISODE_STEPS))
 
     train_env = DummyVecEnv([make_train])
     val_env = DummyVecEnv([make_val])
 
-    # 초기 ent_coef는 Phase 1 값으로 설정
     init_cfg = get_phase_config(0)
     ppo_kwargs = dict(BASE_PPO_KW, ent_coef=init_cfg["ent_coef"])
 
@@ -381,23 +371,19 @@ def main():
         device=DEVICE,
         seed=SEED,
         verbose=0,
-        tensorboard_log=None,  # 텐서보드 로그 비활성화
+        tensorboard_log=None,
         **ppo_kwargs,
     )
-    # model.set_logger(configure(log_dir, ["csv"])) # SB3 자체 로그 비활성화
 
-    # 콜백 구성
-    # csv_log = os.path.join(LOG_DIR, "train_log.csv") # train_log.csv 생성 비활성화
-    mid_logger = MidLogger(LOG_FREQ, None) # csv_path를 None으로 전달
+    mid_logger = MidLogger(LOG_FREQ, None)
     ent_sched = EntropyCoefScheduler()
 
     class EnhancedEvalCallback(EvalCallback):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self._last_eval_count = 0  # 완료된 평가 라운드 수 추적
+            self._last_eval_count = 0
 
         def _on_step(self) -> bool:
-            # 평가 직전/중 Phase 동기화(트레인/밸리데이션 양쪽)
             try:
                 unwrap_to_trading_env(self.model.get_env())._apply_phase()
                 unwrap_to_trading_env(self.eval_env)._apply_phase()
@@ -406,7 +392,6 @@ def main():
 
             cont = super()._on_step()
 
-            # 새 평가 라운드가 끝났으면 그때만 콘솔/CSV 갱신
             if hasattr(self, "evaluations_timesteps"):
                 cur_cnt = len(self.evaluations_timesteps)
                 if cur_cnt > self._last_eval_count and self.last_mean_reward is not None and np.isfinite(self.last_mean_reward):
@@ -416,8 +401,8 @@ def main():
 
     eval_cb = EnhancedEvalCallback(
         val_env,
-        best_model_save_path=MODEL_DIR,  # 최고 성능 모델 자동 저장
-        log_path=None,  # SB3 평가 로그 비활성화
+        best_model_save_path=MODEL_DIR,
+        log_path=None,
         eval_freq=EVAL_FREQ,
         n_eval_episodes=3,
         deterministic=True,
@@ -425,10 +410,8 @@ def main():
         verbose=0,
     )
 
-    # 주기적 체크포인트 저장을 비활성화하고 EvalCallback의 best model 저장 기능만 사용합니다.
     cb = CallbackList([mid_logger, ent_sched, eval_cb])
 
-    # 학습 시작
     try:
         model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=cb, progress_bar=False)
         print("[OK] Training completed")
