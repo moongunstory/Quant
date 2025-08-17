@@ -3,10 +3,10 @@
   "trend_weak",
   "vola_high",
   "vola_low",
-  "adx14_4h",
+  "adx14_5m",
   "adx14_15m",
   "adx14_1h",
-  "adx14_5m",
+  "adx14_4h",
   "hlv_5m",
   "hlv_15m",
   "hlv_1h",
@@ -32,5 +32,9 @@
   "macd_hist_5m",
   "vol_norm_15m",
   "macd_hist_15m",
-  "vol_norm_1h"
+  "vol_norm_1h",
+  "rsi14_4h",
+  "sma20_slope_5m",
+  "rsi14_15m",
+  "macd_hist_1h"
 ]

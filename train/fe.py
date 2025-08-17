@@ -193,6 +193,21 @@ def _numeric(df: pd.DataFrame) -> pd.DataFrame:
             x[c] = np.log1p(x[c].clip(lower=0))
     return x
 
+def _force_keep_features(df: pd.DataFrame) -> List[str]:
+    """
+    레짐 태그 + ADX 원시값(모든 TF)을 강제 포함.
+    df: _numeric() 통과 후의 숫자형 DataFrame
+    """
+    base_keep = ["trend_strong", "trend_weak", "vola_high", "vola_low"]
+    # 모든 타임프레임 ADX 보존 (예: adx14_5m, adx14_15m, ...)
+    adx_cols = [c for c in df.columns if c.lower().startswith("adx14_")]
+
+    seen, kept = set(), []
+    for c in base_keep + adx_cols:
+        if c in df.columns and c not in seen:
+            kept.append(c); seen.add(c)
+    return kept
+
 def _pca_feature_rank(train_df: pd.DataFrame, force_keep: List[str], top_n: int = TOP_N) -> List[str]:
     """Unsupervised ranking by PCA loading energy weighted by explained variance."""
     X = train_df.dropna()
@@ -282,7 +297,7 @@ def main() -> None:
     # 2) Feature selection on TRAIN (unsupervised PCA ranking)
     # Candidates: numeric engineered + regime tags; exclude helper atr_pct column from selection
     train_numeric = _numeric(train_merged)
-    force_keep = ["trend_strong", "trend_weak", "vola_high", "vola_low"]
+    force_keep = _force_keep_features(train_numeric)
     # ensure helper not considered
     if atr_pct_col in train_numeric.columns:
         train_numeric = train_numeric.drop(columns=[atr_pct_col])
