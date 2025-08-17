@@ -1,14 +1,12 @@
 # ai_binance/live/trader.py
 """
-Trader for ETHUSDT Futures (PPO)
-- 모델 로드 후, RealtimeIngest가 큐로 밀어주는 패킷을 소비하여 매매 수행
-- 임계치 게이트: z-score 분위수 기반(진입/전환 엄격, 청산은 히스테리시스 완화)
-- 정책 신뢰도(최대 행동확률) 필터 옵션
-- 쿨다운/수수료/슬리피지 반영
-- 모드: "live" | "paper" (실제 API 주문 vs 가상 처리)
-- (추가) 온라인 학습용 롤아웃(obs/action/reward/logp/value/done) 수집 후 learn_q로 전송
-- (변경) live 모드에서는 CSV/리포트 파일 저장 비활성화(콘솔만)
-- (추가) live 모드 진입 시: 기존 TP/SL(모든 미체결) 취소 후, 3.5% SL(STOP_MARKET closePosition) 자동 예약
+Trader for ETHUSDT Futures (PPO) — Entry/Exit 정책(같은 틱 전환 금지)
+- 학습 환경과 동일한 게이트: |logret| vs (FEE_BUFFER + kσ·vol), 청산은 히스테리시스 완화
+- 펀딩 비용: UTC 00:00/08:00/16:00 정각에만 부과(현재 pos 기준)
+- 관측: 윈도우 피처 + [pos, time_in_pos_norm, upnl_log]
+- 모드: "live" | "paper"
+- (옵션) 온라인 학습 롤아웃 큐 전송
+- live 모드: 파일 저장 비활성(콘솔만)
 
 사용:
     from queue import Queue
@@ -25,7 +23,7 @@ from __future__ import annotations
 import os
 import math
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,40 +32,48 @@ from queue import Queue, Empty
 from stable_baselines3 import PPO
 
 from ai_binance.live.reporting import update_trade_log, generate_report
-from ai_binance.live.execution import BinanceExecutor  # ← 신규 실행 어댑터
+from ai_binance.live.execution import BinanceExecutor  # 실주문 어댑터
 
 # =====================
-# 설정
+# 경로/설정
 # =====================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # ~/ai_binance
 MODEL_DIR = os.path.join(BASE_DIR, "data", "model")
 REPORT_DIR = os.path.join(BASE_DIR, "data", "reports")
 LOG_DIR = os.path.join(BASE_DIR, "data", "logs")
 
-SYMBOL = "ETHUSDT"         # 실주문 대상 심볼
-WINDOW = 48                # 관찰 윈도우(학습과 동일, 4h)
-COMMISSION_SIDE = 0.0005   # 0.05%/side (진입/청산 각각)
-SLIPPAGE = 0.0001          # 0.01% 체결 슬리피지
-FUNDING_SPLIT = 96         # 8h 이벤트를 5분봉으로 분배(보상 동형화)
+SYMBOL = "ETHUSDT"
+WINDOW = 48                # 4h
+COMMISSION_SIDE = 0.0005   # 0.05%/side
+SLIPPAGE = 0.0001          # 0.01%
 
-# 임계치 게이트(과매매 억제)
-COOLDOWN_BARS = 12         # 전환 후 최소 대기(≈1h)
+# === 학습 환경과 완전 일치하는 게이트/펀딩 상수 ===
+VOL_WIN = 24                        # ~2h 표준편차
+HYSTERESIS_RATIO = 0.5              # 청산 문턱 완화
+FEE_BUFFER = 2 * COMMISSION_SIDE    # 왕복 수수료 0.1%
 
-# 정책 신뢰도(최대 행동확률) 필터 — 0이면 비활성
-CONF_THRESHOLD = 0.7       # 0.70=70% 이상일 때만 신규 포지션 허용 (0이면 끔)
+# Phase 스케줄 (global_steps 기준)
+def get_phase_config(global_steps: int) -> Dict[str, float]:
+    if global_steps < 75_000:      # Phase 1
+        return {"k_sigma": 0.8, "phase": 1}
+    elif global_steps < 150_000:   # Phase 2
+        return {"k_sigma": 0.5, "phase": 2}
+    elif global_steps < 225_000:   # Phase 3
+        return {"k_sigma": 0.2, "phase": 3}
+    else:                          # Phase 4
+        return {"k_sigma": 0.1, "phase": 4}
 
 # 로깅/저장
-PRINT_EVERY_BARS = 1       # 리포트 갱신 주기: 1바 = 5분
+PRINT_EVERY_BARS = 1
 INITIAL_CAPITAL = 100_000.0
 
 # 온라인 학습 전송 단위
 ROLLOUT_STEPS = 4096
 
-# 라이브 주문 시 기본 사이징(환경변수로 오버라이드 가능)
-# - 고정 명목 (USDT) 우선 적용, 없으면 위험비율(계좌에 적용) 사용
+# 라이브 주문 사이징(환경변수로 오버라이드 가능)
 DEFAULT_FIXED_USDT = float(os.getenv("TRADER_FIXED_USDT", "0") or 0)
-DEFAULT_RISK_PCT = float(os.getenv("TRADER_RISK_PCT", "0") or 0)  # 예: 0.005 = 0.5%
-DEFAULT_LEVERAGE = int(os.getenv("TRADER_LEVERAGE", "0") or 0) or None   # 미지정시 거래소 설정 그대로
+DEFAULT_RISK_PCT   = float(os.getenv("TRADER_RISK_PCT", "0") or 0)   # 0.005 = 0.5%
+DEFAULT_LEVERAGE   = int(os.getenv("TRADER_LEVERAGE", "0") or 0) or None
 
 
 class Trader:
@@ -81,22 +87,23 @@ class Trader:
         if self.mode == "live" and (not api_key or not secret_key):
             print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
 
+        # 모델 로드
         best = os.path.join(MODEL_DIR, "best_model.zip")
         final = os.path.join(MODEL_DIR, "ppo_final_model.zip")
         path = best if os.path.exists(best) else final
         self.model: PPO = PPO.load(path, device="cpu")
         self.model.eval_mode = True
 
+        # 계좌/포지션 상태
         self.eq = INITIAL_CAPITAL
         self.pos = 0
         self.entry_price = None
-        self.entry_time = None
-        self.last_switch_idx = -10_000
-        self.last_conf = 0.0
+        self.entry_time: Optional[pd.Timestamp] = None
         self.last_price = None
-        self._bars = 0
 
-        self.start_time = datetime.now(timezone.utc)
+        # 스텝/통계
+        self.global_steps = 0
+        self._bars = 0
         self.total_trades = 0
         self.winning_trades = 0
         self.long_trades = 0
@@ -105,17 +112,17 @@ class Trader:
         self.short_wins = 0
         self.hold_trades = 0
 
+        # 세션/리포트
         os.makedirs(REPORT_DIR, exist_ok=True)
         os.makedirs(LOG_DIR, exist_ok=True)
         self.trade_log_path = os.path.join(LOG_DIR, "run_log.csv")
         self.report_path = os.path.join(REPORT_DIR, "trading_report.md")
         self.is_new_session = True
+        self.start_time = datetime.now(timezone.utc)
         self.session_start_time_str = self.start_time.strftime('%Y-%m-%d %H:%M:%S')
 
         print(f"[트레이더] 모드={self.mode} | 모델={os.path.basename(path)}")
         print(f"[트레이더] 시작 시각 (UTC): {self.session_start_time_str}")
-
-        # live 모드에서는 파일 출력 비활성화
         if self.mode != "live":
             self._write_report()
             print(f"[트레이더] 리포트 파일: {self.report_path}")
@@ -123,20 +130,19 @@ class Trader:
         else:
             print(f"[트레이더] live 모드: 파일 리포트/CSV 비활성화 (콘솔만 출력)")
 
-        # ---- 온라인 학습용 롤아웃 버퍼 ----
-        self._roll_obs: list[np.ndarray] = []
-        self._roll_actions: list[int] = []
-        self._roll_rewards: list[float] = []
-        self._roll_dones: list[bool] = []
-        self._roll_values: list[float] = []
-        self._roll_logps: list[float] = []
+        # 온라인 학습용 롤아웃 버퍼
+        self._roll_obs: List[np.ndarray] = []
+        self._roll_actions: List[int] = []
+        self._roll_rewards: List[float] = []
+        self._roll_dones: List[bool] = []
+        self._roll_values: List[float] = []
+        self._roll_logps: List[float] = []
         self._roll_step = 0
 
-        # ---- 라이브 실행기 ----
+        # 실행기
         self.exec: Optional[BinanceExecutor] = None
         self.fixed_usdt = DEFAULT_FIXED_USDT
-        # 사용자의 요청에 따라, 주문 수량을 자산의 99%로 고정합니다.
-        self.risk_pct = 0.99
+        self.risk_pct = DEFAULT_RISK_PCT
         self.leverage = DEFAULT_LEVERAGE
         if self.mode == "live" and self.api_key and self.secret_key:
             try:
@@ -146,6 +152,9 @@ class Trader:
                 print(f"[트레이더] 실행 어댑터 초기화 실패 → paper 경로로 진행: {e}")
                 self.exec = None
 
+    # -------------------------
+    # 리포트/통계
+    # -------------------------
     def _get_stats(self) -> Dict:
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
         long_win_rate = (self.long_wins / self.long_trades * 100) if self.long_trades > 0 else 0.0
@@ -158,12 +167,11 @@ class Trader:
 
     def _write_report(self):
         if self.mode == "live":
-            return  # live 모드에서는 파일 기록 X
+            return
         stats = self._get_stats()
-        price = self.last_price if self.last_price is not None else 0
+        price = self.last_price if self.last_price is not None else 0.0
         unrealized_amount, unrealized_pct = self._get_unrealized_pnl(price)
         pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-
         report_data = {
             'session_start_time': self.session_start_time_str,
             'initial_capital': INITIAL_CAPITAL,
@@ -183,32 +191,74 @@ class Trader:
         if self.is_new_session:
             self.is_new_session = False
 
-    def _build_obs(self, X: pd.DataFrame, t: int) -> np.ndarray:
+    # -------------------------
+    # 관측 구성 (윈도우 + 상태피처3)
+    # -------------------------
+    def _state_vec(self, price_series: pd.Series, t: int) -> np.ndarray:
+        time_in_pos = 0 if self.entry_time is None else int((price_series.index[t] - self.entry_time).total_seconds() // 300)
+        time_in_pos_norm = min(time_in_pos, 1000) / 1000.0
+        if self.entry_price is None or self.pos == 0:
+            upnl_log = 0.0
+        else:
+            upnl_log = float(np.log(float(price_series.iloc[t]) / float(self.entry_price))) * float(self.pos)
+        return np.array([float(self.pos), float(time_in_pos_norm), float(upnl_log)], dtype=np.float32)
+
+    def _build_obs(self, X: pd.DataFrame, close: pd.Series, t: int) -> np.ndarray:
+        # X: 정규화된 피처(5m 확정바 인덱스, UTC), WINDOW 길이 보장
         if t >= WINDOW - 1:
             w = X.iloc[t - (WINDOW - 1): t + 1].values
         else:
             pad = np.tile(X.iloc[[0]].values, (WINDOW - (t + 1), 1))
             w = np.vstack([pad, X.iloc[:t + 1].values])
-        return w.reshape(-1).astype(np.float32)
+        return np.concatenate([w.reshape(-1).astype(np.float32), self._state_vec(close, t)], axis=0)
 
     @torch.no_grad()
-    def _policy_confidence(self, obs: np.ndarray) -> float:
-        try:
-            obs_t = torch.as_tensor(obs).float().unsqueeze(0)
-            dist = self.model.policy.get_distribution(obs_t)
-            probs = torch.softmax(dist.distribution.logits, dim=-1).cpu().numpy()[0]
-            return float(np.max(probs))
-        except Exception:
-            return 1.0
+    def _action_logp_value(self, obs: np.ndarray, deterministic: bool = True) -> tuple[int, float, float]:
+        obs_t = torch.as_tensor(obs).float().unsqueeze(0)
+        action, _ = self.model.predict(obs, deterministic=deterministic)
 
-    def _gate(self, t: int, target: int) -> int:
-        if target != self.pos and (t - self.last_switch_idx) < COOLDOWN_BARS:
-            return self.pos
-        if CONF_THRESHOLD > 0 and target != self.pos and target != 0:
-            if self.last_conf < CONF_THRESHOLD:
-                return self.pos
-        return target
+        dist = self.model.policy.get_distribution(obs_t)
+        act_t = torch.tensor(int(action), dtype=torch.long, device=obs_t.device)
+        logp = dist.log_prob(act_t)
+        if logp.ndim > 1:
+            logp = logp.sum(-1)
+        value = self.model.policy.predict_values(obs_t)
+        return int(action), float(logp.cpu().item()), float(value.cpu().item())
 
+    # -------------------------
+    # 액션 해석(상태별) + 게이트(환경과 동일)
+    # -------------------------
+    @staticmethod
+    def _interpret_action(raw_action: int, pos: int) -> int:
+        # 반환: 목표 pos ∈ {-1,0,1}. 전환 금지.
+        if pos == 0:  # 무포지션: 0=패스, 1=진입롱, 2=진입숏
+            if raw_action == 1: return +1
+            if raw_action == 2: return -1
+            return 0
+        else:         # 보유중: 0=홀드, 1=청산, 2=홀드
+            if raw_action == 1: return 0
+            return pos
+
+    @staticmethod
+    def _is_funding_event(ts: pd.Timestamp) -> bool:
+        # 5분봉 정각 & 8시간 배수(UTC 00/08/16)
+        return (getattr(ts, "minute", 0) == 0) and (getattr(ts, "hour", 0) % 8 == 0)
+
+    def _gate(self, desired_target: int, logret_t: float, vol_t: float) -> int:
+        if desired_target == self.pos:
+            return desired_target
+        k_sigma = get_phase_config(self.global_steps)["k_sigma"]
+        thr_enter = FEE_BUFFER + k_sigma * float(vol_t)
+        thr_exit  = HYSTERESIS_RATIO * thr_enter
+        z = abs(float(logret_t))  # |logret|
+        if self.pos == 0:  # 진입
+            return desired_target if z >= thr_enter else self.pos
+        else:              # 청산
+            return 0 if (desired_target == 0 and z >= thr_exit) else self.pos
+
+    # -------------------------
+    # 주문/정산
+    # -------------------------
     def _get_unrealized_pnl(self, current_price: float) -> tuple[float, float]:
         if self.pos == 0 or self.entry_price is None or current_price == 0:
             return 0.0, 0.0
@@ -216,13 +266,7 @@ class Trader:
         pnl_amount = self.eq * pnl_pct
         return pnl_amount, pnl_pct * 100.0
 
-    # ---- 라이브 주문 사이징 ----
     def _calc_order_qty(self, price: float) -> Optional[float]:
-        """
-        실행 수량 계산:
-        - 고정 명목(USDT) 우선 → 없으면 위험비율(계좌 * risk_pct * leverage)
-        - 수량 라운딩은 execution 쪽 LOT_SIZE 필터에서 처리
-        """
         if price <= 0:
             return None
         if self.fixed_usdt and self.fixed_usdt > 0:
@@ -244,7 +288,6 @@ class Trader:
         self.entry_time = ts
         side_str = "LONG" if side == 1 else "SHORT"
 
-        # === LIVE 주문 경로: 기존 TP/SL 취소 → 시장가 진입 → 3.5% SL 예약 ===
         if self.mode == "live" and self.exec is not None:
             try:
                 qty = self._calc_order_qty(px)
@@ -256,14 +299,13 @@ class Trader:
                         symbol=SYMBOL,
                         side=side_str_api,
                         quantity=qty,
-                        last_price=px,   # 체결 근사, 거래소 fillPrice로 보강 가능
-                        sl_rate=0.035    # 3.5% SL
+                        last_price=px,
+                        sl_rate=0.035
                     )
                     print(f"[트레이더] LIVE 주문 실행: cancel→entry→SL 완료: {resp.get('entry', {}).get('orderId', 'n/a')}")
             except Exception as e:
                 print(f"[트레이더] LIVE 주문 실패: {e}")
 
-        # paper/shadow 로깅은 파일 기록(단, live는 비활성)
         if self.mode != "live":
             trade_info = {
                 'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'),
@@ -286,7 +328,7 @@ class Trader:
         self.total_trades += 1
         if net_pnl > 0:
             self.winning_trades += 1
-        
+
         side_str = "LONG" if self.pos == 1 else "SHORT"
         if self.pos == 1:
             self.long_trades += 1
@@ -297,7 +339,7 @@ class Trader:
 
         holding_time = ts - self.entry_time
         duration_str = f"{int(holding_time.total_seconds() // 60)}m {int(holding_time.total_seconds() % 60)}s"
-        
+
         if self.mode != "live":
             trade_info = {
                 'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'),
@@ -313,26 +355,80 @@ class Trader:
         self.entry_price = None
         self.entry_time = None
 
-    @torch.no_grad()
-    def _action_logp_value(self, obs: np.ndarray, deterministic: bool = True) -> tuple[int, float, float]:
-        """행동/로그확률/가치 추정치를 한 번에 계산"""
-        obs_t = torch.as_tensor(obs).float().unsqueeze(0)
-        action, _ = self.model.predict(obs, deterministic=deterministic)
+    # -------------------------
+    # 메인 루프
+    # -------------------------
+    def run(self):
+        print("[트레이더] 실행 중... (큐에서 데이터 읽기 대기)")
+        while True:
+            try:
+                pkt = self.q.get(timeout=300)
+            except Empty:
+                print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 데이터 수신 대기 중... 리포트 갱신.")
+                self._write_report()
+                continue
 
-        # 분포 및 로그확률 계산
-        dist = self.model.policy.get_distribution(obs_t)
-        if isinstance(action, torch.Tensor):
-            act_t = action.to(dtype=torch.long, device=obs_t.device)
-        else:
-            act_t = torch.tensor(int(action), dtype=torch.long, device=obs_t.device)
+            # 인제스트 패킷
+            X: pd.DataFrame = pkt["X"]           # 정규화 피처, DatetimeIndex(UTC)
+            close: pd.Series = pkt["close"]      # 종가 시리즈(동일 인덱스)
+            ts: pd.Timestamp = pkt["ts"]         # 현재 바 타임스탬프(UTC)
+            funding_rate = float(pkt.get("funding_rate", 0.0))  # 이벤트 시각이면 유효
 
-        logp = dist.log_prob(act_t)
-        if logp.ndim > 1:
-            logp = logp.sum(-1)
+            if len(X) < WINDOW:
+                continue
 
-        value = self.model.policy.predict_values(obs_t)
-        return int(action), float(logp.cpu().item()), float(value.cpu().item())
+            t = len(X) - 1
+            obs = self._build_obs(X, close, t)
 
+            # 정책 결정
+            action, logp, value = self._action_logp_value(obs, deterministic=True)
+
+            # 로그수익/변동성 (환경 동일)
+            lr = float(np.log(float(close.iloc[t]) / float(close.iloc[t - 1]))) if t > 0 else 0.0
+            vol_t = float(np.log(close / close.shift(1)).rolling(VOL_WIN, min_periods=1).std().iloc[t])
+
+            # 상태별 해석 → 게이트
+            desired = self._interpret_action(int(action), self.pos)
+            target = self._gate(desired, lr, vol_t)
+
+            # 표시용 마크투마켓
+            p1 = float(close.iloc[t])
+            if self.pos != 0 and self.last_price is not None:
+                lr_mark = math.log(p1 / self.last_price)
+                self.eq *= math.exp((+1 if self.pos == 1 else -1) * lr_mark)
+            self.last_price = p1
+
+            # 체결/수수료(동형)
+            tx_cost = 0.0
+            if target != self.pos:
+                if self.pos != 0: tx_cost += COMMISSION_SIDE
+                if target != 0:   tx_cost += COMMISSION_SIDE
+                if self.pos != 0: self._close(p1, ts)
+                if target != 0:   self._open(target, p1, ts)
+
+            # RL 보상(환경 동일): 보유수익 - 수수료 - 펀딩(이벤트 시에만)
+            holding_reward = (self.pos * lr)
+            funding_penalty = (self.pos * funding_rate) if self._is_funding_event(ts) else 0.0
+            rl_reward = holding_reward - tx_cost - funding_penalty
+
+            # 롤아웃 적재
+            self._roll_step += 1
+            done = (self._roll_step % ROLLOUT_STEPS == 0)
+            self._push_rollout(obs, action, rl_reward, done, logp, value)
+
+            # 리포트/상태 출력
+            self._bars += 1
+            if self._bars % PRINT_EVERY_BARS == 0:
+                self._write_report()
+                pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
+                print(f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Status: {pos_str} | Equity: ${self.eq:,.2f}")
+
+            # phase 스텝 증가
+            self.global_steps += 1
+
+    # -------------------------
+    # 롤아웃 처리
+    # -------------------------
     def _push_rollout(self, obs: np.ndarray, action: int, reward: float, done: bool, logp: float, value: float):
         self._roll_obs.append(obs.astype(np.float32))
         self._roll_actions.append(int(action))
@@ -361,77 +457,3 @@ class Trader:
                 self._roll_dones.clear()
                 self._roll_logps.clear()
                 self._roll_values.clear()
-
-    def run(self):
-        print("[트레이더] 실행 중... (큐에서 데이터 읽기 대기)")
-        while True:
-            try:
-                pkt = self.q.get(timeout=300)
-            except Empty:
-                print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 데이터 수신 대기 중... 리포트 갱신.")
-                self._write_report()
-                continue
-
-            X: pd.DataFrame = pkt["X"]
-            close: pd.Series = pkt["close"]
-            ts: pd.Timestamp = pkt["ts"]
-            # (옵션) 인제스트가 제공하면 현재 펀딩 비율 사용, 없으면 0
-            funding_rate = float(pkt.get("funding_rate", 0.0))
-
-            if len(X) < 5:
-                continue
-
-            t = len(X) - 1
-            obs = self._build_obs(X, t)
-            self.last_conf = self._policy_confidence(obs)
-
-            # 정책 결정 + 로그확률/가치
-            act, logp, value = self._action_logp_value(obs, deterministic=True)
-            target = 0 if act == 0 else (1 if act == 1 else -1)
-            target = self._gate(t, target)
-
-            if target == 0:
-                self.hold_trades += 1
-
-            # 가격/수익률
-            p1 = float(close.iloc[t])
-            p0 = float(close.iloc[t - 1]) if t > 0 else p1
-            lr = math.log(p1 / p0)
-
-            # 기존 포지션으로 에쿼티 마크투마켓 (표시 목적)
-            if self.pos != 0 and self.last_price is not None:
-                lr_mark = math.log(p1 / self.last_price)
-                self.eq *= math.exp((+1 if self.pos == 1 else -1) * lr_mark)
-            self.last_price = p1
-
-            # ---- 거래 실행(수수료는 계좌에 반영됨) + RL 보상 계산 ----
-            tx_cost = 0.0
-            if target != self.pos:
-                # RL 보상용 수수료(동형화)
-                if self.pos != 0:
-                    tx_cost += COMMISSION_SIDE
-                if target != 0:
-                    tx_cost += COMMISSION_SIDE
-                # 실제 포지션 변경
-                if self.pos != 0:
-                    self._close(p1, ts)
-                if target != 0:
-                    self._open(target, p1, ts)
-                self.last_switch_idx = t
-
-            # 포지션은 이제 self.pos == target
-            holding_reward = (self.pos * lr)
-            funding_penalty = self.pos * (funding_rate / FUNDING_SPLIT) if funding_rate else 0.0
-            rl_reward = holding_reward - tx_cost - funding_penalty
-
-            # ---- 롤아웃 버퍼 적재 & 전송 ----
-            self._roll_step += 1
-            done = (self._roll_step % ROLLOUT_STEPS == 0)
-            self._push_rollout(obs, act, rl_reward, done, logp, value)
-
-            # ---- 리포트/상태 출력 ----
-            self._bars += 1
-            if self._bars % PRINT_EVERY_BARS == 0:
-                self._write_report()
-                pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-                print(f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Status: {pos_str} | Equity: ${self.eq:,.2f} | Confidence: {self.last_conf:.2f}")

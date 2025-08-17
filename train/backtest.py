@@ -1,32 +1,22 @@
 # ai_binance/backtest.py
 """
-Module 4 — Backtest for Trained RL Models (환경 일치 + 임계치 게이트 + 쿨다운)
+Backtest for Trained RL Models — Minimal Causal Environment
 
 핵심
-- 학습 환경과 동일한 로그-보상 체계:
-  reward = pos * log_return − (포지션 변경 시 수수료(사이드당 0.05%))
-  equity *= exp(reward)
-- 임계치(분위수) 기반 게이트 + 히스테리시스 + 쿨다운으로 과매매 억제
-- 예측은 결정론(deterministic=True)로 재현성 보장
-- 체결(사이드), 라운드트립(오픈 수), 수수료(달러) 현실적으로 집계
-- 결과 저장: trades / summary / 차트
-
-실행:
-  python ai_binance/backtest.py
-
-산출:
-  - 거래 내역: ./ai_binance/data/reports/backtest_trades.csv
-  - 성과 요약: ./ai_binance/data/reports/backtest_summary.csv
-  - 에쿼티:   ./ai_binance/data/reports/backtest_equity.csv
-  - 차트:     ./ai_binance/data/reports/backtest_chart.png
+- 학습 환경과 동일한 규칙(게이트/히스테리시스 없음)
+  reward_t = prev_pos*log_return(t) − fee(체결시; per-side 0.05%) − funding(prev_pos)
+  포지션 지시는 같은 틱에 내려도, 포지션은 다음 틱부터 유효
+- 스위칭은 "청산+진입"으로 2사이드 비용
+- 결과: trades / summary / 차트
 """
+
 from __future__ import annotations
 
 import os
 import json
 import warnings
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,17 +32,10 @@ RAW_DIR = "./ai_binance/data/raw"
 MODEL_DIR = "./ai_binance/data/model"
 REPORT_DIR = "./ai_binance/data/reports"
 
-# ===== 백테스트 기본 =====
+# ===== 상수 =====
 INITIAL_CAPITAL = 100_000.0
-COMMISSION_SIDE = 0.0005      # 0.05% / side
-WINDOW = 48                   # 4h context (5m * 48)
-
-# ===== 임계치(스윕) 게이트 =====
-ADAPTIVE_GATE = True          # 분위수 게이트 사용
-ZWIN = 7 * 288                # 7일 롤링(5m=하루 288바)
-Q_ENTER = 0.90                # 상위 10%만 진입 허용
-H_EXIT = 0.6                  # 청산 임계 완화(히스테리시스)
-COOLDOWN_BARS = 12            # 최근 전환 후 최소 대기(1h)
+COMMISSION_SIDE = 0.0005        # 0.05% / side
+WINDOW = 48                     # 4h (5m * 48)
 
 # ===== 결과 데이터클래스 =====
 @dataclass
@@ -78,19 +61,19 @@ class BacktestResults:
     winning_trades: int
     losing_trades: int
     win_rate: float               # %
-    avg_trade_return: float       # % (라운드트립 기준)
+    avg_trade_return: float       # %
 
     # 포지션 통계
     long_trades: int
     short_trades: int
     hold_ratio: float             # %
 
-    # 비용
-    total_commission: float       # $
+    # 비용(USD)
+    total_commission: float
     commission_ratio: float       # % of initial
 
 # ===== 데이터 로드 =====
-def load_test_data() -> Tuple[pd.DataFrame, pd.Series]:
+def load_test_data() -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     X = pd.read_parquet(os.path.join(PROC_DIR, "test_normalized.parquet"))
     feats = json.load(open(os.path.join(PROC_DIR, "feature_list.json"), "r"))
     X = X.reindex(columns=feats).dropna()
@@ -98,11 +81,14 @@ def load_test_data() -> Tuple[pd.DataFrame, pd.Series]:
     df = pd.read_parquet(os.path.join(RAW_DIR, "fut_test_data_5m.parquet"))
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
-    close = df.sort_index()["Close"].astype(float).reindex(X.index).ffill().bfill()
+    df = df.sort_index()
+
+    close = df["Close"].astype(float).reindex(X.index).ffill().bfill()
+    funding = df.get("FundingRate", pd.Series(0.0, index=df.index)).astype(float).reindex(X.index).ffill().bfill()
 
     print(f"Test data loaded: {len(X):,} rows")
     print(f"Period: {X.index[0]} ~ {X.index[-1]}")
-    return X, close
+    return X, close, funding
 
 def load_model() -> PPO:
     best = os.path.join(MODEL_DIR, "best_model.zip")
@@ -115,186 +101,147 @@ def load_model() -> PPO:
 # ===== 백테스트 엔진 =====
 class BacktestEngine:
     """
-    학습 환경과 동일한 로그-보상/수수료 규칙.
-    수수료: 포지션 변경 시에만 사이드당 0.05%를 로그-보상에서 차감,
-           달러 수수료는 당시 에쿼티×0.0005로 누적.
-    임계치 게이트: z = |logret| / vol; 롤링 분위수(Q_ENTER) 이상만 진입/전환 허용, 청산은 완화(H_EXIT).
-    쿨다운: 최근 전환 후 COOLDOWN_BARS 동안 전환 금지.
+    - 액션: {0=홀드/패스, 1=롱, 2=숏} → 다음 틱 포지션으로 적용
+    - 스위칭은 2사이드 비용
+    - 보상: prev_pos * log_ret(t) − fee − funding(prev_pos)
     """
-    def __init__(self, model: PPO, X: pd.DataFrame, prices: pd.Series):
+    def __init__(self, model: PPO, X: pd.DataFrame, prices: pd.Series, funding: pd.Series):
         self.model = model
         self.X = X
         self.p = prices.reindex(X.index).ffill().bfill().astype(float)
+        self.funding = funding.reindex(X.index).ffill().bfill().astype(float)
         self.nf = X.shape[1]
 
         # 프리컴퓨트
         self.logret = np.log(self.p / self.p.shift(1)).fillna(0.0)
-        vol = self.logret.rolling(24, min_periods=1).std().fillna(0.0)  # ~2h
-        self.z = (self.logret.abs() / (vol + 1e-12)).fillna(0.0)
-        if ADAPTIVE_GATE:
-            self.z_thr = (
-                self.z.rolling(ZWIN, min_periods=max(50, ZWIN // 4))
-                .apply(lambda x: np.quantile(x, Q_ENTER), raw=True)
-                .shift(1)
-                .bfill()
-            )
+
         self.reset()
 
+    # ----- 상태 관리 -----
     def reset(self):
         self.t = WINDOW
-        self.pos = 0                  # -1/0/+1
+        self.pos = 0
         self.entry = None
         self.entry_time = None
-        self.equity = 1.0             # 로그 프레임(배율)
-        self.last_switch_t = -10_000
-        self.exec_sides = 0
-        self.open_count = 0
-        self.switch_count = 0
-        self.fee_log_sum = 0.0
-        self.fee_usd_sum = 0.0
+        self.equity = 1.0
 
-        self.trades_sides: List[Dict] = []   # 사이드 로그(open/close)
-        self.trades_round: List[Dict] = []   # 라운드트립(완결) 로그
-        self.equity_curve: List[Dict] = []   # {timestamp, equity$, position, price}
-        self.prediction_log: List[Dict] = [] # 디버깅용 예측/실제 수익률 로그
+        self.open_count = 0
+        self.commission_usd_sum = 0.0
+
+        self.trades_sides: List[Dict] = []
+        self.trades_round: List[Dict] = []
+        self.equity_curve: List[Dict] = []
+        self.prediction_log: List[Dict] = []
+
+    # ----- 관측 구성: 윈도우 + 상태 피처 3개 -----
+    def _state_vec(self, t: int) -> np.ndarray:
+        time_in_pos = 0 if self.entry_time is None else (t - self.entry_time)
+        time_in_pos_norm = min(time_in_pos, 1000) / 1000.0
+        if self.entry is None or self.pos == 0:
+            upnl_log = 0.0
+        else:
+            upnl_log = float(np.log(self.p.iloc[t] / self.entry)) * float(self.pos)
+        return np.array([float(self.pos), float(time_in_pos_norm), float(upnl_log)], dtype=np.float32)
 
     def _obs(self, t: int) -> np.ndarray:
-        if t >= WINDOW:
-            w = self.X.iloc[t - WINDOW : t].values
-        else:
-            pad = np.tile(self.X.iloc[[0]].values, (WINDOW - t - 1, 1))
-            w = np.vstack([pad, self.X.iloc[: t + 1].values])
-        return w.reshape(-1).astype(np.float32)
+        w = self.X.iloc[t - WINDOW : t].values.astype(np.float32)
+        return np.concatenate([w.reshape(-1), self._state_vec(t)], axis=0)
 
-    def _gate(self, target: int) -> int:
-        # 쿨다운: 최근 전환 후 X바 이내면 전환 금지
-        if target != self.pos and (self.t - self.last_switch_t) < COOLDOWN_BARS:
-            return self.pos
-        if target == self.pos:
-            return target
-
-        if ADAPTIVE_GATE:
-            z_t = float(self.z.iloc[self.t])
-            thr = float(self.z_thr.iloc[self.t])
-            thr_enter = thr
-            thr_exit = thr * H_EXIT
-        else:
-            z_t = 0.0
-            thr_enter = -np.inf
-            thr_exit = np.inf
-
-        if self.pos == 0:  # 진입
-            return target if z_t >= thr_enter else self.pos
-
-        if target == 0:  # 청산
-            return 0 if z_t >= thr_exit else self.pos
-
-        # 전환(롱↔숏)은 진입과 동일 임계
-        return target if z_t >= thr_enter else self.pos
-
-    def _apply_switch(self, target: int, price: float, ts: pd.Timestamp) -> float:
-        """
-        포지션 변경 처리:
-        - 기존 포지션 청산 시: 라운드트립 기록 + 수수료 1 side
-        - 새 포지션 진입 시:   오픈 기록 + 수수료 1 side
-        반환: 로그-수수료 합(fee_log) → reward에서 차감
-        """
-        fee_log = 0.0
-
-        # 청산(현재 포지션이 있었다면)
-        if target != self.pos and self.pos != 0:
-            # 라운드트립 수익률 기록(슬리피지 0, 환경 일치)
-            if self.entry is not None:
-                if self.pos == 1:
-                    pnl_pct = (price / self.entry - 1.0) * 100.0
-                else:
-                    pnl_pct = (self.entry / price - 1.0) * 100.0
-                self.trades_round.append(
-                    {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "side": "LONG" if self.pos == 1 else "SHORT",
-                        "entry_price": self.entry,
-                        "exit_price": price,
-                        "pnl_pct": pnl_pct,
-                    }
-                )
-            # 청산 수수료(사이드 1회)
-            fee_log += COMMISSION_SIDE
-            self.fee_log_sum += COMMISSION_SIDE
-            self.fee_usd_sum += float(self.equity * INITIAL_CAPITAL * COMMISSION_SIDE)
-            self.exec_sides += 1
-            self.trades_sides.append({"time": ts, "side": "close", "price": price, "pos_after": 0 if target == 0 else target})
-            self.entry = None
-            self.entry_time = None
-
-        # 진입(목표가 0이 아니면)
-        if target != 0 and target != self.pos:
-            # 전환이면 스위치 카운트
-            if self.pos != 0:
-                self.switch_count += 1
-            # 진입 수수료(사이드 1회)
-            fee_log += COMMISSION_SIDE
-            self.fee_log_sum += COMMISSION_SIDE
-            self.fee_usd_sum += float(self.equity * INITIAL_CAPITAL * COMMISSION_SIDE)
-            self.exec_sides += 1
-            self.trades_sides.append({"time": ts, "side": "open", "price": price, "pos_after": target})
-            self.open_count += 1
-            self.entry = price
-            self.entry_time = ts
-
-        # 상태 반영
-        if target != self.pos:
-            self.last_switch_t = self.t
-            self.pos = target
-
-        return fee_log
-
-    def run(self) -> BacktestResults:
+    # ----- 실행 -----
+    def run(self) -> Tuple[BacktestResults, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         print("Starting backtest simulation...")
         self.reset()
 
-        for t in range(self.t, len(self.X) - 1): # -1 to allow looking at t+1
+        for t in range(self.t, len(self.X) - 1):  # -1 to read t+1 for logging
             self.t = t
             ts = self.X.index[t]
             price_prev = float(self.p.iloc[t - 1])
             price = float(self.p.iloc[t])
-            price_next = float(self.p.iloc[t + 1]) # << Get next price for logging
+            price_next = float(self.p.iloc[t + 1])
             lr = float(np.log(price / price_prev))
 
             obs = self._obs(t)
-            
-            # 결정론 예측(재현성)
-            action, _ = self.model.predict(obs, deterministic=True)
-            target = 0 if action == 0 else (1 if action == 1 else -1)
-            target = self._gate(target)
+            raw_action, _ = self.model.predict(obs, deterministic=True)
 
-            # --- Prediction Logging ---
+            # 액션 → 다음 바 목표 포지션
+            target = {0: self.pos, 1: +1, 2: -1}.get(int(raw_action), self.pos)
+
+            # 디버그(다음 바 수익)
             actual_future_lr = np.log(price_next / price)
             self.prediction_log.append({
                 "timestamp": ts,
-                "predicted_action": target,
-                "actual_future_log_return": actual_future_lr
+                "raw_action": int(raw_action),
+                "gated_target": int(target),
+                "actual_future_log_return": float(actual_future_lr),
             })
-            # --------------------------
 
-            # 보유 수익
-            reward = float(self.pos * lr)
-            # 포지션 변경 시 수수료(로그) 차감 + 거래 기록
-            fee_log = self._apply_switch(target, price, ts)
+            # ▼ 보유 수익: 직전 포지션 기준
+            prev_pos = self.pos
+            reward = float(prev_pos * lr)
+
+            # 체결/수수료 (per-side, switch=2 sides)
+            sides = 0
+            if prev_pos != target:
+                if prev_pos == 0 or target == 0:
+                    sides = 1
+                else:
+                    sides = 2
+            fee_log = sides * COMMISSION_SIDE
             reward -= fee_log
 
-            # 에쿼티 업데이트(로그 누적)
+            # USD 비용 집계(가치가치)
+            if sides > 0:
+                notion_usd = float(self.equity * INITIAL_CAPITAL)
+                self.commission_usd_sum += notion_usd * COMMISSION_SIDE * sides
+                if prev_pos != 0 and target == 0:
+                    self.trades_sides.append({"time": ts, "side": "close", "price": price, "pos_after": 0})
+                elif prev_pos == 0 and target != 0:
+                    self.trades_sides.append({"time": ts, "side": "open", "price": price, "pos_after": target})
+                    self.open_count += 1
+                else:
+                    # switch: close then open
+                    self.trades_sides.append({"time": ts, "side": "close", "price": price, "pos_after": 0})
+                    self.trades_sides.append({"time": ts, "side": "open", "price": price, "pos_after": target})
+                    self.open_count += 1
+
+            # 라운드트립 기록(청산 시점)
+            if prev_pos != 0 and target != prev_pos:
+                # 청산 발생
+                if self.entry is not None:
+                    pnl_pct = ((price / self.entry - 1.0) * 100.0) if prev_pos == 1 else ((self.entry / price - 1.0) * 100.0)
+                    self.trades_round.append({
+                        "entry_time": self.entry_time, "exit_time": ts,
+                        "side": "LONG" if prev_pos == 1 else "SHORT",
+                        "entry_price": self.entry, "exit_price": price,
+                        "pnl_pct": pnl_pct
+                    })
+
+            # 펀딩비(직전 포지션 기준)
+            fr = float(self.funding.iloc[t])
+            is_funding_event = (getattr(ts, "minute", 0) == 0) and (getattr(ts, "hour", 0) % 8 == 0)
+            if is_funding_event:
+                reward -= (prev_pos * fr)
+
+            # 에쿼티 업데이트
             self.equity *= float(np.exp(reward))
+
+            # 포지션/엔트리 갱신
+            if prev_pos != target:
+                if target == 0:
+                    self.entry = None
+                    self.entry_time = None
+                else:
+                    self.entry = price
+                    self.entry_time = self.t
+            self.pos = target
+
             self.equity_curve.append(
                 {"timestamp": ts, "price": price, "position": self.pos, "equity": self.equity * INITIAL_CAPITAL}
             )
 
         # ===== 디버그 로그 저장 =====
-        log_df = pd.DataFrame(self.prediction_log)
-        log_path = os.path.join(REPORT_DIR, "prediction_log.csv")
-        log_df.to_csv(log_path, index=False)
-        print(f"Prediction log saved to: {log_path}")
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        pd.DataFrame(self.prediction_log).to_csv(os.path.join(REPORT_DIR, "prediction_log.csv"), index=False)
 
         # ===== 결과 집계 =====
         eq_df = pd.DataFrame(self.equity_curve).set_index("timestamp")
@@ -312,7 +259,6 @@ class BacktestEngine:
         dd = (eq_df["equity"] - peak) / peak
         mdd = float(dd.min()) * -100.0
 
-        # 라운드트립 승/패/평균
         rounds = pd.DataFrame(self.trades_round)
         if not rounds.empty:
             wins = int((rounds["pnl_pct"] > 0).sum())
@@ -330,7 +276,7 @@ class BacktestEngine:
         hold_ratio = float((eq_df["position"] == 0).mean() * 100.0)
         sharpe = (annual_ret / vol) if vol > 0 else 0.0
 
-        return BacktestResults(
+        results = BacktestResults(
             model_name="PPO_Model",
             start_date=start_date,
             end_date=end_date,
@@ -342,7 +288,7 @@ class BacktestEngine:
             volatility=vol,
             sharpe_ratio=sharpe,
             max_drawdown=mdd,
-            total_trades=int(len(rounds)),         # 라운드트립 개수(오픈 수)
+            total_trades=int(len(rounds)),
             winning_trades=wins,
             losing_trades=losses,
             win_rate=win_rate,
@@ -350,33 +296,15 @@ class BacktestEngine:
             long_trades=long_tr,
             short_trades=short_tr,
             hold_ratio=hold_ratio,
-            total_commission=float(self.fee_usd_sum),
-            commission_ratio=float(self.fee_usd_sum / INITIAL_CAPITAL * 100.0),
-        ), eq_df, rounds, pd.DataFrame(self.trades_sides)
+            total_commission=float(self.commission_usd_sum),
+            commission_ratio=float(self.commission_usd_sum / INITIAL_CAPITAL * 100.0),
+        )
+        return results, eq_df, rounds, pd.DataFrame(self.trades_sides)
 
 # ===== 저장/시각화 =====
 def save_outputs(eq_df: pd.DataFrame, rounds: pd.DataFrame, sides: pd.DataFrame, results: BacktestResults):
     os.makedirs(REPORT_DIR, exist_ok=True)
 
-    # equity
-    # eq_csv = os.path.join(REPORT_DIR, "backtest_equity.csv")
-    # eq_df.to_csv(eq_csv)
-
-    # trades (라운드트립)
-    # tr_csv = os.path.join(REPORT_DIR, "backtest_trades.csv")
-    # if not rounds.empty:
-    #     rounds.to_csv(tr_csv, index=False)
-
-    # side 로그(참고)
-    # sides_csv = os.path.join(REPORT_DIR, "backtest_trades_sides.csv")
-    # if not sides.empty:
-    #     sides.to_csv(sides_csv, index=False)
-
-    # summary
-    # sm_csv = os.path.join(REPORT_DIR, "backtest_summary.csv")
-    # pd.DataFrame([asdict(results)]).to_csv(sm_csv, index=False)
-
-    # chart
     try:
         plt.figure(figsize=(14, 8))
         (eq_df["equity"]).plot(linewidth=2)
@@ -397,10 +325,7 @@ def save_outputs(eq_df: pd.DataFrame, rounds: pd.DataFrame, sides: pd.DataFrame,
     except Exception as e:
         print("[warn] chart failed:", e)
 
-    print("거래 라운드트립: (CSV 저장 비활성화)")
-    print("거래 사이드: (CSV 저장 비활성화)")
-    print("성과 요약: (CSV 저장 비활성화)")
-    print("에쿼티 CSV: (CSV 저장 비활성화)")
+    print("CSV 저장은 기본 비활성화(주석 해제 시 활성).")
 
 def print_summary(r: BacktestResults):
     print("\n" + "=" * 60)
@@ -424,7 +349,7 @@ def print_summary(r: BacktestResults):
     print("\n📊 포지션 분석:")
     print(f"   롱/숏 거래: {r.long_trades}/{r.short_trades}")
     print(f"   홀드 비율: {r.hold_ratio:.1f}%")
-    print("\n💸 비용:")
+    print("\n💸 비용(USD):")
     print(f"   총 수수료: ${r.total_commission:,.2f} ({r.commission_ratio:.2f}%)")
     print("=" * 60)
 
@@ -432,10 +357,10 @@ def print_summary(r: BacktestResults):
 def main():
     print("RL Model Backtest Started!")
     try:
-        X, close = load_test_data()
+        X, close, funding = load_test_data()
         model = load_model()
 
-        engine = BacktestEngine(model, X, close)
+        engine = BacktestEngine(model, X, close, funding)
         results, eq_df, rounds, sides = engine.run()
 
         save_outputs(eq_df, rounds, sides, results)

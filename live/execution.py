@@ -4,6 +4,8 @@ Binance UM Futures Execution Adapter
 - 기능 요약:
   1) 진입 전: 심볼의 기존 TP/SL(모든 미체결 주문) 전부 취소
   2) 진입 후: 3.5% 고정 SL을 STOP_MARKET(closePosition)로 예약
+  3) (추가) 현재 포지션 수량 조회 + reduceOnly MARKET로 즉시 평청
+
 - 옵션: 마크가격 트리거(workingType="MARK_PRICE") 기본
 - 포지션 모드는 원웨이(단일 포지션) 전제
 
@@ -17,6 +19,8 @@ Binance UM Futures Execution Adapter
         last_price=3250.0,      # 직전 체결/관찰 가격(진입가 근사)
         sl_rate=0.035           # 3.5% 고정
     )
+    # 즉시 평청:
+    close_resp = ex.close_position_market("ETHUSDT")
 """
 
 from __future__ import annotations
@@ -75,9 +79,13 @@ class BinanceExecutor:
             params = self._sign(params)
         url = self.BASE_URL + path
         fn = getattr(requests, method.lower())
-        r = fn(url, params=params if method in ("GET", "DELETE") else None,
-               data=params if method in ("POST", "PUT") else None,
-               headers=self._headers(), timeout=self.timeout)
+        r = fn(
+            url,
+            params=params if method in ("GET", "DELETE") else None,
+            data=params if method in ("POST", "PUT") else None,
+            headers=self._headers(),
+            timeout=self.timeout
+        )
         r.raise_for_status()
         return r.json()
 
@@ -138,9 +146,8 @@ class BinanceExecutor:
             "symbol": symbol,
             "side": side.upper(),
             "type": "MARKET",
-            "quantity": str(qty),
+            "quantity": f"{qty}",
             "reduceOnly": "true" if reduce_only else "false",
-            # "newClientOrderId": ...  # 필요시
         }
         return self._request("POST", "/fapi/v1/order", params, signed=True)
 
@@ -155,18 +162,18 @@ class BinanceExecutor:
         opp = self._opp(entry_side)
         if entry_side.upper() == "BUY":
             raw = entry_price * (1.0 - sl_rate)
-            stop = self._round_tick_down(raw, f["tickSize"])  # 약간 더 보수적으로 아래로
+            stop = self._round_tick_down(raw, f["tickSize"])
         else:
             raw = entry_price * (1.0 + sl_rate)
-            stop = self._round_tick_up(raw, f["tickSize"])    # 약간 더 보수적으로 위로
+            stop = self._round_tick_up(raw, f["tickSize"])
 
         params = {
             "symbol": symbol,
             "side": opp,
             "type": "STOP_MARKET",
             "stopPrice": f"{stop:.8f}",
-            "closePosition": "true",           # 전체 포지션 청산
-            "workingType": working_type,       # MARK_PRICE 권장
+            "closePosition": "true",
+            "workingType": working_type,  # MARK_PRICE 권장
         }
         return self._request("POST", "/fapi/v1/order", params, signed=True)
 
@@ -192,3 +199,32 @@ class BinanceExecutor:
 
         out["sl"] = self.place_stop_loss_close(symbol, side, fill_px, sl_rate=sl_rate)
         return out
+
+    # ---------- (추가) 포지션 조회/즉시 평청 ----------
+
+    def get_position_qty(self, symbol: str) -> tuple[float, str]:
+        """
+        현재 포지션 수량과 방향을 반환.
+        반환: (abs_qty, side)  side ∈ {"LONG","SHORT","FLAT"}
+        """
+        data = self._request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+        pos = data[0] if isinstance(data, list) and data else data
+        amt = float(pos.get("positionAmt", "0"))
+        if amt > 0:
+            return abs(amt), "LONG"
+        elif amt < 0:
+            return abs(amt), "SHORT"
+        else:
+            return 0.0, "FLAT"
+
+    def close_position_market(self, symbol: str) -> dict:
+        """
+        현재 포지션을 MARKET + reduceOnly=True로 즉시 평청.
+        - LONG이면 SELL, SHORT이면 BUY로 실행
+        - 포지션이 없으면 {"code":"FLAT"} 반환
+        """
+        qty, side = self.get_position_qty(symbol)
+        if qty <= 0 or side == "FLAT":
+            return {"code": "FLAT"}
+        side_api = "SELL" if side == "LONG" else "BUY"
+        return self.place_market(symbol, side_api, quantity=qty, reduce_only=True)
