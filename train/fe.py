@@ -195,31 +195,36 @@ def _numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 def _pca_feature_rank(train_df: pd.DataFrame, force_keep: List[str], top_n: int = TOP_N) -> List[str]:
     """Unsupervised ranking by PCA loading energy weighted by explained variance."""
-    # Prepare matrix (drop NA)
     X = train_df.dropna()
-    # If all NA or too few columns, just return force_keep
     if X.empty or X.shape[1] == 0:
         return list(dict.fromkeys(force_keep))
+
     # Z-score for PCA
     scaler = StandardScaler()
     Z = scaler.fit_transform(X)
-    k = min(top_n, Z.shape[1])
-    pca = PCA(n_components=k, svd_solver="auto", randomized=False)
+
+    n_samples, n_features = Z.shape
+    # PCA 제약: n_components <= min(n_samples, n_features) and >= 1
+    k = max(1, min(top_n, n_features, n_samples))
+
+    # 'randomized' 인자 제거
+    pca = PCA(n_components=k, svd_solver="auto")
     pca.fit(Z)
-    # components_: (k, n_features); explained_variance_ratio_: (k,)
-    loadings = pca.components_  # rows PCs, cols features
-    weights = pca.explained_variance_ratio_.reshape(-1, 1)
-    # importance per feature = sum_k (loading^2 * var_ratio_k)
-    imp = (loadings ** 2) * weights
-    scores = imp.sum(axis=0)
+
+    loadings = pca.components_                 # (k, n_features)
+    weights = pca.explained_variance_ratio_.reshape(-1, 1)  # (k, 1)
+    imp = (loadings ** 2) * weights            # (k, n_features)
+    scores = imp.sum(axis=0)                   # (n_features,)
     feats = list(X.columns)
+
     ranked = [f for _, f in sorted(zip(scores, feats), key=lambda t: float(t[0]), reverse=True)]
-    # ensure force_keep always included (at front)
+
+    # force_keep을 항상 포함(앞쪽 고정)
     forced = [f for f in force_keep if f in feats]
-    # remove forced from ranked then prepend
     ranked = [f for f in ranked if f not in set(forced)]
     selected = forced + ranked[:top_n]
-    # dedupe while preserving order
+
+    # 순서 유지 중복 제거
     seen, final = set(), []
     for f in selected:
         if f not in seen:
