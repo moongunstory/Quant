@@ -2,7 +2,9 @@
 # PPO + Lagrangian Cost Constraint (λ 자동) + 4-액션(청산 포함)
 # - 액션: 0=no-trade, 1=long, 2=short, 3=flat(청산)
 # - 전환 금지: 보유중 long/short 주문은 "홀드", 전환은 flat→다음 틱 재진입만
-# - 보상: reward = prev_pos*lr − fee − funding − λ*(cost − budget)
+# - 학습 보상: REWARD_SCALE*(pnl - fee - funding) − λ*(cost − budget)
+#              + (트렌드 구간 flat 페널티) + (진입 직후 n틱 방향 보너스)
+# - 자산 업데이트: equity *= exp(pnl - fee - funding)
 # - λ: EMA(cost) 기반 듀얼 업데이트 (매 스텝)
 
 from __future__ import annotations
@@ -41,6 +43,13 @@ COMMISSION_SIDE = 0.0005     # 테이커 0.05%/side
 COST_BUDGET = 1.2e-4         # 현실화(권장 1e-4~1.5e-4 중간값)
 LAMBDA_STEP = 100.0          # η: 과도 반응 완화(권장 50~200)
 LAMBDA_MAX  = 8.0            # 보상 스케일에 맞춘 상한(권장 5~10)
+
+# ---- 보상 스케일 & 트렌드 보상 파라미터 ----
+REWARD_SCALE      = 100.0     # 50~200 권장
+TREND_THRESH      = 8e-4      # |1-스텝 로그수익| 기준 트렌드 임계
+ENTRY_BONUS_H     = 3         # n틱 후 방향 보너스 평가(예: 3→15분)
+ENTRY_BONUS_ALPHA = 50.0      # 진입 방향 일치 보너스 계수
+HOLD_PENALTY      = 0.02      # 트렌드에 flat(무포지션)일 때 페널티
 
 SEED = 72
 DEVICE = "cpu"
@@ -221,12 +230,25 @@ class TradingEnv(gym.Env):
         is_funding_event = (getattr(ts, "minute", 0) == 0) and (getattr(ts, "hour", 0) % 8 == 0)
         funding_fee_cost = (prev_pos * fr) if is_funding_event else 0.0
 
-        # --- 보상/자산 분리
-        # 학습용 보상: r_train = pnl - fee - funding - λ*(cost - budget)
+        # --- 보상/자산 분리 + 스케일/형태 보강
+        # 학습용 보상: r_train = REWARD_SCALE*(pnl - fee - funding) - λ*(cost - budget)
+        #  + (트렌드 flat 페널티) + (진입 시 n틱 방향 보너스)
         # 자산반영:    equity *= exp(pnl - fee - funding)
         inst_cost = transaction_cost
         equity_reward = float(prev_pos * lr) - (transaction_cost + funding_fee_cost)
-        reward = equity_reward - (self.lam * (inst_cost - self.cost_budget))
+        reward = REWARD_SCALE * equity_reward - (self.lam * (inst_cost - self.cost_budget))
+
+        # (A) 트렌드 구간에서 flat(무포지션 유지) 페널티
+        if prev_pos == 0 and target == 0:
+            if abs(lr) > TREND_THRESH:
+                reward -= HOLD_PENALTY
+
+        # (B) 진입 시, n틱 후 방향 일치 보너스
+        if prev_pos == 0 and target != 0:
+            if self.t + ENTRY_BONUS_H < self._episode_len:
+                p_future = float(self.close.iloc[self.t + ENTRY_BONUS_H])
+                fut_lr = float(np.log(p_future / p_curr))  # n틱 후 로그수익
+                reward += ENTRY_BONUS_ALPHA * (target * fut_lr)
 
         # ----- λ 업데이트 (EMA 기반) -----
         self.cost_ema = (1.0 - self.alpha_cost_ema) * self.cost_ema + self.alpha_cost_ema * inst_cost
@@ -329,7 +351,12 @@ class MidLogger(BaseCallback):
 # -----------------
 def main():
     print("[info] PPO Training (Lagrangian cost constraint + 4-action flat)")
-    print(f"✅ reward = pnl − fee − funding − λ*(cost−budget), budget={COST_BUDGET}, eta={LAMBDA_STEP}")
+    print(
+        f"✅ reward = {REWARD_SCALE}*(pnl−fee−funding)"
+        f" − λ*(cost−budget) + trend/hold penalty + entry bonus | "
+        f"budget={COST_BUDGET}, eta={LAMBDA_STEP}, λ_max={LAMBDA_MAX}, "
+        f"trend_thresh={TREND_THRESH}, bonus_h={ENTRY_BONUS_H}"
+    )
 
     # 데이터 로드
     X_train = _load_norm("train")
