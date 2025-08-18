@@ -8,6 +8,10 @@ Ultra-lean version. No CLI. No metadata JSON. No gap checks. Minimal logs.
 - Range: START_DATE → END_DATE (edit constants below)
 - Split: train/val/test = 70/15/15 (by time, per-interval)
 - Output: ./ai_binance/data/raw/fut_{train|val|test}_data_{interval}.parquet
+
+[변경 요약]
+- 펀딩율 정렬을 `reindex(..., method="ffill")`로 개선 → 각 간격(5m/15m/1h/4h) 인덱스에 정확히 맞춰 상수 유지.
+- 컬럼/인덱스/경로/기간은 **그대로 유지**.
 """
 from __future__ import annotations
 
@@ -64,7 +68,11 @@ def _fetch(symbol: str, interval: str, start_ms: int, end_ms: Optional[int]) -> 
         time.sleep(SLEEP)
     if not rows:
         return pd.DataFrame()
-    cols = ["Open_time","Open","High","Low","Close","Volume","Close_time","Quote_asset_volume","Number_of_trades","Taker_buy_base","Taker_buy_quote","Ignore"]
+    cols = [
+        "Open_time","Open","High","Low","Close","Volume",
+        "Close_time","Quote_asset_volume","Number_of_trades",
+        "Taker_buy_base","Taker_buy_quote","Ignore"
+    ]
     df = pd.DataFrame(rows, columns=cols)
     df["Open_time"] = pd.to_datetime(df["Open_time"], unit="ms", utc=True)
     df.set_index("Open_time", inplace=True)
@@ -86,26 +94,26 @@ def _fetch_funding_rates(symbol: str, start_ms: int, end_ms: Optional[int]) -> p
         params = {"symbol": symbol, "startTime": next_start, "limit": limit}
         if end_ms:
             params["endTime"] = end_ms
-        
         r = requests.get(BASE + FUNDING_RATE, params=params, timeout=TIMEOUT)
         r.raise_for_status()
         page = r.json()
         if not page:
             break
-        
         rows.extend(page)
         last_ts = page[-1]['fundingTime']
         next_start = last_ts + 1
-        
         if end_ms and next_start > end_ms:
             break
         if len(page) < limit:
             break
         time.sleep(SLEEP)
-        
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df['fundingTime'] = pd.to_datetime(df['fundingTime'], unit='ms', utc=True)
+    df = df.set_index('fundingTime').sort_index()
+    df['fundingRate'] = pd.to_numeric(df['fundingRate'], errors='coerce')
+    return df
 
 
 def _split(df: pd.DataFrame, a: float, b: float, c: float):
@@ -130,16 +138,14 @@ def main():
 
     print(f"Ingest {symbol} {INTERVALS} | {START_DATE} → {end_date} (UTC)")
 
-    # Fetch funding rates once for the entire period
+    # FundingRate: 8h 스냅샷을 한 번만 수집
     print("  - FundingRate fetching...")
-    df_funding = _fetch_funding_rates(symbol, start_ms, end_ms)
-    if not df_funding.empty:
-        df_funding['fundingTime'] = pd.to_datetime(df_funding['fundingTime'], unit='ms', utc=True)
-        df_funding = df_funding.set_index('fundingTime')
-        funding_rates_series = pd.to_numeric(df_funding['fundingRate'], errors='coerce').rename('FundingRate')
-        print(f"    [ok] funding rates: {len(df_funding):,} records")
+    df_fund = _fetch_funding_rates(symbol, start_ms, end_ms)
+    if not df_fund.empty:
+        fr = df_fund['fundingRate']  # index = fundingTime (UTC)
+        print(f"    [ok] funding rates: {len(df_fund):,} records")
     else:
-        funding_rates_series = None
+        fr = None
         print("    [warn] no funding rate data")
 
     for itv in INTERVALS:
@@ -149,10 +155,9 @@ def main():
             print(f"    [skip] no data")
             continue
 
-        # Merge funding rates
-        if funding_rates_series is not None:
-            df = df.join(funding_rates_series)
-            df['FundingRate'] = df['FundingRate'].ffill().fillna(0.0)
+        # 각 간격 인덱스에 펀딩율을 정확히 정렬 (asof-ffill 효과)
+        if fr is not None:
+            df['FundingRate'] = fr.reindex(df.index, method='ffill').fillna(0.0)
         else:
             df['FundingRate'] = 0.0
 

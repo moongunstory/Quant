@@ -1,421 +1,388 @@
-# rl_entry_exit.py
-# PPO + Lagrangian Cost Constraint (λ 자동) + 4-액션(청산 포함)
-# - 액션: 0=no-trade, 1=long, 2=short, 3=flat(청산)
-# - 전환 금지: 보유중 long/short 주문은 "홀드", 전환은 flat→다음 틱 재진입만
-# - 학습 보상: REWARD_SCALE*(pnl - fee - funding) − λ*(cost − budget)
-#              + (트렌드 구간 flat 페널티) + (진입 직후 n틱 방향 보너스)
-# - 자산 업데이트: equity *= exp(pnl - fee - funding)
-# - λ: EMA(cost) 기반 듀얼 업데이트 (매 스텝)
-
+# rl.py (CPU + VecNormalize + column compatibility + sync helper)
 from __future__ import annotations
-
 import os
-import csv
-import time
+# ---- Force CPU ----
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import json
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Tuple, List
+
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from gymnasium.wrappers import TimeLimit
+
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# -----------------
-# 경로/설정
-# -----------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROC_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
-RAW_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw"))
-MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
-LOG_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "logs"))
+# ===== Settings =====
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR     = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw"))
+PROC_DIR    = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
+MODEL_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "models"))  # ./models/
+SPLITS      = ("train", "val", "test")
+INTERVAL    = "5m"
+WINDOW      = 48            # 5m 기준 4시간 컨텍스트
+INTERVAL_MIN= 5             # 5m
+FEE_PER_SIDE= 0.0005        # 0.05% (Binance taker)
+SLIP_PER_SIDE=0.0001        # 0.01% (왕복 합≈0.12%)
+SEED        = 42
+TIMESTEPS   = 2_000_000
 
-WINDOW = 48                  # 48×5m ≈ 4h
-MAX_EPISODE_STEPS = 10_000   # 리셋 주기(학습 내부 에피소드)
-
-# 거래 비용
-COMMISSION_SIDE = 0.0005     # 테이커 0.05%/side
-
-# ---- 라그랑주(자동 λ) 파라미터 ----
-COST_BUDGET = 1.2e-4         # 현실화(권장 1e-4~1.5e-4 중간값)
-LAMBDA_STEP = 100.0          # η: 과도 반응 완화(권장 50~200)
-LAMBDA_MAX  = 8.0            # 보상 스케일에 맞춘 상한(권장 5~10)
-
-# ---- 보상 스케일 & 트렌드 보상 파라미터 ----
-REWARD_SCALE      = 200.0     # 50~200 권장
-TREND_THRESH      = 8e-4      # |1-스텝 로그수익| 기준 트렌드 임계
-ENTRY_BONUS_H     = 3         # n틱 후 방향 보너스 평가(예: 3→15분)
-ENTRY_BONUS_ALPHA = 50.0      # 진입 방향 일치 보너스 계수
-HOLD_PENALTY      = 0.02      # 트렌드에 flat(무포지션)일 때 페널티
-
-SEED = 72
-DEVICE = "cpu"
-TOTAL_TIMESTEPS = 300_000
-EVAL_FREQ = 10_000
-LOG_FREQ = 2_000
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# -----------------
-# 유틸
-# -----------------
-def unwrap_to_trading_env(obj):
-    env = obj
-    if hasattr(env, "envs"):  # DummyVecEnv
-        env = env.envs[0]
-    while hasattr(env, "env"):
-        env = env.env
-    return env  # TradingEnv
-
-def learning_rate_schedule(progress_remaining: float) -> float:
-    initial_lr, final_lr = 5e-5, 1e-5
-    return float(final_lr + (initial_lr - final_lr) * float(progress_remaining))
-
-BASE_PPO_KW = dict(
-    learning_rate=learning_rate_schedule,
-    n_steps=16384,
-    batch_size=4096,
-    n_epochs=10,
-    vf_coef=0.5,
-    clip_range=0.10,
-    gamma=0.995,
-    gae_lambda=0.95,
-    max_grad_norm=0.5,
-    ent_coef=0.01,          # no-trade 탐색 약하게
-    target_kl=0.02,
-    policy_kwargs=dict(net_arch=[256, 256], ortho_init=False),
-)
-
-# -----------------
-# 데이터 로더
-# -----------------
-def _load_norm(split: str) -> pd.DataFrame:
-    X = pd.read_parquet(os.path.join(PROC_DIR, f"{split}_normalized.parquet"))
-    with open(os.path.join(PROC_DIR, "feature_list.json"), "r") as f:
-        feats: List[str] = json.load(f)
-    return X.reindex(columns=feats).dropna()
-
-def _load_aux_data(split: str) -> Tuple[pd.Series, pd.Series]:
-    path = os.path.join(RAW_DIR, f"fut_{split}_data_5m.parquet")
-    if not os.path.exists(path):
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-    df = pd.read_parquet(path)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True)
-    df = df.sort_index()
-    close = df["Close"].astype(float)
-    funding_rate = df.get("FundingRate", pd.Series(0.0, index=df.index)).astype(float)
-    return close, funding_rate
-
-# -----------------
-# 환경
-# -----------------
-class TradingEnv(gym.Env):
-    metadata = {"render.modes": ["human"]}
-
-    def __init__(self, X: pd.DataFrame, close: pd.Series, funding_rate: pd.Series):
-        super().__init__()
-        self.X = X
-        self.close = close.reindex(X.index).ffill().bfill().astype(float)
-        self.funding_rate = funding_rate.reindex(X.index).ffill().bfill().astype(float)
-        self.features = X.columns.tolist()
-        self.n_feat = len(self.features)
-
-        # 상태 피처 3개: pos, time_in_pos_norm, unrealized_pnl_log
-        self.extra_dim = 3
-
-        # 4-액션: 0=no-trade, 1=long, 2=short, 3=flat(청산)
+# ===== ENV (returns-only) =====
+class SimpleTradingEnv(gym.Env):
+    metadata = {"render_modes": []}
+    def __init__(self, close, funding_rate=None, window=48,
+                 fee_per_side=0.0005, slip_per_side=0.0001,
+                 interval_min=5, random_start=True, seed: int = 42):
+        close = np.asarray(close, dtype=np.float64)
+        assert len(close) >= window + 2, "데이터가 너무 짧음"
+        self.close = close
+        self.funding = np.zeros_like(close, dtype=np.float64) if funding_rate is None else np.asarray(funding_rate, dtype=np.float64)
+        self.window = int(window)
+        self.cost_per_side = float(fee_per_side + slip_per_side)
+        self.ret = np.diff(np.log(self.close))
+        self.random_start = bool(random_start)
+        self.interval_min = int(interval_min)
+        self.fund_div = max(1, int(round(480 / max(1, self.interval_min))))
+        self._rng = np.random.default_rng(seed)
+        self.pos = 0
+        self.bars_in_pos = 0
+        self.t = self.window
+        obs_dim = self.window + 2
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(WINDOW * self.n_feat + self.extra_dim,), dtype=np.float32
-        )
 
-        self.logret = np.log(self.close / self.close.shift(1)).fillna(0.0)
-        self._episode_len = len(self.X)
+    def _obs(self, t):
+        rwin = self.ret[t-self.window:t]
+        return np.asarray(list(rwin) + [float(self.pos), float(self.bars_in_pos)/100.0], dtype=np.float32)
 
-        # 라그랑주 듀얼 변수
-        self.lam = 1.0                    # warm start
-        self.eta = float(LAMBDA_STEP)
-        self.cost_budget = float(COST_BUDGET)
-        self.lam_max = float(LAMBDA_MAX)
-
-        # 비용 EMA
-        self.cost_ema = 0.0
-        self.alpha_cost_ema = 0.05        # 빠른 반응
-
-        self._reset_state()
-
-    # ---------- 내부 상태 ----------
-    def _reset_state(self):
-        self.t = WINDOW
-        self.pos = 0               # -1/0/+1
-        self.entry = None
-        self.entry_t = None
-        self.equity = 1.0
-        self.episode_start = self.t
-        self.diag = {
-            "n_steps": 0,
-            "n_entry": 0,
-            "n_exit": 0,
-            "act_hist": {0: 0, 1: 0, 2: 0, 3: 0},
-            "r_sum": 0.0,
-            "lam": float(self.lam),
-            "cost_ema": 0.0,
-        }
-
-    def _state_vec(self) -> np.ndarray:
-        time_in_pos = 0 if self.entry_t is None else (self.t - self.entry_t)
-        time_in_pos_norm = min(time_in_pos, 1000) / 1000.0
-        if self.entry is None or self.pos == 0:
-            upnl_log = 0.0
-        else:
-            upnl_log = float(np.log(self.close.iloc[self.t] / self.entry)) * float(self.pos)
-        return np.array([float(self.pos), float(time_in_pos_norm), float(upnl_log)], dtype=np.float32)
-
-    def _obs(self) -> np.ndarray:
-        w = self.X.iloc[self.t - WINDOW:self.t].values.astype(np.float32).reshape(-1)
-        return np.concatenate([w, self._state_vec()], axis=0)
-
-    # ---------- 액션 해석 ----------
-    @staticmethod
-    def _map_action(action: int, pos: int) -> int:
-        """
-        반환: target pos ∈ {-1,0,+1}
-        - pos==0: {0:0, 1:+1, 2:-1, 3:0}
-        - pos!=0: {3:0, 그 외: pos(홀드)}  → 같은 틱 전환 금지
-        """
-        a = int(action)
-        if pos == 0:
-            return {0: 0, 1: +1, 2: -1, 3: 0}.get(a, 0)
-        else:
-            return 0 if a == 3 else pos
-
-    # ---------- Gym API ----------
-    def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None):
+    def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self._reset_state()
-        return self._obs(), {}
+        self.pos = 0
+        self.bars_in_pos = 0
+        self.t = self._rng.integers(self.window, len(self.close)-2) if self.random_start else self.window
+        return self._obs(self.t), {}
 
     def step(self, action: int):
-        # 시계열
-        p_prev = float(self.close.iloc[self.t - 1])
-        p_curr = float(self.close.iloc[self.t])
-        lr = float(np.log(p_curr / p_prev))
-        ts = self.X.index[self.t]
-
-        prev_pos = self.pos
-        target = self._map_action(action, prev_pos)
-
-        # --- 체결 비용(전환 금지라 pos 변경 시 1사이드)
-        transaction_cost = 0.0
-        if prev_pos != target:
-            transaction_cost += COMMISSION_SIDE
-            if prev_pos == 0 and target != 0:
-                # 진입
-                self.entry = p_curr
-                self.entry_t = self.t
-                self.diag["n_entry"] += 1
-            elif prev_pos != 0 and target == 0:
-                # 청산
-                self.entry = None
-                self.entry_t = None
-                self.diag["n_exit"] += 1
-
-        # --- 펀딩(정각 & 8시간 배수; prev_pos 기준)
-        fr = float(self.funding_rate.iloc[self.t])
-        is_funding_event = (getattr(ts, "minute", 0) == 0) and (getattr(ts, "hour", 0) % 8 == 0)
-        funding_fee_cost = (prev_pos * fr) if is_funding_event else 0.0
-
-        # --- 보상/자산 분리 + 스케일/형태 보강
-        # 학습용 보상: r_train = REWARD_SCALE*(pnl - fee - funding) - λ*(cost - budget)
-        #  + (트렌드 flat 페널티) + (진입 시 n틱 방향 보너스)
-        # 자산반영:    equity *= exp(pnl - fee - funding)
-        inst_cost = transaction_cost
-        equity_reward = float(prev_pos * lr) - (transaction_cost + funding_fee_cost)
-        reward = REWARD_SCALE * equity_reward - (self.lam * (inst_cost - self.cost_budget))
-
-        # (A) 트렌드 구간에서 flat(무포지션 유지) 페널티
-        if prev_pos == 0 and target == 0:
-            if abs(lr) > TREND_THRESH:
-                reward -= HOLD_PENALTY
-
-        # (B) 진입 시, n틱 후 방향 일치 보너스
-        if prev_pos == 0 and target != 0:
-            if self.t + ENTRY_BONUS_H < self._episode_len:
-                p_future = float(self.close.iloc[self.t + ENTRY_BONUS_H])
-                fut_lr = float(np.log(p_future / p_curr))  # n틱 후 로그수익
-                reward += ENTRY_BONUS_ALPHA * (target * fut_lr)
-
-        # ----- λ 업데이트 (EMA 기반) -----
-        self.cost_ema = (1.0 - self.alpha_cost_ema) * self.cost_ema + self.alpha_cost_ema * inst_cost
-        lam_grad = self.cost_ema - self.cost_budget
-        self.lam = float(np.clip(self.lam + self.eta * lam_grad, 0.0, self.lam_max))
-
-        # 포지션 갱신(다음 틱부터 유효)
-        self.pos = target
-
-        # 자산 업데이트(λ 제외)
-        self.equity *= float(np.exp(equity_reward))
-
-        # 지표/진단
-        self.diag["n_steps"] += 1
-        self.diag["act_hist"][int(action)] = self.diag["act_hist"].get(int(action), 0) + 1
-        self.diag["r_sum"] += reward
-        self.diag["lam"] = float(self.lam)
-        self.diag["cost_ema"] = float(self.cost_ema)
-
-        # 진행
+        sides = 0
+        new_pos = self.pos
+        if action == 0:   # hold
+            new_pos = self.pos
+        elif action == 1: # long
+            if self.pos == 0: new_pos, sides = +1, 1
+            elif self.pos == -1: new_pos, sides = +1, 2
+        elif action == 2: # short
+            if self.pos == 0: new_pos, sides = -1, 1
+            elif self.pos == +1: new_pos, sides = -1, 2
+        elif action == 3: # close
+            if self.pos != 0: new_pos, sides = 0, 1
+        r = self.ret[self.t]
+        simple_ret = np.exp(r) - 1.0
+        fund_step = (self.funding[self.t] / max(1, int(round(480 / self.interval_min)))) * new_pos
+        fee_step = sides * self.cost_per_side
+        reward = (new_pos * simple_ret) - fee_step - fund_step
+        self.pos = new_pos
+        self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
+        terminated = (self.t >= len(self.close) - 1)
+        obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
+        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step)}
+        return obs, float(reward), terminated, False, info
 
-        terminated = (
-            self.t >= self._episode_len - 1
-            or (self.t - self.episode_start) >= MAX_EPISODE_STEPS
+# ===== ENV (features-stacked) =====
+class FeatureStackedEnv(gym.Env):
+    """피처 행렬 X를 window 길이로 스택해 관측 제공. reward는 close/funding 기반."""
+    metadata = {"render_modes": []}
+    def __init__(self, X: np.ndarray, close: np.ndarray, funding_rate: np.ndarray,
+                 window=48, fee_per_side=0.0005, slip_per_side=0.0001,
+                 interval_min=5, random_start=True, seed: int = 42):
+        assert X.ndim == 2, "X must be 2D [T, F]"
+        T, F = X.shape
+        assert len(close) == T and len(funding_rate) == T, "X/close/funding length mismatch"
+        assert T >= window + 2, "데이터가 너무 짧음"
+        self.X = X.astype(np.float32)
+        self.F = F
+        self.close = close.astype(np.float64)
+        self.funding = funding_rate.astype(np.float64)
+        self.window = int(window)
+        self.cost_per_side = float(fee_per_side + slip_per_side)
+        self.ret = np.diff(np.log(self.close))
+        self.random_start = bool(random_start)
+        self.interval_min = int(interval_min)
+        self.fund_div = max(1, int(round(480 / max(1, self.interval_min))))
+        self._rng = np.random.default_rng(seed)
+        self.pos = 0
+        self.bars_in_pos = 0
+        self.t = self.window
+        obs_dim = self.window * self.F + 2
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Discrete(4)
+
+    def _obs(self, t):
+        xw = self.X[t-self.window:t].reshape(-1)
+        return np.concatenate([xw, np.array([float(self.pos), float(self.bars_in_pos)/100.0], dtype=np.float32)], axis=0).astype(np.float32)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.pos = 0
+        self.bars_in_pos = 0
+        self.t = self._rng.integers(self.window, len(self.close)-2) if self.random_start else self.window
+        return self._obs(self.t), {}
+
+    def step(self, action: int):
+        sides = 0
+        new_pos = self.pos
+        if action == 0: new_pos = self.pos
+        elif action == 1:
+            if self.pos == 0: new_pos, sides = +1, 1
+            elif self.pos == -1: new_pos, sides = +1, 2
+        elif action == 2:
+            if self.pos == 0: new_pos, sides = -1, 1
+            elif self.pos == +1: new_pos, sides = -1, 2
+        elif action == 3:
+            if self.pos != 0: new_pos, sides = 0, 1
+        r = self.ret[self.t]
+        simple_ret = np.exp(r) - 1.0
+        fund_step = (self.funding[self.t] / self.fund_div) * new_pos
+        fee_step = sides * self.cost_per_side
+        reward = (new_pos * simple_ret) - fee_step - fund_step
+        self.pos = new_pos
+        self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
+        self.t += 1
+        terminated = (self.t >= len(self.close) - 1)
+        obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
+        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step)}
+        return obs, float(reward), terminated, False, info
+
+# ===== Data loaders =====
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Column harmonization for both RAW and PROCESSED files."""
+    if isinstance(df.index, pd.DatetimeIndex) and (df.index.name or "").lower() in ("open_time", "time"):
+        df = df.reset_index()
+
+    low = {c.lower(): c for c in df.columns}
+    ren = {}
+    if "open_time" in low: ren[low["open_time"]] = "time"
+    if "time" in low: ren[low["time"]] = "time"
+
+    # close priority: close -> close_ref -> Close
+    if "close" in low:
+        ren[low["close"]] = "close"
+    elif "close_ref" in low:
+        ren[low["close_ref"]] = "close"
+    elif "close" not in low and "Close" in df.columns:
+        ren["Close"] = "close"
+
+    # funding_rate priority: funding_rate -> fundingrate -> FundingRate
+    if "funding_rate" in low:
+        ren[low["funding_rate"]] = "funding_rate"
+    elif "fundingrate" in low:
+        ren[low["fundingrate"]] = "funding_rate"
+    elif "FundingRate" in df.columns:
+        ren["FundingRate"] = "funding_rate"
+
+    df = df.rename(columns=ren)
+    if "close" not in df.columns:
+        raise KeyError("processed/raw 데이터에 close(또는 close_ref/Close)가 필요합니다.")
+    if "funding_rate" not in df.columns:
+        df["funding_rate"] = 0.0
+    return df
+
+def load_raw(split: str) -> Tuple[np.ndarray, np.ndarray]:
+    path = os.path.join(RAW_DIR, f"fut_{split}_data_{INTERVAL}.parquet")
+    df = pd.read_parquet(path)
+    df = _normalize_df(df)
+    close = df["close"].to_numpy(dtype=np.float64)
+    funding = df["funding_rate"].to_numpy(dtype=np.float64)
+    return close, funding
+
+def load_processed(split: str):
+    path = os.path.join(PROC_DIR, f"fe_{split}_{INTERVAL}.parquet")
+    df = pd.read_parquet(path)
+    df = _normalize_df(df)
+
+    feat_path = os.path.join(PROC_DIR, f"fe_feature_list_{INTERVAL}.json")
+    if os.path.exists(feat_path):
+        with open(feat_path, "r", encoding="utf-8") as f:
+            feature_cols: List[str] = json.load(f)
+        exclude_low = {"time","open","high","low","close","volume","funding_rate","close_ref",
+                       "FundingRate","Open","High","Low","Close","Volume"}
+        feature_cols = [c for c in feature_cols if c not in exclude_low and c in df.columns]
+        if not feature_cols:
+            feature_cols = [c for c in df.columns if c not in exclude_low]
+    else:
+        exclude_low = {"time","open","high","low","close","volume","funding_rate","close_ref",
+                       "FundingRate","Open","High","Low","Close","Volume"}
+        feature_cols = [c for c in df.columns if c not in exclude_low]
+
+    X = df[feature_cols].to_numpy(dtype=np.float32)
+    close = df["close"].to_numpy(dtype=np.float64)
+    funding = df["funding_rate"].to_numpy(dtype=np.float64)
+    return X, close, funding, feature_cols
+
+# ===== Scaler (features only) =====
+class ZScaler:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+    def fit(self, X: np.ndarray):
+        self.mean = X.mean(axis=0)
+        self.std = X.std(axis=0); self.std[self.std==0] = 1.0
+    def transform(self, X: np.ndarray):
+        return (X - self.mean) / self.std
+
+# ===== VecNormalize 통계 동기화 헬퍼 =====
+def _sync_vecnorm_stats(src: VecNormalize, dst: VecNormalize):
+    """
+    일부 SB3 버전에 load_running_average가 없으므로 수동 복사.
+    src: 학습용 VecNormalize, dst: 검증/테스트용 VecNormalize
+    """
+    assert type(src).__name__ == "VecNormalize" and type(dst).__name__ == "VecNormalize"
+    if hasattr(src, "obs_rms") and src.obs_rms is not None:
+        dst.obs_rms = src.obs_rms
+    if hasattr(src, "ret_rms") and src.ret_rms is not None:
+        dst.ret_rms = src.ret_rms
+    for k in ("clip_obs", "clip_reward", "gamma", "epsilon"):
+        if hasattr(src, k):
+            setattr(dst, k, getattr(src, k))
+    dst.training = False  # 평가 시 학습 OFF
+
+# ===== Eval helper for Vec env =====
+def quick_eval_vec(model: PPO, env: VecNormalize, max_steps: int = 200_000):
+    obs = env.reset()
+    done = np.array([False])
+    R, steps, trades = 0.0, 0, 0
+    while not done.all() and steps < max_steps:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, rewards, done, infos = env.step(action)
+        R += float(rewards[0])
+        info0 = infos[0] if isinstance(infos, list) and len(infos) else {}
+        trades += int(info0.get("sides", 0))
+        steps += 1
+    return {"approx_total_return_normed": R, "steps": steps, "sides": trades}
+
+# ===== Train & Eval =====
+def run_all():
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    proc_ok = all(os.path.exists(os.path.join(PROC_DIR, f"fe_{sp}_{INTERVAL}.parquet")) for sp in SPLITS)
+
+    if proc_ok:
+        print("[RL] Using processed features (MTF) [CPU + VecNormalize]")
+        X_tr, c_tr, f_tr, cols = load_processed("train")
+        X_va, c_va, f_va, _   = load_processed("val")
+
+        scaler = ZScaler(); scaler.fit(X_tr)
+        X_tr_s = scaler.transform(X_tr); X_va_s = scaler.transform(X_va)
+
+        # ----- Vec env with reward normalization -----
+        def make_train_env():
+            return FeatureStackedEnv(X_tr_s, c_tr, f_tr, window=WINDOW,
+                                     fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                                     interval_min=INTERVAL_MIN, random_start=True, seed=SEED)
+
+        def make_eval_env():
+            return FeatureStackedEnv(X_va_s, c_va, f_va, window=WINDOW,
+                                     fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                                     interval_min=INTERVAL_MIN, random_start=False, seed=SEED)
+
+        env_tr = DummyVecEnv([make_train_env])
+        env_tr = VecNormalize(env_tr, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+
+        env_va = DummyVecEnv([make_eval_env])
+        env_va = VecNormalize(env_va, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+        _sync_vecnorm_stats(env_tr, env_va)
+
+        policy_kwargs = dict(net_arch=[256, 256])
+
+        model = PPO(
+            "MlpPolicy", env_tr,
+            n_steps=8192, batch_size=8192,            # 긴 롤아웃 / 큰 배치
+            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
+            learning_rate=3e-4, vf_coef=0.7,         # V 비중 ↑
+            policy_kwargs=policy_kwargs,
+            device="cpu", verbose=1, seed=SEED,
         )
-        truncated = False
+        model.learn(total_timesteps=TIMESTEPS)
 
-        obs = (self._obs() if not terminated else np.zeros_like(self._obs()))
-        info = {
-            "equity": float(self.equity),
-            "pos": int(self.pos),
-            "lam": float(self.lam),
-            "cost_ema": float(self.cost_ema),
-        }
-        return obs, float(reward), terminated, truncated, info
+        model_path = os.path.join(MODEL_DIR, "ppo_v1_features.zip")
+        model.save(model_path)
+        env_stats_path = os.path.join(MODEL_DIR, "ppo_v1_features_vecnorm.pkl")
+        try:
+            env_tr.save(env_stats_path)
+            print(f"[RL] Saved VecNormalize stats: {env_stats_path}")
+        except Exception as e:
+            print("[warn] VecNormalize save failed:", e)
+        print(f"[RL] Saved: {model_path}")
 
-# -----------------
-# 중간 로그 콜백
-# -----------------
-class MidLogger(BaseCallback):
-    def __init__(self, log_freq: int, csv_path: Optional[str]):
-        super().__init__()
-        self.log_freq = log_freq
-        self.csv_path = csv_path
-        self._last = 0
-        self._t0 = time.time()
-        if self.csv_path:
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([
-                    "timesteps", "elapsed_sec", "eval_mean", "equity",
-                    "act0", "act1", "act2", "act3", "entry_cnt", "exit_cnt",
-                    "r_mean", "lambda", "cost_ema"
-                ])
-        self._eval_mean = None
+        rep = quick_eval_vec(model, env_va)
+        print("[Eval: val | normalized return]", rep)
 
-    def set_eval(self, val: float | None):
-        self._eval_mean = None if val is None else float(val)
+        # test(옵션)
+        test_path = os.path.join(PROC_DIR, f"fe_test_{INTERVAL}.parquet")
+        if os.path.exists(test_path):
+            X_te, c_te, f_te, _ = load_processed("test")
+            X_te_s = scaler.transform(X_te)
+            env_te = DummyVecEnv([lambda: FeatureStackedEnv(
+                X_te_s, c_te, f_te, window=WINDOW,
+                fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
+            env_te = VecNormalize(env_te, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+            _sync_vecnorm_stats(env_tr, env_te)
+            rep_te = quick_eval_vec(model, env_te)
+            print("[Eval: test | normalized return]", rep_te)
 
-    def _on_step(self) -> bool:
-        t = int(self.model.num_timesteps)
-        if t - self._last >= self.log_freq:
-            self._last = t
-            elapsed = time.time() - self._t0
+    else:
+        print("[RL] Using raw (returns-only) [CPU + VecNormalize]")
+        c_tr, f_tr = load_raw("train")
+        c_va, f_va = load_raw("val")
 
-            inner = unwrap_to_trading_env(self.model.get_env())
+        env_tr = DummyVecEnv([lambda: SimpleTradingEnv(c_tr, f_tr, window=WINDOW,
+                            fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                            interval_min=INTERVAL_MIN, random_start=True, seed=SEED)])
+        env_tr = VecNormalize(env_tr, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
 
-            d = inner.diag
-            steps = max(d["n_steps"], 1)
-            a0 = d["act_hist"].get(0, 0); a1 = d["act_hist"].get(1, 0)
-            a2 = d["act_hist"].get(2, 0); a3 = d["act_hist"].get(3, 0)
-            r_mean = d["r_sum"] / steps
-            eq = float(inner.equity)
-            n_entry = d.get("n_entry", 0)
-            n_exit = d.get("n_exit", 0)
-            lam = d.get("lam", 0.0)
-            cost_ema = d.get("cost_ema", 0.0)
+        env_va = DummyVecEnv([lambda: SimpleTradingEnv(c_va, f_va, window=WINDOW,
+                            fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                            interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
+        env_va = VecNormalize(env_va, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+        _sync_vecnorm_stats(env_tr, env_va)
 
-            disp_eval = "-" if (self._eval_mean is None or not np.isfinite(self._eval_mean)) else round(float(self._eval_mean), 6)
-            print(f"[diag] steps={t:,} eq={eq:.6f} eval={disp_eval} act=[{a0},{a1},{a2},{a3}] "
-                  f"entry={n_entry} exit={n_exit} r_mean={r_mean:.6f} λ={lam:.4f} cost_ema={cost_ema:.6f}")
+        policy_kwargs = dict(net_arch=[256, 256])
+        model = PPO(
+            "MlpPolicy", env_tr,
+            n_steps=8192, batch_size=8192,
+            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
+            learning_rate=3e-4, vf_coef=0.7,
+            policy_kwargs=policy_kwargs,
+            device="cpu", verbose=1, seed=SEED,
+        )
+        model.learn(total_timesteps=TIMESTEPS)
 
-            if self.csv_path:
-                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow([
-                        t, round(elapsed, 2), ("" if disp_eval == "-" else disp_eval), eq,
-                        a0, a1, a2, a3, n_entry, n_exit, round(r_mean, 8),
-                        round(lam, 6), round(cost_ema, 8)
-                    ])
-            # 윈도우 진단 초기화
-            inner.diag["n_steps"] = 0
-            inner.diag["act_hist"] = {0: 0, 1: 0, 2: 0, 3: 0}
-            inner.diag["r_sum"] = 0.0
-            inner.diag["n_entry"] = 0
-            inner.diag["n_exit"] = 0
-        return True
+        model_path = os.path.join(MODEL_DIR, "ppo_v1_simple.zip")
+        model.save(model_path)
+        env_stats_path = os.path.join(MODEL_DIR, "ppo_v1_simple_vecnorm.pkl")
+        try:
+            env_tr.save(env_stats_path)
+            print(f"[RL] Saved VecNormalize stats: {env_stats_path}")
+        except Exception as e:
+            print("[warn] VecNormalize save failed:", e)
+        print(f"[RL] Saved: {model_path}")
 
-# -----------------
-# 학습
-# -----------------
-def main():
-    print("[info] PPO Training (Lagrangian cost constraint + 4-action flat)")
-    print(
-        f"✅ reward = {REWARD_SCALE}*(pnl−fee−funding)"
-        f" − λ*(cost−budget) + trend/hold penalty + entry bonus | "
-        f"budget={COST_BUDGET}, eta={LAMBDA_STEP}, λ_max={LAMBDA_MAX}, "
-        f"trend_thresh={TREND_THRESH}, bonus_h={ENTRY_BONUS_H}"
-    )
+        rep = quick_eval_vec(model, env_va)
+        print("[Eval: val | normalized return]", rep)
 
-    # 데이터 로드
-    X_train = _load_norm("train")
-    X_val = _load_norm("val")
-    close_train, funding_rate_train = _load_aux_data("train")
-    close_val, funding_rate_val = _load_aux_data("val")
-
-    def make_train():
-        return Monitor(TimeLimit(TradingEnv(X_train, close_train, funding_rate_train), max_episode_steps=MAX_EPISODE_STEPS))
-    def make_val():
-        return Monitor(TimeLimit(TradingEnv(X_val, close_val, funding_rate_val), max_episode_steps=MAX_EPISODE_STEPS))
-
-    train_env = DummyVecEnv([make_train])
-    val_env = DummyVecEnv([make_val])
-
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        device=DEVICE,
-        seed=SEED,
-        verbose=0,
-        tensorboard_log=None,
-        **BASE_PPO_KW,
-    )
-
-    mid_logger = MidLogger(LOG_FREQ, None)
-
-    class EnhancedEvalCallback(EvalCallback):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._last_eval_count = 0
-
-        def _on_step(self) -> bool:
-            cont = super()._on_step()
-            if hasattr(self, "evaluations_timesteps"):
-                cur_cnt = len(self.evaluations_timesteps)
-                if cur_cnt > self._last_eval_count and self.last_mean_reward is not None and np.isfinite(self.last_mean_reward):
-                    self._last_eval_count = cur_cnt
-                    mid_logger.set_eval(float(self.last_mean_reward))
-            return cont
-
-    eval_cb = EnhancedEvalCallback(
-        val_env,
-        best_model_save_path=MODEL_DIR,
-        log_path=None,
-        eval_freq=EVAL_FREQ,
-        n_eval_episodes=3,
-        deterministic=True,
-        render=False,
-        verbose=0,
-    )
-
-    cb = CallbackList([mid_logger, eval_cb])
-
-    try:
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=cb, progress_bar=False)
-        print("[OK] Training completed")
-    except KeyboardInterrupt:
-        print("[INFO] Training interrupted by user")
+        # test(옵션)
+        test_path = os.path.join(RAW_DIR, f"fut_test_data_{INTERVAL}.parquet")
+        if os.path.exists(test_path):
+            c_te, f_te = load_raw("test")
+            env_te = DummyVecEnv([lambda: SimpleTradingEnv(c_te, f_te, window=WINDOW,
+                                fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                                interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
+            env_te = VecNormalize(env_te, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+            _sync_vecnorm_stats(env_tr, env_te)
+            rep_te = quick_eval_vec(model, env_te)
+            print("[Eval: test | normalized return]", rep_te)
 
 if __name__ == "__main__":
-    main()
+    run_all()

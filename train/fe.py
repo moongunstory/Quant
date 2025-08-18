@@ -1,354 +1,323 @@
-"""
-Module 2 — Feature Engineering & Normalization for ETH Futures (No Leakage, No Warnings)
-
-Goal: compact, regime-aware features for RL without leakage.
-- Inputs: raw parquet (5m, 15m, 1h, 4h) → UTC index, sorted asc
-- Indicators (core only):
-  • Returns: ret1, ret12, ret48
-  • Volatility: atr14, hlv=(High-Low)/Close
-  • Trend: sma20_slope, macd_hist(12,26,9), adx14
-  • Position: bb_pos=(Close-mid)/(up-dn)
-  • Momentum: rsi14
-  • Volume: vol_norm=Volume/atr14  (log1p later)
-- Regime tags (one-hot):
-  • trend_strong(ADX14≥25)/trend_weak
-  • vola_high(ATR%≥q70 on TRAIN)/vola_low
-- Feature selection (noise cut):
-  • Unsupervised PCA-loading ranking on TRAIN → top N features (keep regime tags)
-- Normalize:
-  • log1p on Volume/ATR family → StandardScaler fit on TRAIN, reuse for VAL/TEST
-- Outputs:
-  • processed/train_normalized.parquet, val_normalized.parquet, test_normalized.parquet
-  • feature_list.json (selected features only)
-  • scaler.joblib
-  • normalize_stats.json (stores vola threshold & misc)
-"""
+# fe.py — Feature Engineering for ETHUSDT (5m)
+# - Loads raw splits from ./ai_binance/data/raw
+# - Keeps OHLCV + FundingRate (UNSCALED reference)
+# - Builds technical features (SCALed inputs)
+# - Optional feature search (MI or LightGBM) using a self-supervised proxy label (next 5m return sign)
+# - Saves processed splits + feature list + scaler to ./ai_binance/data/processed
+#
+# Output files:
+#   fe_train_5m.parquet, fe_val_5m.parquet, fe_test_5m.parquet
+#   fe_feature_list_5m.json, scaler_5m.joblib
 
 from __future__ import annotations
 
 import os
 import json
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import mutual_info_classif
 import joblib
 
-RAW_DIR = "./ai_binance/data/raw"
-PROC_DIR = "./ai_binance/data/processed"
-INTERVALS = ["5m", "15m", "1h", "4h"]
-BASE_INTERVAL = "5m"
-FEATURE_LIST_PATH = os.path.join(PROC_DIR, "feature_list.json")
-SCALER_JOBLIB = os.path.join(PROC_DIR, "scaler.joblib")
-SCALER_INFO_JSON = os.path.join(PROC_DIR, "normalize_stats.json")  # stores thresholds etc.
+# ===== Optional: LightGBM for model-based feature importance =====
+try:
+    import lightgbm as lgb
+    _HAS_LGB = True
+except Exception:
+    _HAS_LGB = False
 
-# ===== Regime & Selection params =====
-ADX_PERIOD = 14
-ZSCORE_WIN = 48            # (kept for potential future use)
-VOL_Q = 0.70               # 70th percentile on TRAIN atr_pct_5m
-TOP_N = 30                 # number of selected features (excluding forced keeps)
+# ===== Paths / Constants =====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw"))
+OUT_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
+INTERVAL = "5m"
 
-# =========================
-# IO helpers
-# =========================
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+FEATURE_LIST_PATH = os.path.join(OUT_DIR, f"fe_feature_list_{INTERVAL}.json")
+SCALER_PATH       = os.path.join(OUT_DIR, f"scaler_{INTERVAL}.joblib")
 
-def _load(split: str, interval: str) -> pd.DataFrame | None:
-    path = os.path.join(RAW_DIR, f"fut_{split}_data_{interval}.parquet")
-    if not os.path.exists(path):
-        return None
-    df = pd.read_parquet(path)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ===== Toggles =====
+FEATURE_SEARCH = True          # On/Off
+FEATURE_SEARCH_METHOD = "mi"   # "mi" | "lgbm"
+TOP_K_FEATURES = 128            # keep top-K features; set None to keep all
+RANDOM_STATE = 72
+
+# ===== Reference (unscaled) columns to keep =====
+REF_COLS_CANON = ["Open", "High", "Low", "Close", "Volume", "FundingRate"]
+
+# ===== Utilities =====
+
+def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.replace([np.inf, -np.inf], np.nan)
+    std = df.std(numeric_only=True)
+    zero_std_cols = std[std == 0].index.tolist()
+    if len(zero_std_cols) > 0:
+        df[zero_std_cols] = 0.0
+    return df.fillna(0.0)
+
+
+def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
+    if win is None:
+        mu, sd = s.mean(), s.std()
+        sd = sd if (sd and sd > 0) else np.nan
+        out = (s - mu) / sd
+    else:
+        mu = s.rolling(win, min_periods=win).mean()
+        sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
+        out = (s - mu) / sd
+    return out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def _load_raw(split: str) -> pd.DataFrame:
+    p = os.path.join(RAW_DIR, f"fut_{split}_data_{INTERVAL}.parquet")
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Raw split not found: {p}")
+    df = pd.read_parquet(p)
+
+    # Normalize column names present in Binance payloads
+    # Ensure OHLCV exists (case tolerant)
+    # Map lower to real case
+    cols = {c.lower(): c for c in df.columns}
+    # Ensure numeric types
+    for k in ["open","high","low","close","volume"]:
+        if k in cols:
+            real = cols[k]
+            df[real] = pd.to_numeric(df[real], errors="coerce")
+
+    # FundingRate normalization (either FundingRate or funding_rate)
+    if "FundingRate" in df.columns:
+        df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
+    elif "funding_rate" in df.columns:
+        df["FundingRate"] = pd.to_numeric(df["funding_rate"], errors="coerce").fillna(0.0)
+    else:
+        df["FundingRate"] = 0.0
+
+    # Log-stabilize scale-heavy columns to reduce overflow warnings down the line
+    for k in ["Volume", "Quote_asset_volume", "Taker_buy_base", "Taker_buy_quote"]:
+        if k in df.columns:
+            df[k] = np.log1p(np.clip(pd.to_numeric(df[k], errors="coerce"), 0, None))
+
+    # Set datetime index if present
+    for tcol in ["Open_time", "open_time", "time"]:
+        if tcol in df.columns:
+            idx = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+            if idx.notna().any():
+                df = df.set_index(idx).drop(columns=[tcol])
+                df.index.name = "time"
+                break
+
+    # Ensure canonical REF columns exist; if missing, backfill zeros
+    for c in REF_COLS_CANON:
+        if c not in df.columns:
+            df[c] = 0.0
+
     return df.sort_index()
 
-# =========================
-# Indicators (dependency-free)
-# =========================
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    d = series.diff()
-    up = d.clip(lower=0).rolling(period, min_periods=period).mean()
-    dn = (-d.clip(upper=0)).rolling(period, min_periods=period).mean()
-    rs = up / dn.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
 
-def _indicators(df: pd.DataFrame, itv: str) -> pd.DataFrame:
-    """Return ONLY engineered features to keep merge clean."""
-    x = pd.DataFrame(index=df.index)
+# ===== Technical Indicators / Engineered Features =====
+
+def _ta_basic(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # Use canonical Close column for returns
+    close = out["Close"].astype("float64")
 
     # Returns
-    x[f"ret1_{itv}"] = df["Close"].pct_change()
-    x[f"ret12_{itv}"] = df["Close"].pct_change(12)
-    x[f"ret48_{itv}"] = df["Close"].pct_change(48)
+    out["ret_1"]   = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_3"]   = close.pct_change(3).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_6"]   = close.pct_change(6).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_12"]  = close.pct_change(12).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    # Volatility
-    prev_close = df["Close"].shift()
-    tr = np.maximum(
-        df["High"] - df["Low"],
-        np.maximum((df["High"] - prev_close).abs(), (df["Low"] - prev_close).abs()),
-    )
-    atr14 = pd.Series(tr, index=df.index).rolling(14, min_periods=14).mean()
-    x[f"atr14_{itv}"] = atr14
-    x[f"hlv_{itv}"] = (df["High"] - df["Low"]) / df["Close"].replace(0, np.nan)
+    # Rolling z-scores
+    out["z_close_48"] = zscore(close, win=48)
+    out["z_ret1_48"]  = zscore(out["ret_1"], win=48)
 
-    # Trend: SMA20 slope
-    sma20 = df["Close"].rolling(20, min_periods=20).mean()
-    x[f"sma20_slope_{itv}"] = sma20.diff()
+    # Moving averages
+    out["ema_12"] = close.ewm(span=12, adjust=False).mean()
+    out["ema_26"] = close.ewm(span=26, adjust=False).mean()
+    out["macd"]   = out["ema_12"] - out["ema_26"]
+    out["macd_sig"] = out["macd"].ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = out["macd"] - out["macd_sig"]
 
-    # MACD hist (12,26,9)
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    x[f"macd_hist_{itv}"] = macd - macd_sig
+    # RSI (Wilder's)
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50)
 
-    # ADX(14)
-    up_move = df["High"].diff()
-    down_move = -df["Low"].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr_adx = pd.Series(tr, index=df.index).rolling(ADX_PERIOD, min_periods=ADX_PERIOD).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(ADX_PERIOD, min_periods=ADX_PERIOD).mean() / atr_adx.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(ADX_PERIOD, min_periods=ADX_PERIOD).mean() / atr_adx.replace(0, np.nan)
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
-    x[f"adx14_{itv}"] = dx.rolling(ADX_PERIOD, min_periods=ADX_PERIOD).mean()
+    # Volatility / Range features
+    high, low = out["High"].astype("float64"), out["Low"].astype("float64")
+    out["hl_spread"]   = (high - low) / (close.replace(0, np.nan))
+    out["atr14"]       = _atr(out, period=14)
+    out["vol_z_48"]    = zscore(out["Volume"].astype("float64"), win=48)
 
-    # Bollinger position (20)
-    bb_mid = sma20
-    bb_std = df["Close"].rolling(20, min_periods=20).std()
-    bb_up = bb_mid + 2 * bb_std
-    bb_dn = bb_mid - 2 * bb_std
-    span = (bb_up - bb_dn).replace(0, np.nan)
-    x[f"bb_pos_{itv}"] = (df["Close"] - bb_mid) / span
+    # Funding-related
+    out["funding_z_48"] = zscore(out["FundingRate"].astype("float64"), win=48)
 
-    # Momentum
-    x[f"rsi14_{itv}"] = _rsi(df["Close"], 14)
-
-    # Volume (normalized by ATR14)
-    x[f"vol_norm_{itv}"] = df["Volume"] / atr14.replace(0, np.nan)
-
-    # For regime tagging on BASE interval: ATR% = atr14/Close
-    if itv == BASE_INTERVAL:
-        x[f"atr_pct_{itv}"] = (atr14 / df["Close"].replace(0, np.nan))
-
-    return x
-
-# =========================
-# Merge MTF → base index
-# =========================
-def _merge(split: str) -> pd.DataFrame:
-    dfs: Dict[str, pd.DataFrame] = {}
-    for itv in INTERVALS:
-        df = _load(split, itv)
-        if df is not None and not df.empty:
-            dfs[itv] = _indicators(df, itv)
-    if BASE_INTERVAL not in dfs:
-        raise ValueError(f"[{split}] missing base interval {BASE_INTERVAL}")
-
-    out = dfs[BASE_INTERVAL].copy()  # base features are not suffixed (already include itv in names)
-    for itv, df in dfs.items():
-        if itv == BASE_INTERVAL:
-            continue
-        out = pd.merge_asof(
-            out.sort_index(),
-            df.sort_index(),  # every column already includes _{itv} suffix
-            left_index=True,
-            right_index=True,
-            direction="backward",
-        )
+    # Clean
+    out = _sanitize(out)
     return out
 
-# =========================
-# Regime Tags (TRAIN threshold → apply to all)
-# =========================
-def _add_regime_columns(df: pd.DataFrame, vola_thresh: float) -> pd.DataFrame:
-    out = df.copy()
-    adx = out.get(f"adx14_{BASE_INTERVAL}")
-    atr_pct = out.get(f"atr_pct_{BASE_INTERVAL}")
 
-    trend_strong = (adx >= 25).astype(float) if adx is not None else 0.0
-    trend_weak = 1.0 - trend_strong
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"].astype("float64")
+    low  = df["Low"].astype("float64")
+    close= df["Close"].astype("float64")
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-    vola_high = (atr_pct >= vola_thresh).astype(float) if atr_pct is not None else 0.0
-    vola_low = 1.0 - vola_high
 
-    out["trend_strong"] = trend_strong
-    out["trend_weak"] = trend_weak
-    out["vola_high"] = vola_high
-    out["vola_low"] = vola_low
-    return out
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = _ta_basic(df)
+    # Ensure REF columns are present and unscaled; create explicit copies for clarity
+    for c in REF_COLS_CANON:
+        if c not in out.columns and c in df.columns:
+            out[c] = df[c]
+    # Reference copies (for downstream clarity); not scaled
+    out["close_ref"] = out["Close"].astype("float64")
+    return _sanitize(out)
 
-# =========================
-# Normalization helpers
-# =========================
-def _numeric(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.select_dtypes(include=["float64", "float32", "int64", "int32"]).copy()
-    # log1p for heavy-tail families: volume/atr
-    for c in list(x.columns):
-        lc = c.lower()
-        if ("volume" in lc) or ("vol_" in lc) or lc.startswith("vol") or ("atr" in lc):
-            x[c] = np.log1p(x[c].clip(lower=0))
-    return x
 
-def _force_keep_features(df: pd.DataFrame) -> List[str]:
-    """
-    레짐 태그 + ADX 원시값(모든 TF)을 강제 포함.
-    df: _numeric() 통과 후의 숫자형 DataFrame
-    """
-    base_keep = ["trend_strong", "trend_weak", "vola_high", "vola_low"]
-    # 모든 타임프레임 ADX 보존 (예: adx14_5m, adx14_15m, ...)
-    adx_cols = [c for c in df.columns if c.lower().startswith("adx14_")]
+# ===== Feature Search =====
 
-    seen, kept = set(), []
-    for c in base_keep + adx_cols:
-        if c in df.columns and c not in seen:
-            kept.append(c); seen.add(c)
-    return kept
+def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
+    """Self-supervised proxy label: next-bar return sign in {0,1}."""
+    y = df["Close"].astype("float64").pct_change().shift(-1)
+    y = (y > 0).astype(int)
+    return y.fillna(0)
 
-def _pca_feature_rank(train_df: pd.DataFrame, force_keep: List[str], top_n: int = TOP_N) -> List[str]:
-    """Unsupervised ranking by PCA loading energy weighted by explained variance."""
-    X = train_df.dropna()
-    if X.empty or X.shape[1] == 0:
-        return list(dict.fromkeys(force_keep))
 
-    # Z-score for PCA
-    scaler = StandardScaler()
-    Z = scaler.fit_transform(X)
+def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
+    # mutual_info_classif expects finite values
+    X_ = _sanitize(X).astype("float64")
+    y_ = y.astype(int).values
+    mi = mutual_info_classif(X_, y_, random_state=RANDOM_STATE, discrete_features=False)
+    scores = pd.Series(mi, index=X_.columns).sort_values(ascending=False)
+    keep = scores.head(top_k).index.tolist()
+    return keep
 
-    n_samples, n_features = Z.shape
-    # PCA 제약: n_components <= min(n_samples, n_features) and >= 1
-    k = max(1, min(top_n, n_features, n_samples))
 
-    # 'randomized' 인자 제거
-    pca = PCA(n_components=k, svd_solver="auto")
-    pca.fit(Z)
+def _feature_search_lgbm(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
+    if not _HAS_LGB:
+        # Fallback to MI if LightGBM is unavailable
+        return _feature_search_mi(X, y, top_k)
+    X_ = _sanitize(X).astype("float64")
+    y_ = y.astype(int).values
+    dtrain = lgb.Dataset(X_, label=y_)
+    params = dict(objective="binary", metric="auc", learning_rate=0.05, num_leaves=31,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, verbose=-1,
+                  seed=RANDOM_STATE)
+    gbm = lgb.train(params, dtrain, num_boost_round=300)
+    imp = pd.Series(gbm.feature_importance(importance_type="gain"), index=X_.columns)
+    keep = imp.sort_values(ascending=False).head(top_k).index.tolist()
+    return keep
 
-    loadings = pca.components_                 # (k, n_features)
-    weights = pca.explained_variance_ratio_.reshape(-1, 1)  # (k, 1)
-    imp = (loadings ** 2) * weights            # (k, n_features)
-    scores = imp.sum(axis=0)                   # (n_features,)
-    feats = list(X.columns)
 
-    ranked = [f for _, f in sorted(zip(scores, feats), key=lambda t: float(t[0]), reverse=True)]
+def _select_features(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+    # Determine feature columns: exclude REF columns and explicit refs
+    exclude = set(REF_COLS_CANON + ["close_ref"])
+    feat_cols = [c for c in train.columns if c not in exclude]
 
-    # force_keep을 항상 포함(앞쪽 고정)
-    forced = [f for f in force_keep if f in feats]
-    ranked = [f for f in ranked if f not in set(forced)]
-    selected = forced + ranked[:top_n]
+    if (not FEATURE_SEARCH) or (TOP_K_FEATURES is None) or (TOP_K_FEATURES >= len(feat_cols)):
+        return train, val, test, feat_cols
 
-    # 순서 유지 중복 제거
-    seen, final = set(), []
-    for f in selected:
-        if f not in seen:
-            final.append(f); seen.add(f)
-    return final
+    # Build proxy label on TRAIN only
+    y_tr = _make_proxy_y(train)
 
-def _fit_scaler_and_save(train_df: pd.DataFrame, feature_cols: List[str]) -> Tuple[pd.DataFrame, StandardScaler]:
-    numeric = train_df[feature_cols].dropna()
-    scaler = StandardScaler()
-    arr = scaler.fit_transform(numeric)
-    norm = pd.DataFrame(arr, index=numeric.index, columns=feature_cols)
-    _ensure_dir(PROC_DIR)
-    joblib.dump(scaler, SCALER_JOBLIB)
-    with open(FEATURE_LIST_PATH, "w") as f:
-        json.dump(feature_cols, f, indent=2)
-    return norm, scaler
+    if FEATURE_SEARCH_METHOD == "lgbm":
+        keep = _feature_search_lgbm(train[feat_cols], y_tr, TOP_K_FEATURES)
+    else:
+        keep = _feature_search_mi(train[feat_cols], y_tr, TOP_K_FEATURES)
 
-def _apply_scaler(df: pd.DataFrame, feature_cols: List[str], scaler: StandardScaler) -> pd.DataFrame:
-    x = df.copy()
-    # align & dropna like TRAIN
-    for c in feature_cols:
-        if c not in x.columns:
-            x[c] = np.nan
-    x = x[feature_cols].dropna()
-    arr = scaler.transform(x)
-    return pd.DataFrame(arr, index=x.index, columns=feature_cols)
+    for df in (train, val, test):
+        for c in keep:
+            if c not in df.columns:
+                df[c] = 0.0
 
-def _save_norm(df: pd.DataFrame, split: str) -> None:
-    _ensure_dir(PROC_DIR)
-    path = os.path.join(PROC_DIR, f"{split}_normalized.parquet")
-    df.to_parquet(path)
-    print(f"[ok] {split} normalized → {path}")
+    train_sel = pd.concat([train[keep], train[REF_COLS_CANON + ["close_ref"]]], axis=1)
+    val_sel   = pd.concat([val[keep],   val[REF_COLS_CANON + ["close_ref"]]], axis=1)
+    test_sel  = pd.concat([test[keep],  test[REF_COLS_CANON + ["close_ref"]]], axis=1)
+    return train_sel, val_sel, test_sel, keep
 
-# =========================
-# Pipeline
-# =========================
-def _build(split: str, vola_thresh: float) -> pd.DataFrame:
-    merged = _merge(split)
-    merged = _add_regime_columns(merged, vola_thresh)
-    return merged
 
-def main() -> None:
-    _ensure_dir(PROC_DIR)
+# ===== Scaling / Saving =====
 
-    # 1) TRAIN merge + regime thresholds
-    train_merged = _merge("train")
-    # derive vola threshold from TRAIN only
-    atr_pct_col = f"atr_pct_{BASE_INTERVAL}"
-    if atr_pct_col not in train_merged.columns:
-        raise RuntimeError(f"Missing {atr_pct_col} for volatility regime threshold.")
-    vola_thresh = float(np.nanquantile(train_merged[atr_pct_col].values, VOL_Q))
-    # attach regimes to TRAIN
-    train_merged = _add_regime_columns(train_merged, vola_thresh)
+def _split_X_ref(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ref = df[REF_COLS_CANON + ["close_ref"]].copy()
+    X = df.drop(columns=[c for c in ref.columns if c in df.columns], errors="ignore")
+    return X, ref
 
-    # 2) Feature selection on TRAIN (unsupervised PCA ranking)
-    # Candidates: numeric engineered + regime tags; exclude helper atr_pct column from selection
-    train_numeric = _numeric(train_merged)
-    force_keep = _force_keep_features(train_numeric)
-    # ensure helper not considered
-    if atr_pct_col in train_numeric.columns:
-        train_numeric = train_numeric.drop(columns=[atr_pct_col])
-    selected_feats = _pca_feature_rank(train_numeric, force_keep=force_keep, top_n=TOP_N)
 
-    # 3) Fit StandardScaler on TRAIN(selected) and save artifacts
-    # Keep only selected columns (dropna to align)
-    train_selected = train_numeric[selected_feats]
-    train_norm, scaler = _fit_scaler_and_save(train_selected, selected_feats)
+def _scale_and_merge(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, feature_cols: List[str]):
+    scaler = StandardScaler(with_mean=True, with_std=True)
 
-    # Save stats JSON (for reproducibility & VAL/TEST)
-    with open(SCALER_INFO_JSON, "w") as f:
-        json.dump(
-            {
-                "info": "StandardScaler for FE; PCA-loading selection on TRAIN.",
-                "vola_quantile": VOL_Q,
-                "vola_threshold_on_train_atr_pct": vola_thresh,
-                "base_interval": BASE_INTERVAL,
-                "top_n": TOP_N,
-                "feature_count": len(selected_feats),
-            },
-            f,
-            indent=2,
-        )
+    X_tr, ref_tr = _split_X_ref(train)
+    X_va, ref_va = _split_X_ref(val)
+    X_te, ref_te = _split_X_ref(test)
 
-    _save_norm(train_norm, "train")
+    X_tr = _sanitize(X_tr.astype("float64"))
+    X_va = _sanitize(X_va.astype("float64"))
+    X_te = _sanitize(X_te.astype("float64"))
 
-    # 4) VAL/TEST — build with same threshold, same features, same scaler
-    for split in ["val", "test"]:
-        merged = None
-        try:
-            merged = _build(split, vola_thresh)
-        except ValueError:
-            print(f"[skip] {split} missing base interval {BASE_INTERVAL}")
-            continue
-        if merged is None or merged.empty:
-            print(f"[skip] {split} has no data")
-            continue
-        X = _numeric(merged)
-        # drop helper
-        if atr_pct_col in X.columns:
-            X = X.drop(columns=[atr_pct_col])
-        # align columns to selected
-        for c in selected_feats:
-            if c not in X.columns:
-                X[c] = np.nan
-        X = X[selected_feats]
-        norm = _apply_scaler(X, selected_feats, scaler)
-        _save_norm(norm, split)
+    scaler.fit(X_tr[feature_cols])
+    X_tr[feature_cols] = scaler.transform(X_tr[feature_cols])
+    X_va[feature_cols] = scaler.transform(X_va[feature_cols])
+    X_te[feature_cols] = scaler.transform(X_te[feature_cols])
 
-    print("[OK] FE pipeline completed: compact features, regime tags, PCA-selected, normalized without leakage.")
+    tr_out = pd.concat([X_tr[feature_cols], ref_tr], axis=1)
+    va_out = pd.concat([X_va[feature_cols], ref_va], axis=1)
+    te_out = pd.concat([X_te[feature_cols], ref_te], axis=1)
+
+    # Final safety & save
+    def _save(df: pd.DataFrame, split: str):
+        df = _sanitize(df)
+        assert np.isfinite(df.select_dtypes(include=[np.number])).all().all(), f"Non-finite detected in {split}"
+        out_p = os.path.join(OUT_DIR, f"fe_{split}_{INTERVAL}.parquet")
+        df.to_parquet(out_p)
+        print(f"[ok] {split}: {len(df):,} x {df.shape[1]} → {out_p}")
+
+    _save(tr_out, "train")
+    _save(va_out, "val")
+    _save(te_out, "test")
+
+    with open(FEATURE_LIST_PATH, "w", encoding="utf-8") as f:
+        json.dump(feature_cols, f, ensure_ascii=False, indent=2)
+    joblib.dump(scaler, SCALER_PATH)
+    print(f"[ok] feature list → {FEATURE_LIST_PATH}")
+    print(f"[ok] scaler → {SCALER_PATH}")
+
+
+# ===== Main =====
+
+def main():
+    # 1) Load raw splits
+    df_tr = _load_raw("train")
+    df_va = _load_raw("val")
+    df_te = _load_raw("test")
+
+    # 2) Compute features (OHLCV + Funding kept unscaled)
+    fe_tr = compute_features(df_tr)
+    fe_va = compute_features(df_va)
+    fe_te = compute_features(df_te)
+
+    # 3) Feature search (optional)
+    fe_tr, fe_va, fe_te, feat_cols = _select_features(fe_tr, fe_va, fe_te)
+
+    # 4) Scale features & save together with REF columns
+    _scale_and_merge(fe_tr, fe_va, fe_te, feat_cols)
+
 
 if __name__ == "__main__":
     main()
