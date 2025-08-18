@@ -26,7 +26,7 @@ WINDOW        = 48            # 5m 기준 4시간
 INTERVAL_MIN  = 5
 FEE_PER_SIDE  = 0.0005
 SLIP_PER_SIDE = 0.0001
-HOLDING_PENALTY = 0.00001 # 포지션 보유 시 스텝당 페널티
+REWARD_HORIZON= 12            # 12 * 5m = 1 hour
 SEED          = 42
 TIMESTEPS     = 2_000_000
 
@@ -72,7 +72,7 @@ class SimpleTradingEnv(gym.Env):
         super().reset(seed=seed)
         self.pos = 0
         self.bars_in_pos = 0
-        self.t = self._rng.integers(self.window, len(self.close)-2) if self.random_start else self.window
+        self.t = self._rng.integers(self.window, len(self.close)-REWARD_HORIZON-2) if self.random_start else self.window
         return self._obs(self.t), {}
 
     def step(self, action: int):
@@ -88,19 +88,26 @@ class SimpleTradingEnv(gym.Env):
             elif self.pos == +1: new_pos, sides = -1, 2
         elif action == 3: # flat
             if self.pos != 0: new_pos, sides = 0, 1
-        r = self.ret[self.t]
-        simple_ret = np.exp(r) - 1.0
-        fund_step = (self.funding[self.t] / max(1, int(round(480 / self.interval_min)))) * new_pos
+        
+        # --- Reward Calculation (Long Horizon) ---
+        entry_price = self.close[self.t - 1]
+        future_price_idx = min(self.t - 1 + REWARD_HORIZON, len(self.close) - 1)
+        future_price = self.close[future_price_idx]
+        horizon_return = (future_price / entry_price) - 1.0 if entry_price > 0 else 0.0
+
         fee_step = sides * self.cost_per_side
-        reward = (new_pos * simple_ret) - fee_step - fund_step
-        if new_pos != 0:
-            reward -= HOLDING_PENALTY
+        reward = (new_pos * horizon_return) - fee_step
+
+        # --- State Update ---
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
-        terminated = (self.t >= len(self.close) - 1)
+        terminated = (self.t >= len(self.close) - REWARD_HORIZON - 1)
         obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
-        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step)}
+        
+        # --- Info Dict (for logging) ---
+        simple_ret = np.exp(self.ret[self.t-1]) - 1.0
+        info = {"ret": float(simple_ret), "sides": int(sides), "fee_step": float(fee_step)}
         return obs, float(reward), terminated, False, info
 
 # ===== ENV (features-stacked) =====
@@ -140,7 +147,7 @@ class FeatureStackedEnv(gym.Env):
         super().reset(seed=seed)
         self.pos = 0
         self.bars_in_pos = 0
-        self.t = self._rng.integers(self.window, len(self.close)-2) if self.random_start else self.window
+        self.t = self._rng.integers(self.window, len(self.close)-REWARD_HORIZON-2) if self.random_start else self.window
         return self._obs(self.t), {}
 
     def step(self, action: int):
@@ -156,19 +163,26 @@ class FeatureStackedEnv(gym.Env):
             if self.pos == 0: new_pos, sides = -1, 1
         elif action == 3:
             if self.pos != 0: new_pos, sides = 0, 1
-        r = self.ret[self.t]
-        simple_ret = np.exp(r) - 1.0
-        fund_step = (self.funding[self.t] / self.fund_div) * new_pos
+
+        # --- Reward Calculation (Long Horizon) ---
+        entry_price = self.close[self.t - 1]
+        future_price_idx = min(self.t - 1 + REWARD_HORIZON, len(self.close) - 1)
+        future_price = self.close[future_price_idx]
+        horizon_return = (future_price / entry_price) - 1.0 if entry_price > 0 else 0.0
+
         fee_step = sides * self.cost_per_side
-        reward = (new_pos * simple_ret) - fee_step - fund_step
-        if new_pos != 0:
-            reward -= HOLDING_PENALTY
+        reward = (new_pos * horizon_return) - fee_step
+
+        # --- State Update ---
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
-        terminated = (self.t >= len(self.close) - 1)
+        terminated = (self.t >= len(self.close) - REWARD_HORIZON - 1)
         obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
-        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step), "pos": self.pos}
+
+        # --- Info Dict (for logging) ---
+        simple_ret = np.exp(self.ret[self.t-1]) - 1.0
+        info = {"ret": float(simple_ret), "sides": int(sides), "fee_step": float(fee_step), "pos": self.pos}
         return obs, float(reward), terminated, False, info
 
 # ===== Data loaders =====
@@ -182,7 +196,6 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if "open_time" in low: ren[low["open_time"]] = "time"
     if "time" in low: ren[low["time"]] = "time"
 
-    # close priority: close -> close_ref -> Close
     if "close" in low:
         ren[low["close"]] = "close"
     elif "close_ref" in low:
@@ -190,7 +203,6 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     elif "close" not in low and "Close" in df.columns:
         ren["Close"] = "close"
 
-    # funding_rate priority: funding_rate -> fundingrate -> FundingRate
     if "funding_rate" in low:
         ren[low["funding_rate"]] = "funding_rate"
     elif "fundingrate" in low:
@@ -250,10 +262,6 @@ class ZScaler:
 
 # ===== VecNormalize 통계 동기화 헬퍼 =====
 def _sync_vecnorm_stats(src: VecNormalize, dst: VecNormalize):
-    """
-    일부 SB3 버전에 load_running_average가 없으므로 수동 복사.
-    src: 학습용 VecNormalize, dst: 검증/테스트용 VecNormalize
-    """
     assert type(src).__name__ == "VecNormalize" and type(dst).__name__ == "VecNormalize"
     if hasattr(src, "obs_rms") and src.obs_rms is not None:
         dst.obs_rms = src.obs_rms
@@ -262,14 +270,10 @@ def _sync_vecnorm_stats(src: VecNormalize, dst: VecNormalize):
     for k in ("clip_obs", "clip_reward", "gamma", "epsilon"):
         if hasattr(src, k):
             setattr(dst, k, getattr(src, k))
-    dst.training = False  # 평가 시 학습 OFF
+    dst.training = False
 
 # ===== 학습률 스케줄러 (progress_remaining → lr) =====
 def linear_schedule(initial_lr: float, final_lr: float) -> Callable[[float], float]:
-    """
-    SB3 PPO는 learning_rate에 float 또는 callable(progress_remaining)->lr 허용.
-    progress_remaining: 1→0 (학습 진행에 따라 감소)
-    """
     def _lr(progress_remaining: float) -> float:
         return final_lr + (initial_lr - final_lr) * float(progress_remaining)
     return _lr
@@ -286,7 +290,6 @@ def run_all():
         scaler = ZScaler(); scaler.fit(X_tr)
         X_tr_s = scaler.transform(X_tr)
 
-        # ----- 병렬 학습 환경 -----
         def make_train_env(i):
             def _t():
                 return FeatureStackedEnv(X_tr_s, c_tr, f_tr, window=WINDOW,
@@ -296,15 +299,14 @@ def run_all():
         env_tr = SubprocVecEnv([make_train_env(i) for i in range(N_ENVS)])
         env_tr = VecNormalize(env_tr, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
 
-        # ----- PPO with LR schedule -----
         policy_kwargs = dict(net_arch=NET_ARCH)
-        lr_sched = linear_schedule(initial_lr=1e-3, final_lr=3e-4)   # 시작은 1e-3, 후반 3e-4로 감쇠
+        lr_sched = linear_schedule(initial_lr=1e-3, final_lr=3e-4)
 
         model = PPO(
             "MlpPolicy", env_tr,
             n_steps=N_STEPS, batch_size=BATCH_SIZE, n_epochs=N_EPOCHS,
             gamma=0.99, gae_lambda=0.95, clip_range=CLIP_RANGE,
-            learning_rate=lr_sched,        # << 스케줄 적용
+            learning_rate=lr_sched,
             ent_coef=ENTROPY_COEF,
             vf_coef=VF_COEF,
             policy_kwargs=policy_kwargs,
@@ -312,7 +314,6 @@ def run_all():
         )
         model.learn(total_timesteps=TIMESTEPS)
 
-        # ----- 저장 -----
         model_path = os.path.join(MODEL_DIR, "ppo_mtf_features.zip")
         model.save(model_path)
         env_stats_path = os.path.join(MODEL_DIR, "ppo_mtf_vecnorm.pkl")
