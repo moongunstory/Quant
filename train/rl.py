@@ -1,10 +1,11 @@
-# rl.py (SubprocVecEnv + VecNormalize + LR schedule + CPU + column compatibility)
+# rl.py (SubprocVecEnv + VecNormalize + LR schedule + CPU + column compatibility + FIXED REWARD)
 from __future__ import annotations
 import os
 # ---- Force CPU ----
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import json
+from enum import Enum
 from typing import Tuple, List, Callable
 
 import numpy as np
@@ -13,7 +14,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 # ===== Settings =====
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -40,12 +41,20 @@ ENTROPY_COEF  = 0.01
 VF_COEF       = 0.70
 NET_ARCH      = [256, 256]
 
+# ===== Reward Mode =====
+class RewardMode(str, Enum):
+    PNL_STEP = "pnl_step"          # 1바 실현 PnL 보상
+    HORIZON_ON_TRADE = "horizon"   # 진입/전환 시 1회 horizon 보상(보유 중 0)
+
 # ===== ENV (returns-only) =====
 class SimpleTradingEnv(gym.Env):
     metadata = {"render_modes": []}
     def __init__(self, close, funding_rate=None, window=48,
                  fee_per_side=0.0005, slip_per_side=0.0001,
-                 interval_min=5, random_start=True, seed: int = 42):
+                 interval_min=5, random_start=True, seed: int = 42,
+                 reward_mode: RewardMode = RewardMode.PNL_STEP,
+                 reward_horizon: int = REWARD_HORIZON,
+                 min_hold_bars: int = 0):
         close = np.asarray(close, dtype=np.float64)
         assert len(close) >= window + 2, "데이터가 너무 짧음"
         self.close = close
@@ -55,11 +64,18 @@ class SimpleTradingEnv(gym.Env):
         self.ret = np.diff(np.log(self.close))
         self.random_start = bool(random_start)
         self.interval_min = int(interval_min)
+        # 8시간(=480분) / interval
         self.fund_div = max(1, int(round(480 / max(1, self.interval_min))))
         self._rng = np.random.default_rng(seed)
         self.pos = 0
         self.bars_in_pos = 0
         self.t = self.window
+
+        self.reward_mode = reward_mode
+        self.H = int(reward_horizon)
+        self.min_hold = int(min_hold_bars)
+        self.last_trade_bar = -10**9
+
         obs_dim = self.window + 2
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)
@@ -72,42 +88,74 @@ class SimpleTradingEnv(gym.Env):
         super().reset(seed=seed)
         self.pos = 0
         self.bars_in_pos = 0
-        self.t = self._rng.integers(self.window, len(self.close)-REWARD_HORIZON-2) if self.random_start else self.window
+        last_safe = len(self.close) - max(self.H, 1) - 2
+        start_hi = max(self.window, last_safe)
+        self.t = self._rng.integers(self.window, start_hi) if self.random_start else self.window
         return self._obs(self.t), {}
 
     def step(self, action: int):
         sides = 0
         new_pos = self.pos
+
+        # --- 액션 처리(일관 규칙) ---
         if action == 0:   # hold
             new_pos = self.pos
         elif action == 1: # long
-            if self.pos == 0: new_pos, sides = +1, 1
+            if   self.pos == 0:  new_pos, sides = +1, 1
             elif self.pos == -1: new_pos, sides = +1, 2
         elif action == 2: # short
-            if self.pos == 0: new_pos, sides = -1, 1
+            if   self.pos == 0:  new_pos, sides = -1, 1
             elif self.pos == +1: new_pos, sides = -1, 2
         elif action == 3: # flat
-            if self.pos != 0: new_pos, sides = 0, 1
-        
-        # --- Reward Calculation (Long Horizon) ---
-        entry_price = self.close[self.t - 1]
-        future_price_idx = min(self.t - 1 + REWARD_HORIZON, len(self.close) - 1)
-        future_price = self.close[future_price_idx]
-        horizon_return = (future_price / entry_price) - 1.0 if entry_price > 0 else 0.0
+            if self.pos != 0:    new_pos, sides = 0, 1
 
+        # --- 최소 보유 강제(옵션) ---
+        if self.pos != 0 and self.bars_in_pos < self.min_hold and new_pos != self.pos:
+            new_pos, sides = self.pos, 0  # 액션 무시(hold)
+
+        # --- 비용 계산 ---
         fee_step = sides * self.cost_per_side
-        reward = (new_pos * horizon_return) - fee_step
 
-        # --- State Update ---
+        # --- 펀딩: 정확히 8시간 주기에만 적용 ---
+        funding_penalty = 0.0
+        if self.fund_div > 0 and self.pos != 0:
+            if ((self.t - 1) % self.fund_div) == 0:
+                # long이 +rate 지불(음), short은 -rate 지불(양)이 될 수 있음
+                funding_penalty = self.pos * float(self.funding[self.t - 1])
+
+        # --- 보상 계산 ---
+        if self.reward_mode == RewardMode.PNL_STEP:
+            # 1바 실현 수익
+            step_ret = (self.close[self.t] / self.close[self.t - 1]) - 1.0
+            reward = (self.pos * step_ret) - fee_step - funding_penalty
+        else:  # RewardMode.HORIZON_ON_TRADE
+            if sides > 0:
+                entry_price = self.close[self.t - 1]
+                future_idx  = min(self.t - 1 + self.H, len(self.close) - 1)
+                horizon_ret = (self.close[future_idx] / entry_price) - 1.0 if entry_price > 0 else 0.0
+                reward = (new_pos * horizon_ret) - fee_step - funding_penalty
+            else:
+                reward = -funding_penalty  # 보유/홀드 구간엔 horizon 보상 없음
+
+        # --- 상태 업데이트 ---
+        if sides > 0:
+            self.last_trade_bar = self.t
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
-        terminated = (self.t >= len(self.close) - REWARD_HORIZON - 1)
+
+        # 종료 판정(보상 모드별 안전 인덱스)
+        if self.reward_mode == RewardMode.PNL_STEP:
+            last_safe_t = len(self.close) - 1
+        else:
+            last_safe_t = len(self.close) - self.H - 1
+        terminated = (self.t >= last_safe_t)
+
         obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
-        
-        # --- Info Dict (for logging) ---
-        simple_ret = np.exp(self.ret[self.t-1]) - 1.0
-        info = {"ret": float(simple_ret), "sides": int(sides), "fee_step": float(fee_step)}
+
+        simple_ret = float(np.exp(self.ret[min(self.t-1, len(self.ret)-1)]) - 1.0)
+        info = {"ret": simple_ret, "sides": int(sides), "fee_step": float(fee_step),
+                "funding": float(funding_penalty), "pos": int(self.pos)}
         return obs, float(reward), terminated, False, info
 
 # ===== ENV (features-stacked) =====
@@ -116,7 +164,10 @@ class FeatureStackedEnv(gym.Env):
     metadata = {"render_modes": []}
     def __init__(self, X: np.ndarray, close: np.ndarray, funding_rate: np.ndarray,
                  window=48, fee_per_side=0.0005, slip_per_side=0.0001,
-                 interval_min=5, random_start=True, seed: int = 42):
+                 interval_min=5, random_start=True, seed: int = 42,
+                 reward_mode: RewardMode = RewardMode.PNL_STEP,
+                 reward_horizon: int = REWARD_HORIZON,
+                 min_hold_bars: int = 0):
         assert X.ndim == 2, "X must be 2D [T, F]"
         T, F = X.shape
         assert len(close) == T and len(funding_rate) == T, "X/close/funding length mismatch"
@@ -135,6 +186,12 @@ class FeatureStackedEnv(gym.Env):
         self.pos = 0
         self.bars_in_pos = 0
         self.t = self.window
+
+        self.reward_mode = reward_mode
+        self.H = int(reward_horizon)
+        self.min_hold = int(min_hold_bars)
+        self.last_trade_bar = -10**9
+
         obs_dim = self.window * self.F + 2
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)
@@ -147,42 +204,65 @@ class FeatureStackedEnv(gym.Env):
         super().reset(seed=seed)
         self.pos = 0
         self.bars_in_pos = 0
-        self.t = self._rng.integers(self.window, len(self.close)-REWARD_HORIZON-2) if self.random_start else self.window
+        last_safe = len(self.close) - max(self.H, 1) - 2
+        start_hi = max(self.window, last_safe)
+        self.t = self._rng.integers(self.window, start_hi) if self.random_start else self.window
         return self._obs(self.t), {}
 
     def step(self, action: int):
         sides = 0
         new_pos = self.pos
-        if action == 0: new_pos = self.pos
-        elif action == 1:
-            if self.pos == 0: new_pos, sides = +1, 1
-            elif self.pos == -1: new_pos, sides = +1, 2
-        elif self.pos == +1 and action == 2:
-            new_pos, sides = -1, 2
-        elif action == 2:
-            if self.pos == 0: new_pos, sides = -1, 1
-        elif action == 3:
-            if self.pos != 0: new_pos, sides = 0, 1
 
-        # --- Reward Calculation (Long Horizon) ---
-        entry_price = self.close[self.t - 1]
-        future_price_idx = min(self.t - 1 + REWARD_HORIZON, len(self.close) - 1)
-        future_price = self.close[future_price_idx]
-        horizon_return = (future_price / entry_price) - 1.0 if entry_price > 0 else 0.0
+        if action == 0:  # hold
+            new_pos = self.pos
+        elif action == 1:  # long
+            if   self.pos == 0:  new_pos, sides = +1, 1
+            elif self.pos == -1: new_pos, sides = +1, 2
+        elif action == 2:  # short
+            if   self.pos == 0:  new_pos, sides = -1, 1
+            elif self.pos == +1: new_pos, sides = -1, 2
+        elif action == 3:  # flat
+            if self.pos != 0:    new_pos, sides = 0, 1
+
+        if self.pos != 0 and self.bars_in_pos < self.min_hold and new_pos != self.pos:
+            new_pos, sides = self.pos, 0
 
         fee_step = sides * self.cost_per_side
-        reward = (new_pos * horizon_return) - fee_step
 
-        # --- State Update ---
+        funding_penalty = 0.0
+        if self.fund_div > 0 and self.pos != 0:
+            if ((self.t - 1) % self.fund_div) == 0:
+                funding_penalty = self.pos * float(self.funding[self.t - 1])
+
+        if self.reward_mode == RewardMode.PNL_STEP:
+            step_ret = (self.close[self.t] / self.close[self.t - 1]) - 1.0
+            reward = (self.pos * step_ret) - fee_step - funding_penalty
+        else:
+            if sides > 0:
+                entry_price = self.close[self.t - 1]
+                future_idx  = min(self.t - 1 + self.H, len(self.close) - 1)
+                horizon_ret = (self.close[future_idx] / entry_price) - 1.0 if entry_price > 0 else 0.0
+                reward = (new_pos * horizon_ret) - fee_step - funding_penalty
+            else:
+                reward = -funding_penalty
+
+        if sides > 0:
+            self.last_trade_bar = self.t
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
-        terminated = (self.t >= len(self.close) - REWARD_HORIZON - 1)
+
+        if self.reward_mode == RewardMode.PNL_STEP:
+            last_safe_t = len(self.close) - 1
+        else:
+            last_safe_t = len(self.close) - self.H - 1
+        terminated = (self.t >= last_safe_t)
+
         obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
 
-        # --- Info Dict (for logging) ---
-        simple_ret = np.exp(self.ret[self.t-1]) - 1.0
-        info = {"ret": float(simple_ret), "sides": int(sides), "fee_step": float(fee_step), "pos": self.pos}
+        simple_ret = float(np.exp(self.ret[min(self.t-1, len(self.ret)-1)]) - 1.0)
+        info = {"ret": simple_ret, "sides": int(sides), "fee_step": float(fee_step),
+                "funding": float(funding_penalty), "pos": int(self.pos)}
         return obs, float(reward), terminated, False, info
 
 # ===== Data loaders =====
@@ -256,7 +336,8 @@ class ZScaler:
         self.std = None
     def fit(self, X: np.ndarray):
         self.mean = X.mean(axis=0)
-        self.std = X.std(axis=0); self.std[self.std==0] = 1.0
+        self.std = X.std(axis=0)
+        self.std[self.std == 0] = 1.0
     def transform(self, X: np.ndarray):
         return (X - self.mean) / self.std
 
@@ -286,15 +367,21 @@ def run_all():
     if proc_ok:
         print("[RL] Using processed features (MTF) [CPU + VecNormalize + SubprocVecEnv]")
         X_tr, c_tr, f_tr, cols = load_processed("train")
-        
+
         scaler = ZScaler(); scaler.fit(X_tr)
         X_tr_s = scaler.transform(X_tr)
+        # 스케일러 저장(실거래/평가 재현성용)
+        np.savez(os.path.join(MODEL_DIR, "scaler_mtf.npz"), mean=scaler.mean, std=scaler.std)
 
         def make_train_env(i):
             def _t():
-                return FeatureStackedEnv(X_tr_s, c_tr, f_tr, window=WINDOW,
-                                         fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                                         interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i)
+                return FeatureStackedEnv(
+                    X_tr_s, c_tr, f_tr, window=WINDOW,
+                    fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                    interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i,
+                    reward_mode=RewardMode.PNL_STEP, reward_horizon=REWARD_HORIZON,
+                    min_hold_bars=3
+                )
             return _t
         env_tr = SubprocVecEnv([make_train_env(i) for i in range(N_ENVS)])
         env_tr = VecNormalize(env_tr, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
@@ -330,9 +417,13 @@ def run_all():
 
         def make_train_env(i):
             def _t():
-                return SimpleTradingEnv(c_tr, f_tr, window=WINDOW,
-                                        fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                                        interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i)
+                return SimpleTradingEnv(
+                    c_tr, f_tr, window=WINDOW,
+                    fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                    interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i,
+                    reward_mode=RewardMode.PNL_STEP, reward_horizon=REWARD_HORIZON,
+                    min_hold_bars=3
+                )
             return _t
         env_tr = SubprocVecEnv([make_train_env(i) for i in range(N_ENVS)])
         env_tr = VecNormalize(env_tr, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
