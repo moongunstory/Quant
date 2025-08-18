@@ -78,17 +78,12 @@ def _load_raw(split: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Raw split not found: {p}")
     df = pd.read_parquet(p)
 
-    # Normalize column names present in Binance payloads
-    # Ensure OHLCV exists (case tolerant)
-    # Map lower to real case
     cols = {c.lower(): c for c in df.columns}
-    # Ensure numeric types
     for k in ["open","high","low","close","volume"]:
         if k in cols:
             real = cols[k]
             df[real] = pd.to_numeric(df[real], errors="coerce")
 
-    # FundingRate normalization (either FundingRate or funding_rate)
     if "FundingRate" in df.columns:
         df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
     elif "funding_rate" in df.columns:
@@ -96,12 +91,10 @@ def _load_raw(split: str) -> pd.DataFrame:
     else:
         df["FundingRate"] = 0.0
 
-    # Log-stabilize scale-heavy columns to reduce overflow warnings down the line
     for k in ["Volume", "Quote_asset_volume", "Taker_buy_base", "Taker_buy_quote"]:
         if k in df.columns:
             df[k] = np.log1p(np.clip(pd.to_numeric(df[k], errors="coerce"), 0, None))
 
-    # Set datetime index if present
     for tcol in ["Open_time", "open_time", "time"]:
         if tcol in df.columns:
             idx = pd.to_datetime(df[tcol], errors="coerce", utc=True)
@@ -110,7 +103,6 @@ def _load_raw(split: str) -> pd.DataFrame:
                 df.index.name = "time"
                 break
 
-    # Ensure canonical REF columns exist; if missing, backfill zeros
     for c in REF_COLS_CANON:
         if c not in df.columns:
             df[c] = 0.0
@@ -119,52 +111,6 @@ def _load_raw(split: str) -> pd.DataFrame:
 
 
 # ===== Technical Indicators / Engineered Features =====
-
-def _ta_basic(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # Use canonical Close column for returns
-    close = out["Close"].astype("float64")
-
-    # Returns
-    out["ret_1"]   = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    out["ret_3"]   = close.pct_change(3).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    out["ret_6"]   = close.pct_change(6).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    out["ret_12"]  = close.pct_change(12).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    # Rolling z-scores
-    out["z_close_48"] = zscore(close, win=48)
-    out["z_ret1_48"]  = zscore(out["ret_1"], win=48)
-
-    # Moving averages
-    out["ema_12"] = close.ewm(span=12, adjust=False).mean()
-    out["ema_26"] = close.ewm(span=26, adjust=False).mean()
-    out["macd"]   = out["ema_12"] - out["ema_26"]
-    out["macd_sig"] = out["macd"].ewm(span=9, adjust=False).mean()
-    out["macd_hist"] = out["macd"] - out["macd_sig"]
-
-    # RSI (Wilder's)
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = (-delta).clip(lower=0)
-    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    out["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50)
-
-    # Volatility / Range features
-    high, low = out["High"].astype("float64"), out["Low"].astype("float64")
-    out["hl_spread"]   = (high - low) / (close.replace(0, np.nan))
-    out["atr14"]       = _atr(out, period=14)
-    out["vol_z_48"]    = zscore(out["Volume"].astype("float64"), win=48)
-
-    # Funding-related
-    out["funding_z_48"] = zscore(out["FundingRate"].astype("float64"), win=48)
-
-    # Clean
-    out = _sanitize(out)
-    return out
-
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["High"].astype("float64")
@@ -178,14 +124,92 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
+def _ta_basic(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = out["Close"].astype("float64")
+
+    out["ret_1"]   = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_3"]   = close.pct_change(3).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_6"]   = close.pct_change(6).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["ret_12"]  = close.pct_change(12).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    out["z_close_48"] = zscore(close, win=48)
+    out["z_ret1_48"]  = zscore(out["ret_1"], win=48)
+
+    out["ema_12"] = close.ewm(span=12, adjust=False).mean()
+    out["ema_26"] = close.ewm(span=26, adjust=False).mean()
+    out["macd"]   = out["ema_12"] - out["ema_26"]
+    out["macd_sig"] = out["macd"].ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = out["macd"] - out["macd_sig"]
+
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50)
+
+    high, low = out["High"].astype("float64"), out["Low"].astype("float64")
+    out["hl_spread"]   = (high - low) / (close.replace(0, np.nan))
+    out["atr14"]       = _atr(out, period=14)
+    out["vol_z_48"]    = zscore(out["Volume"].astype("float64"), win=48)
+
+    out["funding_z_48"] = zscore(out["FundingRate"].astype("float64"), win=48)
+
+    return _sanitize(out)
+
+def _ta_extended(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes additional, extended features."""
+    out = pd.DataFrame(index=df.index)
+    close = df["Close"].astype("float64")
+    high = df["High"].astype("float64")
+    low = df["Low"].astype("float64")
+
+    # 1. Long-Term Trend
+    for n in [100, 200]:
+        sma = close.rolling(n, min_periods=n).mean()
+        out[f'sma_{n}'] = sma
+        out[f'price_vs_sma_{n}'] = close / sma
+
+    # 2. Volatility / Channel
+    bb_win = 20
+    bb_mid = close.rolling(bb_win, min_periods=bb_win).mean()
+    bb_std = close.rolling(bb_win, min_periods=bb_win).std()
+    out["bb_width"] = (4 * bb_std) / bb_mid
+    
+    atr14 = _atr(df, period=14)
+    out['atr_roc_6'] = atr14.pct_change(6)
+
+    # 3. Momentum
+    for n in [6, 12]:
+        out[f"roc_{n}"] = close.pct_change(n) * 100
+
+    stoch_win = 14
+    low_min = low.rolling(stoch_win).min()
+    high_max = high.rolling(stoch_win).max()
+    k = 100 * (close - low_min) / (high_max - low_min).replace(0, np.nan)
+    out["stoch_k"] = k.rolling(3).mean()
+    out["stoch_d"] = out["stoch_k"].rolling(3).mean()
+
+    # 4. Time Features
+    if isinstance(df.index, pd.DatetimeIndex):
+        out['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
+        out['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
+        out['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+        out['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+        
+    return _sanitize(out)
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out = _ta_basic(df)
-    # Ensure REF columns are present and unscaled; create explicit copies for clarity
+    out_extended = _ta_extended(df)
+    out = pd.concat([out, out_extended], axis=1)
+
     for c in REF_COLS_CANON:
         if c not in out.columns and c in df.columns:
             out[c] = df[c]
-    # Reference copies (for downstream clarity); not scaled
+
     out["close_ref"] = out["Close"].astype("float64")
     return _sanitize(out)
 
@@ -200,7 +224,6 @@ def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
 
 
 def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
-    # mutual_info_classif expects finite values
     X_ = _sanitize(X).astype("float64")
     y_ = y.astype(int).values
     mi = mutual_info_classif(X_, y_, random_state=RANDOM_STATE, discrete_features=False)
@@ -211,7 +234,6 @@ def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
 
 def _feature_search_lgbm(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
     if not _HAS_LGB:
-        # Fallback to MI if LightGBM is unavailable
         return _feature_search_mi(X, y, top_k)
     X_ = _sanitize(X).astype("float64")
     y_ = y.astype(int).values
@@ -226,14 +248,12 @@ def _feature_search_lgbm(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]
 
 
 def _select_features(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
-    # Determine feature columns: exclude REF columns and explicit refs
     exclude = set(REF_COLS_CANON + ["close_ref"])
     feat_cols = [c for c in train.columns if c not in exclude]
 
     if (not FEATURE_SEARCH) or (TOP_K_FEATURES is None) or (TOP_K_FEATURES >= len(feat_cols)):
         return train, val, test, feat_cols
 
-    # Build proxy label on TRAIN only
     y_tr = _make_proxy_y(train)
 
     if FEATURE_SEARCH_METHOD == "lgbm":
@@ -280,7 +300,6 @@ def _scale_and_merge(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
     va_out = pd.concat([X_va[feature_cols], ref_va], axis=1)
     te_out = pd.concat([X_te[feature_cols], ref_te], axis=1)
 
-    # Final safety & save
     def _save(df: pd.DataFrame, split: str):
         df = _sanitize(df)
         assert np.isfinite(df.select_dtypes(include=[np.number])).all().all(), f"Non-finite detected in {split}"

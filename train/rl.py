@@ -1,11 +1,11 @@
-# rl.py (CPU + VecNormalize + column compatibility + sync helper)
+# rl.py (SubprocVecEnv + VecNormalize + LR schedule + CPU + column compatibility)
 from __future__ import annotations
 import os
 # ---- Force CPU ----
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import json
-from typing import Tuple, List
+from typing import Tuple, List, Callable
 
 import numpy as np
 import pandas as pd
@@ -13,21 +13,32 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 # ===== Settings =====
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR     = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw"))
-PROC_DIR    = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
-MODEL_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "models"))  # ./models/
-SPLITS      = ("train", "val", "test")
-INTERVAL    = "5m"
-WINDOW      = 48            # 5m 기준 4시간 컨텍스트
-INTERVAL_MIN= 5             # 5m
-FEE_PER_SIDE= 0.0005        # 0.05% (Binance taker)
-SLIP_PER_SIDE=0.0001        # 0.01% (왕복 합≈0.12%)
-SEED        = 42
-TIMESTEPS   = 2_000_000
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR       = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw"))
+PROC_DIR      = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
+MODEL_DIR     = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "models"))  # ./models/
+SPLITS        = ("train", "val", "test")
+INTERVAL      = "5m"
+WINDOW        = 48            # 5m 기준 4시간
+INTERVAL_MIN  = 5
+FEE_PER_SIDE  = 0.0005
+SLIP_PER_SIDE = 0.0001
+HOLDING_PENALTY = 0.00001 # 포지션 보유 시 스텝당 페널티
+SEED          = 42
+TIMESTEPS     = 2_000_000
+
+# PPO/Env
+N_ENVS        = 8                    # 병렬 환경 개수 (CPU 코어에 맞춰 조정)
+N_STEPS       = 2048                 # per-env rollout → 총 rollout = N_ENVS * N_STEPS
+BATCH_SIZE    = 4096
+N_EPOCHS      = 10
+CLIP_RANGE    = 0.30
+ENTROPY_COEF  = 0.01
+VF_COEF       = 0.70
+NET_ARCH      = [256, 256]
 
 # ===== ENV (returns-only) =====
 class SimpleTradingEnv(gym.Env):
@@ -75,13 +86,15 @@ class SimpleTradingEnv(gym.Env):
         elif action == 2: # short
             if self.pos == 0: new_pos, sides = -1, 1
             elif self.pos == +1: new_pos, sides = -1, 2
-        elif action == 3: # close
+        elif action == 3: # flat
             if self.pos != 0: new_pos, sides = 0, 1
         r = self.ret[self.t]
         simple_ret = np.exp(r) - 1.0
         fund_step = (self.funding[self.t] / max(1, int(round(480 / self.interval_min)))) * new_pos
         fee_step = sides * self.cost_per_side
         reward = (new_pos * simple_ret) - fee_step - fund_step
+        if new_pos != 0:
+            reward -= HOLDING_PENALTY
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
@@ -137,9 +150,10 @@ class FeatureStackedEnv(gym.Env):
         elif action == 1:
             if self.pos == 0: new_pos, sides = +1, 1
             elif self.pos == -1: new_pos, sides = +1, 2
+        elif self.pos == +1 and action == 2:
+            new_pos, sides = -1, 2
         elif action == 2:
             if self.pos == 0: new_pos, sides = -1, 1
-            elif self.pos == +1: new_pos, sides = -1, 2
         elif action == 3:
             if self.pos != 0: new_pos, sides = 0, 1
         r = self.ret[self.t]
@@ -147,12 +161,14 @@ class FeatureStackedEnv(gym.Env):
         fund_step = (self.funding[self.t] / self.fund_div) * new_pos
         fee_step = sides * self.cost_per_side
         reward = (new_pos * simple_ret) - fee_step - fund_step
+        if new_pos != 0:
+            reward -= HOLDING_PENALTY
         self.pos = new_pos
         self.bars_in_pos = (self.bars_in_pos + 1) if self.pos != 0 else 0
         self.t += 1
         terminated = (self.t >= len(self.close) - 1)
         obs = self._obs(self.t) if not terminated else np.zeros_like(self._obs(self.t-1), dtype=np.float32)
-        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step)}
+        info = {"ret": float(simple_ret), "fund": float(self.funding[min(self.t-1, len(self.funding)-1)]), "sides": int(sides), "fee_step": float(fee_step), "pos": self.pos}
         return obs, float(reward), terminated, False, info
 
 # ===== Data loaders =====
@@ -248,19 +264,15 @@ def _sync_vecnorm_stats(src: VecNormalize, dst: VecNormalize):
             setattr(dst, k, getattr(src, k))
     dst.training = False  # 평가 시 학습 OFF
 
-# ===== Eval helper for Vec env =====
-def quick_eval_vec(model: PPO, env: VecNormalize, max_steps: int = 200_000):
-    obs = env.reset()
-    done = np.array([False])
-    R, steps, trades = 0.0, 0, 0
-    while not done.all() and steps < max_steps:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, rewards, done, infos = env.step(action)
-        R += float(rewards[0])
-        info0 = infos[0] if isinstance(infos, list) and len(infos) else {}
-        trades += int(info0.get("sides", 0))
-        steps += 1
-    return {"approx_total_return_normed": R, "steps": steps, "sides": trades}
+# ===== 학습률 스케줄러 (progress_remaining → lr) =====
+def linear_schedule(initial_lr: float, final_lr: float) -> Callable[[float], float]:
+    """
+    SB3 PPO는 learning_rate에 float 또는 callable(progress_remaining)->lr 허용.
+    progress_remaining: 1→0 (학습 진행에 따라 감소)
+    """
+    def _lr(progress_remaining: float) -> float:
+        return final_lr + (initial_lr - final_lr) * float(progress_remaining)
+    return _lr
 
 # ===== Train & Eval =====
 def run_all():
@@ -268,121 +280,86 @@ def run_all():
     proc_ok = all(os.path.exists(os.path.join(PROC_DIR, f"fe_{sp}_{INTERVAL}.parquet")) for sp in SPLITS)
 
     if proc_ok:
-        print("[RL] Using processed features (MTF) [CPU + VecNormalize]")
+        print("[RL] Using processed features (MTF) [CPU + VecNormalize + SubprocVecEnv]")
         X_tr, c_tr, f_tr, cols = load_processed("train")
-        X_va, c_va, f_va, _   = load_processed("val")
-
+        
         scaler = ZScaler(); scaler.fit(X_tr)
-        X_tr_s = scaler.transform(X_tr); X_va_s = scaler.transform(X_va)
+        X_tr_s = scaler.transform(X_tr)
 
-        # ----- Vec env with reward normalization -----
-        def make_train_env():
-            return FeatureStackedEnv(X_tr_s, c_tr, f_tr, window=WINDOW,
-                                     fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                                     interval_min=INTERVAL_MIN, random_start=True, seed=SEED)
+        # ----- 병렬 학습 환경 -----
+        def make_train_env(i):
+            def _t():
+                return FeatureStackedEnv(X_tr_s, c_tr, f_tr, window=WINDOW,
+                                         fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                                         interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i)
+            return _t
+        env_tr = SubprocVecEnv([make_train_env(i) for i in range(N_ENVS)])
+        env_tr = VecNormalize(env_tr, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
 
-        def make_eval_env():
-            return FeatureStackedEnv(X_va_s, c_va, f_va, window=WINDOW,
-                                     fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                                     interval_min=INTERVAL_MIN, random_start=False, seed=SEED)
-
-        env_tr = DummyVecEnv([make_train_env])
-        env_tr = VecNormalize(env_tr, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-
-        env_va = DummyVecEnv([make_eval_env])
-        env_va = VecNormalize(env_va, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-        _sync_vecnorm_stats(env_tr, env_va)
-
-        policy_kwargs = dict(net_arch=[256, 256])
+        # ----- PPO with LR schedule -----
+        policy_kwargs = dict(net_arch=NET_ARCH)
+        lr_sched = linear_schedule(initial_lr=1e-3, final_lr=3e-4)   # 시작은 1e-3, 후반 3e-4로 감쇠
 
         model = PPO(
             "MlpPolicy", env_tr,
-            n_steps=8192, batch_size=8192,            # 긴 롤아웃 / 큰 배치
-            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-            learning_rate=3e-4, vf_coef=0.7,         # V 비중 ↑
+            n_steps=N_STEPS, batch_size=BATCH_SIZE, n_epochs=N_EPOCHS,
+            gamma=0.99, gae_lambda=0.95, clip_range=CLIP_RANGE,
+            learning_rate=lr_sched,        # << 스케줄 적용
+            ent_coef=ENTROPY_COEF,
+            vf_coef=VF_COEF,
             policy_kwargs=policy_kwargs,
             device="cpu", verbose=1, seed=SEED,
         )
         model.learn(total_timesteps=TIMESTEPS)
 
-        model_path = os.path.join(MODEL_DIR, "ppo_v1_features.zip")
+        # ----- 저장 -----
+        model_path = os.path.join(MODEL_DIR, "ppo_mtf_features.zip")
         model.save(model_path)
-        env_stats_path = os.path.join(MODEL_DIR, "ppo_v1_features_vecnorm.pkl")
+        env_stats_path = os.path.join(MODEL_DIR, "ppo_mtf_vecnorm.pkl")
         try:
             env_tr.save(env_stats_path)
             print(f"[RL] Saved VecNormalize stats: {env_stats_path}")
         except Exception as e:
             print("[warn] VecNormalize save failed:", e)
         print(f"[RL] Saved: {model_path}")
-
-        rep = quick_eval_vec(model, env_va)
-        print("[Eval: val | normalized return]", rep)
-
-        # test(옵션)
-        test_path = os.path.join(PROC_DIR, f"fe_test_{INTERVAL}.parquet")
-        if os.path.exists(test_path):
-            X_te, c_te, f_te, _ = load_processed("test")
-            X_te_s = scaler.transform(X_te)
-            env_te = DummyVecEnv([lambda: FeatureStackedEnv(
-                X_te_s, c_te, f_te, window=WINDOW,
-                fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
-            env_te = VecNormalize(env_te, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-            _sync_vecnorm_stats(env_tr, env_te)
-            rep_te = quick_eval_vec(model, env_te)
-            print("[Eval: test | normalized return]", rep_te)
 
     else:
-        print("[RL] Using raw (returns-only) [CPU + VecNormalize]")
+        print("[RL] Using raw (returns-only) [CPU + VecNormalize + SubprocVecEnv]")
         c_tr, f_tr = load_raw("train")
-        c_va, f_va = load_raw("val")
 
-        env_tr = DummyVecEnv([lambda: SimpleTradingEnv(c_tr, f_tr, window=WINDOW,
-                            fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                            interval_min=INTERVAL_MIN, random_start=True, seed=SEED)])
-        env_tr = VecNormalize(env_tr, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+        def make_train_env(i):
+            def _t():
+                return SimpleTradingEnv(c_tr, f_tr, window=WINDOW,
+                                        fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
+                                        interval_min=INTERVAL_MIN, random_start=True, seed=SEED+i)
+            return _t
+        env_tr = SubprocVecEnv([make_train_env(i) for i in range(N_ENVS)])
+        env_tr = VecNormalize(env_tr, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
 
-        env_va = DummyVecEnv([lambda: SimpleTradingEnv(c_va, f_va, window=WINDOW,
-                            fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                            interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
-        env_va = VecNormalize(env_va, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-        _sync_vecnorm_stats(env_tr, env_va)
+        policy_kwargs = dict(net_arch=NET_ARCH)
+        lr_sched = linear_schedule(initial_lr=1e-3, final_lr=3e-4)
 
-        policy_kwargs = dict(net_arch=[256, 256])
         model = PPO(
             "MlpPolicy", env_tr,
-            n_steps=8192, batch_size=8192,
-            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-            learning_rate=3e-4, vf_coef=0.7,
+            n_steps=N_STEPS, batch_size=BATCH_SIZE, n_epochs=N_EPOCHS,
+            gamma=0.99, gae_lambda=0.95, clip_range=CLIP_RANGE,
+            learning_rate=lr_sched,
+            ent_coef=ENTROPY_COEF,
+            vf_coef=VF_COEF,
             policy_kwargs=policy_kwargs,
             device="cpu", verbose=1, seed=SEED,
         )
         model.learn(total_timesteps=TIMESTEPS)
 
-        model_path = os.path.join(MODEL_DIR, "ppo_v1_simple.zip")
+        model_path = os.path.join(MODEL_DIR, "ppo_simple.zip")
         model.save(model_path)
-        env_stats_path = os.path.join(MODEL_DIR, "ppo_v1_simple_vecnorm.pkl")
+        env_stats_path = os.path.join(MODEL_DIR, "ppo_simple_vecnorm.pkl")
         try:
             env_tr.save(env_stats_path)
             print(f"[RL] Saved VecNormalize stats: {env_stats_path}")
         except Exception as e:
             print("[warn] VecNormalize save failed:", e)
         print(f"[RL] Saved: {model_path}")
-
-        rep = quick_eval_vec(model, env_va)
-        print("[Eval: val | normalized return]", rep)
-
-        # test(옵션)
-        test_path = os.path.join(RAW_DIR, f"fut_test_data_{INTERVAL}.parquet")
-        if os.path.exists(test_path):
-            c_te, f_te = load_raw("test")
-            env_te = DummyVecEnv([lambda: SimpleTradingEnv(c_te, f_te, window=WINDOW,
-                                fee_per_side=FEE_PER_SIDE, slip_per_side=SLIP_PER_SIDE,
-                                interval_min=INTERVAL_MIN, random_start=False, seed=SEED)])
-            env_te = VecNormalize(env_te, norm_obs=False, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-            _sync_vecnorm_stats(env_tr, env_te)
-            rep_te = quick_eval_vec(model, env_te)
-            print("[Eval: test | normalized return]", rep_te)
 
 if __name__ == "__main__":
     run_all()
