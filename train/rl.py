@@ -211,6 +211,7 @@ class CostConfig:
 
 class CryptoFuturesMTFEnv(gym.Env):
     metadata = {"render.modes": []}
+
     def __init__(self, data: Dict[str, np.ndarray], cost: CostConfig,
                  lambda_init=LAMBDA_INIT, lambda_step=LAMBDA_STEP, lambda_max=LAMBDA_MAX):
         super().__init__()
@@ -233,8 +234,13 @@ class CryptoFuturesMTFEnv(gym.Env):
         self.pos = 0.0
         self.pos_target = 0.0
         self.pos_last_change = -10**9
-        self.turn_hist: List[float] = []  # last 288 abs(dpos)
+        self.turn_hist: List[float] = []
         self.turnover_roll = 0.0
+
+        # 누적 보상 관리
+        self.cum_pnl = 0.0
+        self.cum_cost = 0.0
+        self.prev_pos = 0.0
 
         # safety
         first = self.obs_mat[0]
@@ -250,14 +256,19 @@ class CryptoFuturesMTFEnv(gym.Env):
         self.turn_hist.clear()
         self.turnover_roll = 0.0
         self.lambda_ = min(self.lambda_, self.lambda_max)
+
+        # 누적 초기화
+        self.cum_pnl = 0.0
+        self.cum_cost = 0.0
+        self.prev_pos = 0.0
+
         return self.obs_mat[self.t], {}
 
     def _apply_action(self, a_raw: float) -> Tuple[float, float]:
-        """데드존 제거. 정책출력 증폭 후 스무딩 → 목표 업데이트."""
         if (self.t - self.pos_last_change) < self.cost.cooldown:
             a = self.pos_target
         else:
-            a_raw = float(np.clip(a_raw * ACTION_GAIN, -1.0, 1.0))  # <-- gain
+            a_raw = float(np.clip(a_raw * ACTION_GAIN, -1.0, 1.0))
             a = (1 - self.cost.smooth_alpha) * self.pos_target + self.cost.smooth_alpha * a_raw
             if abs(a - self.pos_target) > 1e-12:
                 self.pos_last_change = self.t
@@ -267,6 +278,7 @@ class CryptoFuturesMTFEnv(gym.Env):
     def step(self, action: np.ndarray):
         assert self.t < self.T, "Episode done"
         a_raw = float(action[0])
+        self.prev_pos = self.pos
         a_target, dpos = self._apply_action(a_raw)
 
         fee_cost  = self.cost.fee_bps  * abs(dpos) * self.cost.leverage
@@ -278,22 +290,38 @@ class CryptoFuturesMTFEnv(gym.Env):
         pnl_ret   = (self.pos * self.cost.leverage) * self.rets[self.t]
         fund_cost = self.pos * self.fund[self.t]
 
+        # 누적 관리
+        self.cum_pnl  += pnl_ret
+        self.cum_cost += fee_cost + slip_cost + fund_cost
+
+        # 턴오버 제약
         self.turn_hist.append(abs(dpos))
         if len(self.turn_hist) > 288:
             self.turn_hist.pop(0)
         self.turnover_roll = float(sum(self.turn_hist))
         excess = max(0.0, self.turnover_roll - self.cost.budget_daily)
-
         if excess > 0.0:
             self.lambda_ = min(self.lambda_max, self.lambda_ + self.lambda_step)
 
-        reward = pnl_ret - fee_cost - slip_cost - fund_cost - self.lambda_ * excess
+        # === 보상 계산 ===
+        reward = 0.0
+        # shaping reward (보유 중 방향성 힌트)
+        if self.pos != 0.0:
+            reward += 0.01 * pnl_ret  # ← 크기는 작게
+
+        # 청산 시점: 누적 정산
+        if self.pos == 0.0 and self.prev_pos != 0.0:
+            net = self.cum_pnl - self.cum_cost - self.lambda_ * excess
+            reward += net
+            self.cum_pnl = 0.0
+            self.cum_cost = 0.0
 
         info = dict(
             t=int(self.t), ts=str(self.ts[self.t].to_pydatetime()),
             pos=float(self.pos), dpos=float(dpos), pnl_ret=float(pnl_ret),
             fee=float(fee_cost), slip=float(slip_cost), fund=float(fund_cost),
-            lambda_=float(self.lambda_), excess_turn=float(excess), ret=float(self.rets[self.t])
+            lambda_=float(self.lambda_), excess_turn=float(excess), ret=float(self.rets[self.t]),
+            reward=float(reward)
         )
 
         self.t += 1
