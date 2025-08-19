@@ -308,72 +308,114 @@ def run_backtest(model: PPO, data: Dict[str, np.ndarray], cfg: CostCfg) -> Dict[
 
 # ===== Main =====
 def main():
-    warnings.filterwarnings("ignore")
-    model_path = os.getenv("BACKTEST_MODEL") or _find_latest_model(MODEL_DIR)
-    if not model_path:
-        print(f"[error] No model .zip found in {MODEL_DIR}.")
-        return
+   warnings.filterwarnings("ignore")
+   model_path = os.getenv("BACKTEST_MODEL") or _find_latest_model(MODEL_DIR)
+   if not model_path:
+       print(f"[error] No model .zip found in {MODEL_DIR}.")
+       return
 
-    print(f"[auto] Model: {model_path}")
-    print(f"[auto] Split: {SPLIT}")
+   print(f"[auto] Model: {model_path}")
+   print(f"[auto] Split: {SPLIT}")
 
-    try:
-        model = PPO.load(model_path, device="cpu")
-    except Exception:
-        model = PPO.load(model_path, device="cpu", custom_objects={})
+   try:
+       model = PPO.load(model_path, device="cpu")
+   except Exception:
+       model = PPO.load(model_path, device="cpu", custom_objects={})
 
-    feat_cols = _load_feature_list()
+   feat_cols = _load_feature_list()
 
-    mtf_ok = all(os.path.exists(os.path.join(PROC_DIR, f"fe_{SPLIT}_{tf}.parquet")) for tf in TIMEFRAMES)
-    data = None; used = ""
-    try:
-        if mtf_ok:
-            print("[auto] Building MTF dataset…")
-            data = _build_data_mtf(SPLIT, feat_cols); used = "MTF"
-        else:
-            raise RuntimeError("MTF files missing")
-    except Exception as e:
-        print(f"[auto] MTF build failed ({e}). Falling back to STF.")
-        data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
+   mtf_ok = all(os.path.exists(os.path.join(PROC_DIR, f"fe_{SPLIT}_{tf}.parquet")) for tf in TIMEFRAMES)
+   data = None; used = ""
+   try:
+       if mtf_ok:
+           print("[auto] Building MTF dataset…")
+           data = _build_data_mtf(SPLIT, feat_cols); used = "MTF"
+       else:
+           raise RuntimeError("MTF files missing")
+   except Exception as e:
+       print(f"[auto] MTF build failed ({e}). Falling back to STF.")
+       data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
 
-    try:
-        obs_dim = getattr(model.policy.observation_space, "shape", None)
-        if obs_dim and len(obs_dim) == 1 and data["obs"].shape[1] != obs_dim[0]:
-            print(f"[warn] Obs dim mismatch ({data['obs'].shape[1]} vs {obs_dim[0]}). Trying STF fallback…")
-            data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
-    except Exception:
-        pass
+   try:
+       obs_dim = getattr(model.policy.observation_space, "shape", None)
+       if obs_dim and len(obs_dim) == 1 and data["obs"].shape[1] != obs_dim[0]:
+           print(f"[warn] Obs dim mismatch ({data['obs'].shape[1]} vs {obs_dim[0]}). Trying STF fallback…")
+           data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
+   except Exception:
+       pass
 
-    print(f"[auto] Mode: {used} | Obs shape: {data['obs'].shape}")
-    print(f"[cfg] DET={EVAL_DET} (0=stochastic), GAIN={ACTION_GAIN}, SMOOTH_A={EVAL_SMOOTH_A}, MIN_DPOS={EVAL_MIN_DPOS}, COOLDOWN={EVAL_COOLDOWN}")
+   print(f"[auto] Mode: {used} | Obs shape: {data['obs'].shape}")
+   print(f"[cfg] DET={EVAL_DET} (0=stochastic), GAIN={ACTION_GAIN}, SMOOTH_A={EVAL_SMOOTH_A}, MIN_DPOS={EVAL_MIN_DPOS}, COOLDOWN={EVAL_COOLDOWN}")
 
-    cfg = CostCfg(
-        fee_bps=FEE_BPS, slip_bps=SLIP_BPS,
-        min_dpos=EVAL_MIN_DPOS, cooldown=EVAL_COOLDOWN,
-        smooth_a=EVAL_SMOOTH_A, leverage=LEVERAGE
-    )
+   cfg = CostCfg(
+       fee_bps=FEE_BPS, slip_bps=SLIP_BPS,
+       min_dpos=EVAL_MIN_DPOS, cooldown=EVAL_COOLDOWN,
+       smooth_a=EVAL_SMOOTH_A, leverage=LEVERAGE
+   )
 
-    print("[run] Backtest starting…")
-    res = run_backtest(model, data, cfg)
+   print("[run] Backtest starting…")
+   res = run_backtest(model, data, cfg)
 
-    print("\n==================== BACKTEST SUMMARY ====================")
-    print(f"기간: {res['start']} ~ {res['end']} | 바 수: {res['bars']:,}")
-    print(f"초기 자본: ${START_CAP:,.0f} | 최종 자본: ${res['final_capital']:,.0f}")
-    print(f"총 수익률: {res['total_return']*100:.2f}% | 연 변동성: {res['vol_annual']*100:.2f}% | 샤프: {res['sharpe']:.2f}")
-    print(f"최대 손실: {res['max_dd']*100:.2f}%")
-    fbps = res['costs']['fees']*1e4; sbps = res['costs']['slippage']*1e4; fundbps = res['costs']['funding']*1e4
-    print(f"거래 수: {res['n_trades']:,} | 총 회전율(Σ|Δpos|): {res['turnover']*100:.2f}%")
-    print(f"비용 → 수수료: {res['costs']['fees']*100:.4f}% ({fbps:.1f} bp) / "
-          f"슬리피지: {res['costs']['slippage']*100:.4f}% ({sbps:.1f} bp) / "
-          f"펀딩: {res['costs']['funding']*100:.4f}% ({fundbps:.1f} bp)")
-    print(f"액션 통계 → mean|a|={res['a_mean']:.4f}, p95|a|={res['a_p95']:.4f}, mean|pos|={res['p_mean']:.4f}, p95|pos|={res['p_p95']:.4f}")
-    if SAVE_CSV:
-        print(f"Trades CSV: {os.path.join(REPORT_DIR, 'backtest_trades.csv')}")
-    if LOG_ACTION_CSV:
-        print(f"Action CSV: {os.path.join(REPORT_DIR, 'backtest_actions.csv')}")
-    if SAVE_CHART:
-        print(f"Chart PNG : {os.path.join(REPORT_DIR, 'backtest_chart.png')}")
-    print("==========================================================")
+   print("\n==================== BACKTEST SUMMARY ====================")
+   print(f"기간: {res['start']} ~ {res['end']} | 바 수: {res['bars']:,}")
+   print(f"초기 자본: ${START_CAP:,.0f} | 최종 자본: ${res['final_capital']:,.0f}")
+   print(f"총 수익률: {res['total_return']*100:.2f}% | 연 변동성: {res['vol_annual']*100:.2f}% | 샤프: {res['sharpe']:.2f}")
+   print(f"최대 손실: {res['max_dd']*100:.2f}%")
+   fbps = res['costs']['fees']*1e4; sbps = res['costs']['slippage']*1e4; fundbps = res['costs']['funding']*1e4
+   print(f"거래 수: {res['n_trades']:,} | 총 회전율(Σ|Δpos|): {res['turnover']*100:.2f}%")
+   print(f"비용 → 수수료: {res['costs']['fees']*100:.4f}% ({fbps:.1f} bp) / "
+         f"슬리피지: {res['costs']['slippage']*100:.4f}% ({sbps:.1f} bp) / "
+         f"펀딩: {res['costs']['funding']*100:.4f}% ({fundbps:.1f} bp)")
+   print(f"액션 통계 → mean|a|={res['a_mean']:.4f}, p95|a|={res['a_p95']:.4f}, mean|pos|={res['p_mean']:.4f}, p95|pos|={res['p_p95']:.4f}")
+   
+   # 저활동 감지 시 stochastic 모드 추가 실행
+   LOW_ACTIVITY_THRESHOLD = 0.01  # 회전율 1% 미만
+   LOW_TRADES_THRESHOLD = 200     # 거래 200건 미만
+   
+   if (res['turnover'] < LOW_ACTIVITY_THRESHOLD or 
+       res['n_trades'] < LOW_TRADES_THRESHOLD or 
+       res['a_mean'] < 0.02):
+       
+       print("\n[INFO] 저활동 감지 → stochastic 모드 3회 실행")
+       
+       # EVAL_DET 임시 변경
+       original_eval_det = EVAL_DET
+       globals()['EVAL_DET'] = False  # stochastic 모드
+       
+       try:
+           stoch_results = []
+           for i in range(3):
+               stoch_res = run_backtest(model, data, cfg)
+               stoch_results.append(stoch_res)
+           
+           # 평균 계산
+           avg_return = sum(r['total_return'] for r in stoch_results) / 3
+           avg_trades = sum(r['n_trades'] for r in stoch_results) / 3
+           avg_turnover = sum(r['turnover'] for r in stoch_results) / 3
+           avg_sharpe = sum(r['sharpe'] for r in stoch_results) / 3
+           avg_fees = sum(r['costs']['fees'] for r in stoch_results) / 3
+           avg_slips = sum(r['costs']['slippage'] for r in stoch_results) / 3
+           avg_funding = sum(r['costs']['funding'] for r in stoch_results) / 3
+           
+           print("\n---------------- STOCHASTIC 모드 (MC=3) ----------------")
+           print(f"평균 총 수익률: {avg_return*100:.2f}% | 평균 샤프: {avg_sharpe:.2f}")
+           print(f"평균 거래 수: {avg_trades:.0f} | 평균 회전율: {avg_turnover*100:.2f}%")
+           fbps = avg_fees*1e4; sbps = avg_slips*1e4; fundbps = avg_funding*1e4
+           print(f"평균 비용 → 수수료: {avg_fees*100:.4f}% ({fbps:.1f} bp) / "
+                 f"슬리피지: {avg_slips*100:.4f}% ({sbps:.1f} bp) / "
+                 f"펀딩: {avg_funding*100:.4f}% ({fundbps:.1f} bp)")
+           print("-------------------------------------------------------")
+                 
+       finally:
+           globals()['EVAL_DET'] = original_eval_det  # 원복
+   
+   if SAVE_CSV:
+       print(f"Trades CSV: {os.path.join(REPORT_DIR, 'backtest_trades.csv')}")
+   if LOG_ACTION_CSV:
+       print(f"Action CSV: {os.path.join(REPORT_DIR, 'backtest_actions.csv')}")
+   if SAVE_CHART:
+       print(f"Chart PNG : {os.path.join(REPORT_DIR, 'backtest_chart.png')}")
+   print("==========================================================")
 
 if __name__ == "__main__":
-    main()
+   main()
