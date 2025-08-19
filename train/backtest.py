@@ -1,19 +1,17 @@
-# backtest_practitioner.py — Next-bar execution backtester (5m, crypto futures)
-# - Uses processed features from fe.py: fe_{train|val|test}_5m.parquet + fe_feature_list_5m.json
-# - Loads PPO model and replays deterministic policy
-# - Costs ONLY when position changes (no double-count)
-# - Funding applied per step: Funding8h/96 (fallback to FundingRate/96)
-# - Outputs: summary to console, optional trades CSV and equity chart PNG
-#
-# Usage:
-#   python ai_binance/train/backtest_practitioner.py \
-#       --model ./ai_binance/data/model/ppo_practitioner_best.zip \
-#       --split test --save-csv --save-chart
+# backtest.py — Auto-run backtester (MTF/STF autodetect) with action diagnostics
+# - Run directly: finds latest PPO .zip, builds data, runs backtest on split="test"
+# - New:
+#     * EVAL_DET=0 -> stochastic actions (like training exploration)
+#     * ACTION_GAIN=1.0 -> multiply policy output to test amplitude
+#     * EVAL_SMOOTH_A=0.25 -> action smoothing (lower = 더 과감)
+#     * LOG_ACTION_CSV=1 -> save per-step action/pos/equity CSV
+# - Outputs:
+#     reports/backtest_trades.csv, backtest_chart.png, (optional) backtest_actions.csv
 
 from __future__ import annotations
-import os, json, math, argparse, warnings
+import os, json, math, warnings
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,324 +19,361 @@ import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 
 # ===== Paths =====
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-PROC_DIR    = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
-MODEL_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
-REPORT_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "reports"))
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "data"))
+PROC_DIR   = os.path.join(DATA_DIR, "processed")
+MODEL_DIR  = os.path.join(DATA_DIR, "model")
+REPORT_DIR = os.path.join(DATA_DIR, "reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-# ===== Defaults (align with rl_practitioner.py) =====
-WINDOW              = 48
-FEE_BPS             = 0.0006     # taker fee per notional traded
-SLIP_BPS            = 0.0003     # baseline slippage per turnover
-MIN_DPOS            = 0.10       # ignore tiny Δpos
-COOLDOWN            = 2          # bars to lock after a change
-SMOOTH_ALPHA        = 0.25       # action smoothing toward target
-LEVERAGE            = 1.0
-TURN_BUDGET_DAILY   = 1.5        # turnover budget (per 288 steps)
-START_CAPITAL       = 100_000.0
+# ===== Defaults / Evaluation toggles =====
+SPLIT = os.getenv("BACKTEST_SPLIT", "test")
+SAVE_CSV = True
+SAVE_CHART = True
 
-STEPS_PER_YEAR = 365 * 24 * 12   # 5m bars in 1y (24/7)
+# Trading / Costs
+WINDOW_STF = 48
+FEE_BPS    = 0.0006
+SLIP_BPS   = 0.0003
+EVAL_MIN_DPOS = float(os.getenv("EVAL_MIN_DPOS", "0.00"))  # 0.00~0.02 권장
+EVAL_COOLDOWN = int(os.getenv("EVAL_COOLDOWN", "0"))
+EVAL_SMOOTH_A = float(os.getenv("EVAL_SMOOTH_A", "0.25"))
+EVAL_DET      = int(os.getenv("EVAL_DET", "1"))            # 1: deterministic / 0: stochastic
+ACTION_GAIN   = float(os.getenv("ACTION_GAIN", "1.0"))     # 행동 출력 스케일
+LOG_ACTION_CSV= int(os.getenv("LOG_ACTION_CSV", "0"))
 
-@dataclass
-class CostConfig:
-    fee_bps: float = FEE_BPS
-    slip_bps: float = SLIP_BPS
-    min_dpos: float = MIN_DPOS
-    cooldown: int = COOLDOWN
-    smooth_alpha: float = SMOOTH_ALPHA
-    leverage: float = LEVERAGE
+LEVERAGE   = 1.0
+START_CAP  = 100_000.0
 
-# ===== IO =====
-def load_processed(split: str) -> Tuple[pd.DataFrame, List[str]]:
-    X = pd.read_parquet(os.path.join(PROC_DIR, f"fe_{split}_5m.parquet"))
+# MTF setup
+TIMEFRAMES = ["5m", "15m", "1h", "4h"]
+WINDOWS_MTF = {"5m": 48, "15m": 32, "1h": 24, "4h": 12}
+
+STEPS_PER_YEAR = 365 * 24 * 12  # 5m bars/year = 105,120
+
+# ===== Utils =====
+def _find_latest_model(model_dir: str) -> Optional[str]:
+    if not os.path.isdir(model_dir):
+        return None
+    zips = [os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".zip")]
+    if not zips:
+        return None
+    def score(p):
+        name = os.path.basename(p).lower()
+        bonus = (2 if "best" in name else 0) + (1 if "final" in name else 0)
+        return (bonus, os.path.getmtime(p))
+    zips.sort(key=score, reverse=True)
+    return zips[0]
+
+def _load_feature_list() -> List[str]:
     with open(os.path.join(PROC_DIR, "fe_feature_list_5m.json"), "r", encoding="utf-8") as f:
-        feat_cols = json.load(f)
-    # sanity for required refs
-    for c in ["close_ref", "FundingRate"]:
-        if c not in X.columns:
-            X[c] = 0.0
-    if "Funding8h" not in X.columns:
-        X["Funding8h"] = X["FundingRate"]
-    X = X.sort_index()
-    return X, feat_cols
+        return json.load(f)
 
-def build_windows(df: pd.DataFrame, feat_cols: List[str], window: int) -> Dict[str, np.ndarray]:
-    idx = df.index if isinstance(df.index, pd.DatetimeIndex) else pd.to_datetime(df.index, utc=True)
-    F = len(feat_cols)
-    N = len(df)
-    if N <= window + 1:
-        raise ValueError("Not enough rows for windowing")
+def _load_split_parquet(split: str, tf: str) -> pd.DataFrame:
+    p = os.path.join(PROC_DIR, f"fe_{split}_{tf}.parquet")
+    if not os.path.exists(p):
+        raise FileNotFoundError(p)
+    df = pd.read_parquet(p).sort_index()
+    if "Close" not in df.columns:
+        df["Close"] = df.get("close_ref", 0.0)
+    if "FundingRate" not in df.columns:
+        df["FundingRate"] = 0.0
+    if "Funding8h" not in df.columns:
+        df["Funding8h"] = df["FundingRate"]
+    return df
 
-    Xf = df[feat_cols].values.astype(np.float32)
-    close = df["close_ref"].astype("float64").values
-    fund8h = df["Funding8h"].astype("float64").values
-
-    T = N - window
-    obs = np.empty((T, window * F), dtype=np.float32)
-    for t in range(T):
-        obs[t] = Xf[t:t+window].reshape(-1)
-
-    # next-bar return (obs at t → price move from t+window-1 → t+window)
-    step_ret = (close[window:] - close[window-1:-1]) / np.maximum(close[window-1:-1], 1e-12)
-    fund_step = fund8h[window:] / 96.0
-    ts = pd.to_datetime(idx[window:], utc=True)
-    px = close[window:]  # reference price for logging
-    return dict(obs=obs, ret=step_ret.astype(np.float64), fund=fund_step.astype(np.float64),
-                ts=ts, price=px.astype(np.float64))
-
-# ===== Backtest Core =====
-def _apply_action(a_raw: float, t: int, pos_target: float, pos_exec: float, cfg: CostConfig, last_change: int) -> Tuple[float, float, int]:
-    # cooldown
-    if (t - last_change) < cfg.cooldown:
-        a = pos_target
-    else:
-        # smooth toward raw
-        a = (1 - cfg.smooth_alpha) * pos_target + cfg.smooth_alpha * float(np.clip(a_raw, -1.0, 1.0))
-        if abs(a - pos_target) < cfg.min_dpos:
-            a = pos_target
-        else:
-            last_change = t
-    dpos = a - pos_exec
-    return a, dpos, last_change
-
-def backtest(model: PPO, data: Dict[str, np.ndarray], cfg: CostConfig,
-             window: int, save_csv: Optional[str] = None) -> Dict[str, any]:
-    obs_mat = data["obs"]
-    rets    = data["ret"]
-    funds   = data["fund"]
-    ts      = data["ts"]
-    price   = data["price"]
-    T = len(rets)
-
-    pos_exec = 0.0
-    pos_target = 0.0
-    last_change = -10**9
-
-    # logs
-    eq = START_CAPITAL
-    eq_path = []
-    step_costs = []
-    step_pnl = []
-    step_pos = []
-    step_ret = []
-    step_fee = []
-    step_slip = []
-    step_fund = []
-    trades = []  # only when position changes
-
-    for t in range(T):
-        obs = obs_mat[t]
-        a_raw, _ = model.predict(obs, deterministic=True)
-
-        # next-bar execution, costs on turnover
-        pos_target, dpos, last_change = _apply_action(
-            float(a_raw[0]), t, pos_target, pos_exec, cfg, last_change
-        )
-        fee = cfg.fee_bps  * abs(dpos) * cfg.leverage
-        slip= cfg.slip_bps * abs(dpos) * cfg.leverage
-
-        # execute now
-        pos_exec = pos_target
-
-        # pnl over this bar with executed pos
-        pnl_ret = (pos_exec * cfg.leverage) * rets[t]
-        fund_cost = pos_exec * funds[t]  # +rate costs longs, -rate costs shorts
-
-        # equity update (λ 같은 학습용 벌점은 없음)
-        step_net = pnl_ret - fee - slip - fund_cost
-        eq *= (1.0 + step_net)
-
-        # logs
-        eq_path.append(eq)
-        step_costs.append(fee + slip + fund_cost)
-        step_pnl.append(pnl_ret)
-        step_pos.append(pos_exec)
-        step_ret.append(rets[t])
-        step_fee.append(fee)
-        step_slip.append(slip)
-        step_fund.append(fund_cost)
-
-        if abs(dpos) >= cfg.min_dpos:
-            trades.append(dict(
-                ts=str(ts[t].to_pydatetime()),
-                price=float(price[t]),
-                dpos=float(dpos),
-                pos=float(pos_exec),
-                fee=float(fee),
-                slip=float(slip),
-                fund=float(fund_cost),
-                pnl_ret=float(pnl_ret),
-                step_net=float(step_net)
-            ))
-
-    # metrics
-    eq_arr = np.asarray(eq_path, dtype=float)
-    rets_net = np.asarray(step_pnl, dtype=float) - (np.asarray(step_fee)+np.asarray(step_slip)+np.asarray(step_fund))
-    # avoid nan
-    rets_net = np.nan_to_num(rets_net, nan=0.0, posinf=0.0, neginf=0.0)
-
-    total_ret = eq_arr[-1] / START_CAPITAL - 1.0 if len(eq_arr) else 0.0
-    # per-step net return series for sharpe/vol
-    step_net = rets_net
-    mu = step_net.mean() if len(step_net) else 0.0
-    sd = step_net.std(ddof=1) if len(step_net) > 1 else 0.0
-    vol_annual = (sd * math.sqrt(STEPS_PER_YEAR)) if sd > 0 else 0.0
-    sharpe = (mu / sd * math.sqrt(STEPS_PER_YEAR)) if sd > 0 else 0.0
-
-    # max drawdown
-    if len(eq_arr):
-        peak = np.maximum.accumulate(eq_arr)
-        dd = (eq_arr / np.maximum(peak, 1e-12)) - 1.0
-        max_dd = dd.min()
-    else:
-        max_dd = 0.0
-
-    # trade stats
-    n_trades = len(trades)
-    # per-trade PnL by aggregating steps until position flips to 0 or sign change
-    hit, hold_bars = 0, []
-    if n_trades:
-        # reconstruct trade segments
-        pos_series = np.asarray(step_pos)
-        # mark trade boundaries when pos goes 0->nonzero, or sign flips
-        boundaries = []
-        prev = 0.0
-        start_idx = None
-        for i, p in enumerate(pos_series):
-            if prev == 0.0 and p != 0.0:
-                start_idx = i
-            # close when back to 0 or sign flip
-            if start_idx is not None:
-                if (p == 0.0) or (np.sign(p) != np.sign(pos_series[start_idx])):
-                    boundaries.append((start_idx, i))
-                    start_idx = None
-            prev = p
-        if start_idx is not None:
-            boundaries.append((start_idx, len(pos_series)-1))
-        # compute per-trade net
-        for s,e in boundaries:
-            pnl_tr = (np.asarray(step_pnl[s:e+1]) - (np.asarray(step_fee[s:e+1]) +
-                                                     np.asarray(step_slip[s:e+1]) +
-                                                     np.asarray(step_fund[s:e+1]))).sum()
-            hit += 1 if pnl_tr > 0 else 0
-            hold_bars.append(e - s + 1)
-    hit_rate = (hit / len(hold_bars)) if hold_bars else 0.0
-    avg_hold = (np.mean(hold_bars) if hold_bars else 0.0)
-
-    # CSV
-    if save_csv:
-        df_tr = pd.DataFrame(trades)
-        df_tr.to_csv(save_csv, index=False)
-
-    return dict(
-        start=str(ts[0].to_pydatetime()) if len(ts) else "",
-        end=str(ts[-1].to_pydatetime()) if len(ts) else "",
-        bars=len(ts),
-        final_capital=eq_arr[-1] if len(eq_arr) else START_CAPITAL,
-        total_return=total_ret,
-        vol_annual=vol_annual,
-        sharpe=sharpe,
-        max_dd=max_dd,
-        n_trades=n_trades,
-        hit_rate=hit_rate,
-        avg_hold_bars=avg_hold,
-        costs=dict(
-            fees=float(np.sum(step_fee)),
-            slippage=float(np.sum(step_slip)),
-            funding=float(np.sum(step_fund))
-        ),
-        eq_path=eq_arr,
-        ts=ts
-    )
-
-# ===== Plot =====
-def save_chart(ts: pd.DatetimeIndex, eq: np.ndarray, out_path: str):
-    if len(eq) == 0:
-        return
+def _save_chart(ts: pd.DatetimeIndex, eq: np.ndarray, out_path: str):
+    if len(eq) == 0: return
     eq_norm = eq / eq[0]
-    plt.figure(figsize=(10,4))
+    plt.figure(figsize=(10, 4))
     plt.plot(ts, eq_norm, linewidth=1.0)
     plt.title("Equity Curve (normalized)")
     plt.xlabel("Time (UTC)")
     plt.ylabel("Equity (×)")
     plt.tight_layout()
-    plt.savefig(out_path, dpi=120)
+    plt.savefig(out_path, dpi=130)
     plt.close()
 
-# ===== CLI =====
-def parse_args():
-    p = argparse.ArgumentParser(description="Practitioner-style backtest (5m, next-bar execution)")
-    p.add_argument("--model", type=str, required=True, help="Path to PPO .zip")
-    p.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
-    p.add_argument("--window", type=int, default=WINDOW, help="Must match training window")
-    p.add_argument("--fee-bps", type=float, default=FEE_BPS)
-    p.add_argument("--slip-bps", type=float, default=SLIP_BPS)
-    p.add_argument("--min-dpos", type=float, default=MIN_DPOS)
-    p.add_argument("--cooldown", type=int, default=COOLDOWN)
-    p.add_argument("--smooth-alpha", type=float, default=SMOOTH_ALPHA)
-    p.add_argument("--leverage", type=float, default=LEVERAGE)
-    p.add_argument("--save-csv", action="store_true")
-    p.add_argument("--save-chart", action="store_true")
-    return p.parse_args()
+# ===== Build data (STF) =====
+def _build_data_stf(split: str, feat_cols: List[str], window: int) -> Dict[str, np.ndarray]:
+    df = _load_split_parquet(split, "5m")
+    X = df[[c for c in feat_cols if c in df.columns]].astype("float32").to_numpy(copy=False)
+    close = df["Close"].astype("float64").to_numpy(copy=False)
+    fund8h = df["Funding8h"].astype("float64").to_numpy(copy=False)
+    N = len(df)
+    if N <= window + 1:
+        raise ValueError(f"Not enough rows for STF window={window}: {N}")
+    T = N - window
+    obs = np.empty((T, window * X.shape[1]), dtype=np.float32)
+    for t in range(T):
+        obs[t] = X[t:t+window].reshape(-1)
+    ret  = (close[window:] - close[window-1:-1]) / np.maximum(close[window-1:-1], 1e-12)
+    fund = fund8h[window:] / 96.0
+    ts   = pd.to_datetime(df.index[window:], utc=True)
+    return dict(obs=obs, ret=ret.astype(np.float64), fund=fund.astype(np.float64), ts=ts, price=close[window:].astype(np.float64))
 
-def main():
-    warnings.filterwarnings("ignore")
-    args = parse_args()
+# ===== Build data (MTF) =====
+def _first_ready_ts(df: pd.DataFrame, feat_cols: List[str], window: int) -> pd.Timestamp:
+    cols = [c for c in feat_cols if c in df.columns]
+    if not cols:
+        raise ValueError("No matching features")
+    arr = df[cols].to_numpy(dtype=float, copy=False)
+    finite = np.isfinite(arr).all(axis=1)
+    mask = pd.Series(finite, index=df.index)
+    ready = mask.rolling(window, min_periods=window).apply(lambda x: 1.0 if bool(np.all(x)) else 0.0)
+    ts = ready[ready == 1.0].index.min()
+    if ts is None: raise ValueError("No valid warm-up segment")
+    return ts
 
-    # Load data
-    print("RL Model Backtest Started!")
-    print("Loading data…")
-    df, feat_cols = load_processed(args.split)
-    data = build_windows(df, feat_cols, args.window)
+def _align_mtf(dfs: Dict[str, pd.DataFrame], feat_cols: List[str]) -> Dict[str, pd.DataFrame]:
+    start_ts = max(_first_ready_ts(dfs[tf], feat_cols, WINDOWS_MTF[tf]) for tf in TIMEFRAMES)
+    base = dfs["5m"].loc[dfs["5m"].index >= start_ts]
+    base_times = base.index
+    out = {}
+    for tf in TIMEFRAMES:
+        d = dfs[tf].loc[dfs[tf].index >= start_ts]
+        d = d.reindex(base_times).ffill()
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+        out[tf] = d
+    common_idx = out["5m"].index
+    for tf in TIMEFRAMES:
+        common_idx = common_idx.intersection(out[tf].index)
+    for tf in TIMEFRAMES:
+        out[tf] = out[tf].reindex(common_idx)
+    return out
 
-    # Load model (safe)
-    print(f"Loading model: {args.model}")
-    try:
-        model = PPO.load(args.model, device="cpu")
-    except Exception as e:
-        # fallback without custom_objects in case of schedules
-        model = PPO.load(args.model, device="cpu", custom_objects={})
+def _build_data_mtf(split: str, feat_cols: List[str]) -> Dict[str, np.ndarray]:
+    dfs = {tf: _load_split_parquet(split, tf) for tf in TIMEFRAMES}
+    aligned = _align_mtf(dfs, feat_cols)
+    base = aligned["5m"]
+    max_w = max(WINDOWS_MTF.values())
+    N = len(base)
+    if N <= max_w + 1:
+        raise ValueError(f"Not enough rows after MTF alignment: {N}")
+    mtf_obs = {}
+    total_dim = 0
+    for tf in TIMEFRAMES:
+        d = aligned[tf]
+        w = WINDOWS_MTF[tf]
+        cols = [c for c in feat_cols if c in d.columns]
+        X = d[cols].astype("float32").to_numpy(copy=False)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        T = N - max_w
+        obs = np.empty((T, w * len(cols)), dtype=np.float32)
+        for t in range(T):
+            s = max_w - w + t
+            e = max_w + t
+            obs[t] = X[s:e].reshape(-1)
+        mtf_obs[tf] = obs
+        total_dim += obs.shape[1]
+        print(f"[MTF] {tf}: {len(cols)} features × {w} window = {obs.shape[1]} dims")
+    T = min(arr.shape[0] for arr in mtf_obs.values())
+    combined = np.empty((T, total_dim), dtype=np.float32)
+    i = 0
+    for tf in TIMEFRAMES:
+        d = mtf_obs[tf][:T]
+        combined[:, i:i+d.shape[1]] = d
+        i += d.shape[1]
+    close = base["Close"].astype("float64").to_numpy(copy=False)
+    fund8h = base.get("Funding8h", base["FundingRate"]).astype("float64").to_numpy(copy=False)
+    ret  = (close[max_w:max_w+T] - close[max_w-1:max_w+T-1]) / np.maximum(close[max_w-1:max_w+T-1], 1e-12)
+    fund = fund8h[max_w:max_w+T] / 96.0
+    ts   = pd.to_datetime(base.index[max_w:max_w+T], utc=True)
+    print(f"[MTF] Combined obs shape: {combined.shape}")
+    return dict(obs=combined, ret=ret.astype(np.float64), fund=fund.astype(np.float64), ts=ts, price=close[max_w:max_w+T].astype(np.float64))
 
-    # Config
-    cfg = CostConfig(
-        fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-        min_dpos=args.min_dpos, cooldown=args.cooldown,
-        smooth_alpha=args.smooth_alpha, leverage=args.leverage
+# ===== Backtest core =====
+@dataclass
+class CostCfg:
+    fee_bps: float = FEE_BPS
+    slip_bps: float = SLIP_BPS
+    min_dpos: float = EVAL_MIN_DPOS
+    cooldown: int = EVAL_COOLDOWN
+    smooth_a: float = EVAL_SMOOTH_A
+    leverage: float = LEVERAGE
+
+def _apply_action(a_raw: float, t: int, pos_target: float, pos_exec: float, cfg: CostCfg, last_change: int) -> Tuple[float, float, int]:
+    if (t - last_change) < cfg.cooldown:
+        a = pos_target
+    else:
+        a = (1 - cfg.smooth_a) * pos_target + cfg.smooth_a * float(np.clip(a_raw, -1.0, 1.0))
+        delta = a - pos_target
+        k = cfg.min_dpos
+        if k > 0 and abs(delta) <= k:
+            delta = delta * (abs(delta) / k)  # soft shrink
+        a = pos_target + delta
+        if abs(delta) > 1e-12:
+            last_change = t
+    dpos = a - pos_exec
+    return a, dpos, last_change
+
+def run_backtest(model: PPO, data: Dict[str, np.ndarray], cfg: CostCfg) -> Dict[str, any]:
+    obs_mat = data["obs"]; rets = data["ret"]; funds = data["fund"]; ts = data["ts"]; price = data["price"]
+    T = len(rets)
+    pos_exec = 0.0; pos_target = 0.0; last_change = -10**9
+    eq = START_CAP; eq_path = []
+
+    # diagnostics
+    fees=slips=funds_sum=0.0
+    trades = 0
+    turnover = 0.0
+    raw_actions = np.zeros(T, dtype=float)
+    pos_series  = np.zeros(T, dtype=float)
+    dpos_series = np.zeros(T, dtype=float)
+
+    det_flag = bool(EVAL_DET)
+
+    for t in range(T):
+        obs = obs_mat[t]
+        a_raw, _ = model.predict(obs, deterministic=det_flag)
+        a = float(a_raw[0]) * ACTION_GAIN
+        raw_actions[t] = a
+        pos_target, dpos, last_change = _apply_action(a, t, pos_target, pos_exec, cfg, last_change)
+        fee  = cfg.fee_bps  * abs(dpos) * cfg.leverage
+        slip = cfg.slip_bps * abs(dpos) * cfg.leverage
+        pos_exec = pos_target
+
+        pnl_ret = (pos_exec * cfg.leverage) * rets[t]
+        fund_cost = pos_exec * funds[t]
+
+        step_net = pnl_ret - fee - slip - fund_cost
+        eq *= (1.0 + step_net)
+
+        eq_path.append(eq); fees += fee; slips += slip; funds_sum += fund_cost
+        pos_series[t]  = pos_exec
+        dpos_series[t] = dpos
+        if abs(dpos) > 1e-9:
+            trades += 1
+            turnover += abs(dpos)
+
+    eq_arr = np.asarray(eq_path, dtype=float)
+    total_ret = eq_arr[-1] / START_CAP - 1.0 if len(eq_arr) else 0.0
+    step_net = np.diff(np.hstack(([START_CAP], eq_arr))) / np.maximum(np.hstack(([START_CAP], eq_arr[:-1])), 1e-12)
+    mu = step_net.mean() if len(step_net) else 0.0
+    sd = step_net.std(ddof=1) if len(step_net) > 1 else 0.0
+    vol_ann = sd * math.sqrt(STEPS_PER_YEAR) if sd > 0 else 0.0
+    sharpe  = (mu / sd * math.sqrt(STEPS_PER_YEAR)) if sd > 0 else 0.0
+    if len(eq_arr):
+        peak = np.maximum.accumulate(eq_arr); dd = eq_arr / np.maximum(peak, 1e-12) - 1.0; max_dd = dd.min()
+    else:
+        max_dd = 0.0
+
+    # optional per-step action log
+    if LOG_ACTION_CSV:
+        df_log = pd.DataFrame({
+            "ts": [str(x.to_pydatetime()) for x in ts],
+            "price": data["price"].astype(float),
+            "a_raw": raw_actions,
+            "pos": pos_series,
+            "dpos": dpos_series
+        })
+        df_log.to_csv(os.path.join(REPORT_DIR, "backtest_actions.csv"), index=False)
+
+    # trade CSV (events only)
+    if SAVE_CSV:
+        rows = []
+        for i in range(T):
+            if abs(dpos_series[i]) > 1e-9:
+                rows.append(dict(
+                    ts=str(ts[i].to_pydatetime()),
+                    price=float(price[i]),
+                    a_raw=float(raw_actions[i]),
+                    dpos=float(dpos_series[i]),
+                    pos=float(pos_series[i])
+                ))
+        pd.DataFrame(rows).to_csv(os.path.join(REPORT_DIR, "backtest_trades.csv"), index=False)
+
+    if SAVE_CHART and len(eq_arr):
+        _save_chart(ts, eq_arr, os.path.join(REPORT_DIR, "backtest_chart.png"))
+
+    # action stats
+    abs_a = np.abs(raw_actions)
+    abs_p = np.abs(pos_series)
+    a_mean = float(abs_a.mean()) if len(abs_a) else 0.0
+    a_p95  = float(np.percentile(abs_a, 95)) if len(abs_a) else 0.0
+    p_mean = float(abs_p.mean()) if len(abs_p) else 0.0
+    p_p95  = float(np.percentile(abs_p, 95)) if len(abs_p) else 0.0
+
+    return dict(
+        start=str(ts[0].to_pydatetime()) if len(ts) else "",
+        end=str(ts[-1].to_pydatetime()) if len(ts) else "",
+        bars=len(ts),
+        final_capital=eq_arr[-1] if len(eq_arr) else START_CAP,
+        total_return=total_ret, vol_annual=vol_ann, sharpe=sharpe, max_dd=max_dd,
+        n_trades=trades, turnover=turnover,
+        costs=dict(fees=fees, slippage=slips, funding=funds_sum),
+        a_mean=a_mean, a_p95=a_p95, p_mean=p_mean, p_p95=p_p95,
+        det=det_flag, gain=ACTION_GAIN, smooth=EVAL_SMOOTH_A
     )
 
-    # Backtest
-    print("Running backtest simulation…")
-    trades_csv = None
-    if args.save_csv:
-        trades_csv = os.path.join(REPORT_DIR, "backtest_trades.csv")
-    res = backtest(model, data, cfg, args.window, save_csv=trades_csv)
+# ===== Main =====
+def main():
+    warnings.filterwarnings("ignore")
+    model_path = os.getenv("BACKTEST_MODEL") or _find_latest_model(MODEL_DIR)
+    if not model_path:
+        print(f"[error] No model .zip found in {MODEL_DIR}.")
+        return
 
-    # Chart
-    chart_path = None
-    if args.save_chart:
-        chart_path = os.path.join(REPORT_DIR, "backtest_chart.png")
-        save_chart(res["ts"], res["eq_path"], chart_path)
+    print(f"[auto] Model: {model_path}")
+    print(f"[auto] Split: {SPLIT}")
 
-    # Summary
-    print("\n============================================================")
-    print("BACKTEST RESULTS SUMMARY")
-    print("============================================================")
+    try:
+        model = PPO.load(model_path, device="cpu")
+    except Exception:
+        model = PPO.load(model_path, device="cpu", custom_objects={})
+
+    feat_cols = _load_feature_list()
+
+    mtf_ok = all(os.path.exists(os.path.join(PROC_DIR, f"fe_{SPLIT}_{tf}.parquet")) for tf in TIMEFRAMES)
+    data = None; used = ""
+    try:
+        if mtf_ok:
+            print("[auto] Building MTF dataset…")
+            data = _build_data_mtf(SPLIT, feat_cols); used = "MTF"
+        else:
+            raise RuntimeError("MTF files missing")
+    except Exception as e:
+        print(f"[auto] MTF build failed ({e}). Falling back to STF.")
+        data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
+
+    try:
+        obs_dim = getattr(model.policy.observation_space, "shape", None)
+        if obs_dim and len(obs_dim) == 1 and data["obs"].shape[1] != obs_dim[0]:
+            print(f"[warn] Obs dim mismatch ({data['obs'].shape[1]} vs {obs_dim[0]}). Trying STF fallback…")
+            data = _build_data_stf(SPLIT, feat_cols, WINDOW_STF); used = "STF"
+    except Exception:
+        pass
+
+    print(f"[auto] Mode: {used} | Obs shape: {data['obs'].shape}")
+    print(f"[cfg] DET={EVAL_DET} (0=stochastic), GAIN={ACTION_GAIN}, SMOOTH_A={EVAL_SMOOTH_A}, MIN_DPOS={EVAL_MIN_DPOS}, COOLDOWN={EVAL_COOLDOWN}")
+
+    cfg = CostCfg(
+        fee_bps=FEE_BPS, slip_bps=SLIP_BPS,
+        min_dpos=EVAL_MIN_DPOS, cooldown=EVAL_COOLDOWN,
+        smooth_a=EVAL_SMOOTH_A, leverage=LEVERAGE
+    )
+
+    print("[run] Backtest starting…")
+    res = run_backtest(model, data, cfg)
+
+    print("\n==================== BACKTEST SUMMARY ====================")
     print(f"기간: {res['start']} ~ {res['end']} | 바 수: {res['bars']:,}")
-    print(f"초기 자본: ${START_CAPITAL:,.0f}")
-    print(f"최종 자본: ${res['final_capital']:,.0f}")
-    print(f"총 수익률: {res['total_return']*100:.2f}%")
-    print(f"연 변동성: {res['vol_annual']*100:.2f}%")
-    print(f"샤프비율: {res['sharpe']:.2f}")
+    print(f"초기 자본: ${START_CAP:,.0f} | 최종 자본: ${res['final_capital']:,.0f}")
+    print(f"총 수익률: {res['total_return']*100:.2f}% | 연 변동성: {res['vol_annual']*100:.2f}% | 샤프: {res['sharpe']:.2f}")
     print(f"최대 손실: {res['max_dd']*100:.2f}%")
-    print("비용 합계:")
-    print(f"  수수료: {res['costs']['fees']*100:.2f}% | 슬리피지: {res['costs']['slippage']*100:.2f}% | 펀딩: {res['costs']['funding']*100:.2f}%")
-    print("거래 통계:")
-    print(f"  거래 수: {res['n_trades']:,} | 승률: {res['hit_rate']*100:.2f}% | 평균 보유봉: {res['avg_hold_bars']:.1f}")
-    if trades_csv:
-        print(f"CSV 저장: {trades_csv}")
-    if chart_path:
-        print(f"차트 저장: {chart_path}")
+    fbps = res['costs']['fees']*1e4; sbps = res['costs']['slippage']*1e4; fundbps = res['costs']['funding']*1e4
+    print(f"거래 수: {res['n_trades']:,} | 총 회전율(Σ|Δpos|): {res['turnover']*100:.2f}%")
+    print(f"비용 → 수수료: {res['costs']['fees']*100:.4f}% ({fbps:.1f} bp) / "
+          f"슬리피지: {res['costs']['slippage']*100:.4f}% ({sbps:.1f} bp) / "
+          f"펀딩: {res['costs']['funding']*100:.4f}% ({fundbps:.1f} bp)")
+    print(f"액션 통계 → mean|a|={res['a_mean']:.4f}, p95|a|={res['a_p95']:.4f}, mean|pos|={res['p_mean']:.4f}, p95|pos|={res['p_p95']:.4f}")
+    if SAVE_CSV:
+        print(f"Trades CSV: {os.path.join(REPORT_DIR, 'backtest_trades.csv')}")
+    if LOG_ACTION_CSV:
+        print(f"Action CSV: {os.path.join(REPORT_DIR, 'backtest_actions.csv')}")
+    if SAVE_CHART:
+        print(f"Chart PNG : {os.path.join(REPORT_DIR, 'backtest_chart.png')}")
+    print("==========================================================")
 
 if __name__ == "__main__":
     main()
