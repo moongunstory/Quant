@@ -1,15 +1,15 @@
 """
-fe.py — Feature Engineering for ETHUSDT (MTF) [REV-2]
-- NEW: Multi-Time-Frame (MTF) feature generation.
+fe.py — Feature Engineering for ETHUSDT (MTF) [REV-3 / Multi-Input]
+- NEW: Saves each timeframe as a separate file for multi-input models.
 - Raw: Loads 5m, 15m, 1h, 4h data from ./ai_binance/data/raw/
-- Output: fe_{train|val|test}_5m.parquet, fe_feature_list_5m.json, scaler_5m.joblib
+- Output: fe_{train|val|test}_{5m|15m|1h|4h}.parquet, fe_feature_list_5m.json, scaler_5m.joblib
 - Logic:
   1. Load raw data for all specified timeframes (5m, 15m, 1h, 4h).
-  2. Generate features for each timeframe independently, suffixing columns with interval (e.g., "rsi_14_1h").
-  3. Use 5m as the base index.
-  4. Reindex higher timeframe features to the 5m index using forward-fill.
-  5. Concatenate all features into a single dataframe.
-  6. Perform feature selection and scaling on the combined MTF feature set.
+  2. Generate features for each timeframe independently.
+  3. Perform feature selection based on the base interval (5m) training data.
+  4. Fit a scaler on the base interval (5m) training data.
+  5. Apply the selected features and scaler to all timeframes.
+  6. Save each processed timeframe and split into its own file.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -39,9 +39,9 @@ OUT_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
 
 # MTF Setup
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
-BASE_INTERVAL = "5m" # The final index will be based on this interval
+BASE_INTERVAL = "5m" # Feature selection and scaling will be based on this interval
 
-# Output paths remain compatible with rl.py
+# Output paths
 FEATURE_LIST_PATH = os.path.join(OUT_DIR, f"fe_feature_list_{BASE_INTERVAL}.json")
 SCALER_PATH       = os.path.join(OUT_DIR, f"scaler_{BASE_INTERVAL}.joblib")
 
@@ -205,7 +205,7 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     
     return _sanitize(final_out)
 
-# ===== Feature Search =====
+# ===== Feature Search & Scaling =====
 
 def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
     y = df["Close"].astype("float64").pct_change().shift(-1)
@@ -219,72 +219,47 @@ def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
     scores = pd.Series(mi, index=X_.columns).sort_values(ascending=False)
     return scores.head(top_k).index.tolist()
 
-def _select_features(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
-    exclude = set(REF_COLS_CANON + ["close_ref"])
-    feat_cols = [c for c in train.columns if c not in exclude]
+def get_feature_list(train_df: pd.DataFrame) -> List[str]:
+    """Performs feature selection based on the training data of the base interval."""
+    exclude = set(REF_COLS_CANON)
+    feat_cols = [c for c in train_df.columns if c not in exclude]
 
     if os.path.exists(FEATURE_LIST_PATH):
-        print(f"[info] Found existing feature list. Reusing.")
+        print(f"[info] Found existing feature list. Reusing: {FEATURE_LIST_PATH}")
         with open(FEATURE_LIST_PATH, "r", encoding="utf-8") as f:
             keep = json.load(f)
+        return keep
+
+    if (not FEATURE_SEARCH) or (TOP_K_FEATURES is None) or (TOP_K_FEATURES >= len(feat_cols)):
+        keep = feat_cols
     else:
-        if (not FEATURE_SEARCH) or (TOP_K_FEATURES is None) or (TOP_K_FEATURES >= len(feat_cols)):
-            keep = feat_cols
-        else:
-            print(f"[info] Performing feature search with method: {FEATURE_SEARCH_METHOD}")
-            y_tr = _make_proxy_y(train)
-            if FEATURE_SEARCH_METHOD == "lgbm" and _HAS_LGB:
-                # Not implemented in this version, falls back to MI
-                keep = _feature_search_mi(train[feat_cols], y_tr, TOP_K_FEATURES)
-            else:
-                keep = _feature_search_mi(train[feat_cols], y_tr, TOP_K_FEATURES)
+        print(f"[info] Performing feature search with method: {FEATURE_SEARCH_METHOD} on base interval")
+        y_tr = _make_proxy_y(train_df)
+        # In this version, both lgbm (not implemented) and mi will use _feature_search_mi
+        keep = _feature_search_mi(train_df[feat_cols], y_tr, TOP_K_FEATURES)
 
-    for df in (train, val, test):
-        add = [c for c in keep if c not in df.columns]
-        for c in add:
-            df[c] = 0.0
-
-    train_sel = pd.concat([train[keep], train[REF_COLS_CANON + ["close_ref"]]], axis=1)
-    val_sel   = pd.concat([val[keep],   val[REF_COLS_CANON + ["close_ref"]]], axis=1)
-    test_sel  = pd.concat([test[keep],  test[REF_COLS_CANON + ["close_ref"]]], axis=1)
-    return train_sel, val_sel, test_sel, keep
-
-# ===== Scaling / Saving =====
-
-def _scale_and_merge(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, feature_cols: List[str]):
-    scaler = StandardScaler(with_mean=True, with_std=True)
-
-    X_tr, ref_tr = train[feature_cols], train.drop(columns=feature_cols)
-    X_va, ref_va = val[feature_cols], val.drop(columns=feature_cols)
-    X_te, ref_te = test[feature_cols], test.drop(columns=feature_cols)
-
-    X_tr, X_va, X_te = _sanitize(X_tr), _sanitize(X_va), _sanitize(X_te)
-
-    scaler.fit(X_tr)
-    X_tr.loc[:, feature_cols] = scaler.transform(X_tr)
-    X_va.loc[:, feature_cols] = scaler.transform(X_va)
-    X_te.loc[:, feature_cols] = scaler.transform(X_te)
-
-    tr_out = pd.concat([X_tr, ref_tr], axis=1)
-    va_out = pd.concat([X_va, ref_va], axis=1)
-    te_out = pd.concat([X_te, ref_te], axis=1)
-
-    def _save(df: pd.DataFrame, split: str):
-        df = _sanitize(df)
-        assert np.isfinite(df.select_dtypes(include=[np.number])).all().all(), f"Non-finite detected in {split}"
-        out_p = os.path.join(OUT_DIR, f"fe_{split}_{BASE_INTERVAL}.parquet")
-        df.to_parquet(out_p)
-        print(f"[ok] {split}: {len(df):,} x {df.shape[1]} -> {out_p}")
-
-    _save(tr_out, "train")
-    _save(va_out, "val")
-    _save(te_out, "test")
-
+    print(f"[ok] Generated feature list with {len(keep)} features.")
     with open(FEATURE_LIST_PATH, "w", encoding="utf-8") as f:
-        json.dump(feature_cols, f, ensure_ascii=False, indent=2)
+        json.dump(keep, f, ensure_ascii=False, indent=2)
+    
+    return keep
+
+def get_and_fit_scaler(train_df: pd.DataFrame, feature_list: List[str]) -> StandardScaler:
+    """Fits a scaler on the training data of the base interval."""
+    print(f"[info] Fitting scaler on base interval training data.")
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    
+    # Ensure all features are present for fitting
+    X_tr = train_df.copy()
+    for col in feature_list:
+        if col not in X_tr.columns:
+            X_tr[col] = 0.0
+    X_tr = X_tr[feature_list]
+    
+    scaler.fit(_sanitize(X_tr))
     joblib.dump(scaler, SCALER_PATH)
-    print(f"[ok] feature list -> {FEATURE_LIST_PATH}")
-    print(f"[ok] scaler -> {SCALER_PATH}")
+    print(f"[ok] Scaler fitted and saved to {SCALER_PATH}")
+    return scaler
 
 # ===== Main =====
 
@@ -305,38 +280,49 @@ def main():
             print(f"  - Computing features for {split} / {tf}...")
             feature_data[split][tf] = compute_features_for_tf(raw_data[split][tf], tf)
 
-    # 3. Merge MTF features
-    print("\n[3/4] Merging MTF features...")
-    merged_data = {}
-    for split in ["train", "val", "test"]:
-        print(f"  - Merging {split} data...")
-        base_df = feature_data[split][BASE_INTERVAL].copy()
-        
-        for tf in TIMEFRAMES:
-            if tf == BASE_INTERVAL:
-                continue
-            
-            # Select only feature columns from higher TFs (not OHLCV)
-            higher_tf_df = feature_data[split][tf]
-            feature_cols_higher_tf = [c for c in higher_tf_df.columns if c not in REF_COLS_CANON]
-            
-            # Reindex and forward-fill
-            resampled_features = higher_tf_df[feature_cols_higher_tf].reindex(base_df.index, method='ffill')
-            
-            base_df = pd.concat([base_df, resampled_features], axis=1)
-        
-        base_df["close_ref"] = base_df["Close"].astype("float64")
-        merged_data[split] = _sanitize(base_df)
+    # 3. Get Feature List and Scaler from Base Interval (5m)
+    print(f"\n[3/4] Getting feature list and scaler from base interval ({BASE_INTERVAL})...")
+    base_train_df = feature_data["train"][BASE_INTERVAL]
+    feature_list = get_feature_list(base_train_df)
+    scaler = get_and_fit_scaler(base_train_df, feature_list)
 
-    # 4. Feature selection and scaling
-    print("\n[4/4] Selecting features, scaling, and saving...")
-    train_df, val_df, test_df = merged_data["train"], merged_data["val"], merged_data["test"]
-    
-    train_sel, val_sel, test_sel, feat_cols = _select_features(train_df, val_df, test_df)
-    
-    _scale_and_merge(train_sel, val_sel, test_sel, feat_cols)
-    
-    print("\n[+] MTF Feature Engineering complete.")
+    # 4. Process and save data for each timeframe and split
+    print("\n[4/4] Processing and saving all timeframe data...")
+    for split in ["train", "val", "test"]:
+        for tf in TIMEFRAMES:
+            print(f"  - Processing {split} / {tf}...")
+            df = feature_data[split][tf].copy()
+
+            # Select features
+            current_features = [c for c in feature_list if c in df.columns]
+            missing_features = [c for c in feature_list if c not in df.columns]
+            
+            ref_cols = [c for c in REF_COLS_CANON if c in df.columns]
+            
+            # 수정: .copy()를 사용하여 SettingWithCopyWarning 방지
+            df_selected = df[current_features + ref_cols].copy()
+            
+            # 수정: missing features 추가 방법 개선
+            for col in missing_features:
+                df_selected[col] = 0.0
+            
+            # Scale features
+            df_scaled = df_selected.copy()
+            df_scaled[feature_list] = scaler.transform(df_selected[feature_list])
+            
+            # Reorder columns for consistency
+            final_df = df_scaled[feature_list + ref_cols]
+            
+            # Save to file
+            final_df = _sanitize(final_df)
+            assert np.isfinite(final_df.select_dtypes(include=[np.number])).all().all(), f"Non-finite detected in {split}/{tf}"
+            
+            # 수정: f-string 포맷팅 적용
+            out_p = os.path.join(OUT_DIR, f"fe_{split}_{tf}.parquet")
+            final_df.to_parquet(out_p)
+            print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
+
+    print("\n[+] MTF Multi-Input Feature Engineering complete.")
 
 if __name__ == "__main__":
     main()
