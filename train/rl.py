@@ -281,6 +281,7 @@ class CryptoFuturesMTFEnv(gym.Env):
         self.prev_pos = self.pos
         a_target, dpos = self._apply_action(a_raw)
 
+        # === 비용 계산 ===
         fee_cost  = self.cost.fee_bps  * abs(dpos) * self.cost.leverage
         slip_cost = self.cost.slip_bps * abs(dpos) * self.cost.leverage
 
@@ -290,38 +291,44 @@ class CryptoFuturesMTFEnv(gym.Env):
         pnl_ret   = (self.pos * self.cost.leverage) * self.rets[self.t]
         fund_cost = self.pos * self.fund[self.t]
 
-        # 누적 관리
+        # === 누적 관리 ===
         self.cum_pnl  += pnl_ret
         self.cum_cost += fee_cost + slip_cost + fund_cost
 
-        # 턴오버 제약
+        # === 턴오버 제약 ===
         self.turn_hist.append(abs(dpos))
         if len(self.turn_hist) > 288:
             self.turn_hist.pop(0)
         self.turnover_roll = float(sum(self.turn_hist))
         excess = max(0.0, self.turnover_roll - self.cost.budget_daily)
+
         if excess > 0.0:
-            self.lambda_ = min(self.lambda_max, self.lambda_ + self.lambda_step)
+            # λ 상승 속도 완화 (기존보다 절반)
+            self.lambda_ = min(self.lambda_max, self.lambda_ + self.lambda_step * 0.5)
 
         # === 보상 계산 ===
         reward = 0.0
-        # shaping reward (보유 중 방향성 힌트)
-        if self.pos != 0.0:
-            reward += 0.01 * pnl_ret  # ← 크기는 작게
 
-        # 청산 시점: 누적 정산
+        # (1) shaping reward: 방향성 힌트 → 강도 0.1배 (이전엔 0.01)
+        if self.pos != 0.0:
+            reward += 0.1 * pnl_ret
+
+        # (2) 청산 시점 정산
         if self.pos == 0.0 and self.prev_pos != 0.0:
             net = self.cum_pnl - self.cum_cost - self.lambda_ * excess
             reward += net
             self.cum_pnl = 0.0
             self.cum_cost = 0.0
 
+        # (3) 전체 보상 scale normalization (스케일 차이 줄이기)
+        reward = reward * 100.0
+
         info = dict(
             t=int(self.t), ts=str(self.ts[self.t].to_pydatetime()),
             pos=float(self.pos), dpos=float(dpos), pnl_ret=float(pnl_ret),
             fee=float(fee_cost), slip=float(slip_cost), fund=float(fund_cost),
-            lambda_=float(self.lambda_), excess_turn=float(excess), ret=float(self.rets[self.t]),
-            reward=float(reward)
+            lambda_=float(self.lambda_), excess_turn=float(excess),
+            ret=float(self.rets[self.t]), reward=float(reward)
         )
 
         self.t += 1
