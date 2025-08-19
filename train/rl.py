@@ -1,427 +1,311 @@
-"""
-rl.py — PPO training for ETHUSDT (5m) matching fe.py outputs (REV-1)
-- Fix: **Slippage no double-count** — slippage is applied ONLY via execution price; costs exclude slippage.
-- Add: **min_hold=24, cooldown=6 bars, flip penalty=3bp** to suppress churn.
-- Reward: per-step **ΔEquity fraction** (equity_after / equity_before - 1.0), including fees & funding.
-- Uses fe.py processed files from ./ai_binance/data/processed.
-- Saves models to ./ai_binance/data/model.
+# rl_practitioner.py — PPO for Crypto Futures (practitioner-style)
+# - Env: 5m bar, next-bar execution (1-bar latency), Box action a∈[-1,1] = target position
+# - Reward: pos * return  − (fee + slippage) on turnover − funding_per_step − λ·excess_turnover
+# - Costs only when position changes (NO double-count)
+# - Funding: 8h rate / 96 per 5m step (uses Funding8h or FundingRate)
+# - Stabilizers: min Δpos threshold, cooldown, action smoothing, daily turnover budget(Lagrange)
+# - Data: uses processed outputs from fe.py (fe_{train,val,test}_5m.parquet + feature_list JSON)
 
-Quick start:
-    python ai_binance/train/rl.py --timesteps 1_200_000
-"""
 from __future__ import annotations
-
-import os
-import json
-import math
-import argparse
+import os, json, math, warnings
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, Tuple, Optional, List
 
-import numpy as np
-import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
+import numpy as np
+import pandas as pd
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
+from stable_baselines3.common.utils import set_random_seed
 
-# ===== Paths (aligned with fe.py) =====
+# ===== Paths =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROC_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
 MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
-os.makedirs(MODEL_DIR, exist_ok=True)
+REPORT_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "reports"))
+os.makedirs(MODEL_DIR, exist_ok=True); os.makedirs(REPORT_DIR, exist_ok=True)
 
-INTERVAL = "5m"
-TRAIN_P = os.path.join(PROC_DIR, f"fe_train_{INTERVAL}.parquet")
-VAL_P   = os.path.join(PROC_DIR, f"fe_val_{INTERVAL}.parquet")
-TEST_P  = os.path.join(PROC_DIR, f"fe_test_{INTERVAL}.parquet")
-FEAT_P  = os.path.join(PROC_DIR, f"fe_feature_list_{INTERVAL}.json")
+# ===== Default Hyperparams (reasonable starting points) =====
+SEED = 42
+WINDOW = 48                 # 4h of 5m bars
+FEE_BPS = 0.0006            # taker fee per notional traded (e.g., 6 bps)
+SLIP_BPS = 0.0003           # baseline slippage per turnover (can be made ATR-linked)
+MIN_DPOS = 0.10             # ignore Δpos smaller than this (mask small fiddling)
+COOLDOWN = 2                # bars after a change where further changes are blocked
+TURN_BUDGET_DAILY = 1.5     # daily turnover budget (×equity notional)
+LAMBDA_INIT = 0.0           # Lagrange multiplier start
+LAMBDA_STEP = 1e-4          # λ += LAMBDA_STEP * (excess > 0)
+LAMBDA_MAX = 25.0
+LEVERAGE = 1.0              # scale of exposure; keep 1.0 to start
+SMOOTH_ALPHA = 0.25         # action smoothing toward target (EMA)
+EVAL_EVERY = 10_000
+TOTAL_STEPS = 1_000_000
 
-# ===== Trading/Env Parameters =====
+# ===== Data loading =====
+def _load_fe(split: str) -> Tuple[pd.DataFrame, List[str]]:
+    X = pd.read_parquet(os.path.join(PROC_DIR, f"fe_{split}_5m.parquet"))
+    with open(os.path.join(PROC_DIR, "fe_feature_list_5m.json"), "r", encoding="utf-8") as f:
+        feat_cols = json.load(f)
+    # Sanity
+    req = ["close_ref", "FundingRate"]
+    for c in req:
+        if c not in X.columns:
+            X[c] = 0.0
+    # Optional columns
+    if "Funding8h" not in X.columns:
+        X["Funding8h"] = X["FundingRate"]
+    if "FundingSettle" not in X.columns:
+        idx = X.index if isinstance(X.index, pd.DatetimeIndex) else pd.to_datetime(X.index, utc=True)
+        X["FundingSettle"] = (((idx.hour % 8 == 0) & (idx.minute == 0))).astype("int8")
+    return X.sort_index(), feat_cols
+
+def _to_numpy_windows(df: pd.DataFrame, feat_cols: List[str], window: int) -> Dict[str, np.ndarray]:
+    idx = df.index
+    F = len(feat_cols)
+    N = len(df)
+    if N <= window + 1:
+        raise ValueError("Not enough rows for windowing.")
+    # features already scaled by fe.py
+    X = df[feat_cols].values.astype(np.float32)
+    close = df["close_ref"].astype("float64").values
+    fund8h = df.get("Funding8h", df["FundingRate"]).astype("float64").values
+    # build rolling windows (flattened)
+    T = N - window
+    obs = np.empty((T, window * F), dtype=np.float32)
+    for t in range(T):
+        obs[t] = X[t:t+window].reshape(-1)
+    # returns for step t+1 (next-bar; obs at t corresponds to price move from t+window-1 -> t+window)
+    ret = (close[window:] - close[window-1:-1]) / np.maximum(close[window-1:-1], 1e-12)
+    # per-step funding rate (8h/96)
+    fund_step = fund8h[window:] / 96.0
+    # timestamps (align to step target bar)
+    ts = pd.to_datetime(idx[window:], utc=True)
+    return dict(obs=obs, ret=ret.astype(np.float64), fund=fund_step.astype(np.float64), ts=ts)
+
+# ===== Env =====
 @dataclass
-class EnvCfg:
-    fee_rate: float = 0.0006          # taker per side (6bp)
-    slip_bp: float = 0.0002           # slippage (applied to exec price only)
-    min_hold: int = 24                # bars (↑ to reduce churn)
-    max_hold: int = 96                # bars (~8h)
-    stop_pct: float = 0.010           # 1%
-    stop_atr_mult: float = 2.0        # 2x ATR stop
-    trail_mult: Optional[float] = 1.2 # trailing multiple of stop width (None to disable)
-    leverage: float = 1.0
-    alpha_flip_bp: float = 0.0003     # extra penalty when changing position (3bp)
-    funding_split: int = 96           # 8h / 5m
-    random_reset: bool = True
-    flat_at_funding: bool = False     # optional (unused here)
-    cooldown_bars: int = 6            # wait after any trade
+class CostConfig:
+    fee_bps: float = FEE_BPS
+    slip_bps: float = SLIP_BPS
+    min_dpos: float = MIN_DPOS
+    cooldown: int = COOLDOWN
+    budget_daily: float = TURN_BUDGET_DAILY
+    leverage: float = LEVERAGE
+    smooth_alpha: float = SMOOTH_ALPHA
 
-# ===== Helpers =====
-
-def _ewm_mean(arr: np.ndarray, alpha: float) -> np.ndarray:
-    out = np.empty_like(arr)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
-    return out
-
-
-def _atr_from_ohlc(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]
-    tr = np.maximum.reduce([
-        high - low,
-        np.abs(high - prev_close),
-        np.abs(low - prev_close)
-    ])
-    alpha = 1.0 / period
-    return _ewm_mean(tr, alpha)
-
-
-class MarketEnvTargetPos(gym.Env):
-    """Gym env using fe.py processed files.
-    Observation: scaled feature vector at time t.
-    Action: 0→-1(short), 1→0(flat), 2→+1(long). Internally mapped to {-1,0,+1}.
-    Reward: **ΔEquity fraction** including fees (no slippage double count) & funding.
-    """
-    metadata = {"render.modes": ["human"]}
-
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        feature_cols: List[str],
-        cfg: EnvCfg,
-        seed: int = 72,
-    ):
+class CryptoFuturesEnv(gym.Env):
+    metadata = {"render.modes": []}
+    def __init__(self, data: Dict[str, np.ndarray], cost: CostConfig, lambda_init=LAMBDA_INIT, lambda_step=LAMBDA_STEP, lambda_max=LAMBDA_MAX):
         super().__init__()
-        self.rng = np.random.default_rng(seed)
-        self.cfg = cfg
+        self.obs_mat = data["obs"]           # (T, W*F)
+        self.rets = data["ret"]              # price return for this step
+        self.fund = data["fund"]             # funding per step (sign matters)
+        self.ts = data["ts"]                 # timestamps
+        self.T = len(self.rets)
 
-        # Split features and refs
-        self.feature_cols = feature_cols
-        assert all(c in df.columns for c in feature_cols), "Missing feature columns in df"
-        # Refs
-        for c in ["Open", "High", "Low", "Close", "FundingRate", "close_ref"]:
-            if c not in df.columns:
-                df[c] = 0.0
-        self.ref = df[["Open", "High", "Low", "Close", "FundingRate", "close_ref"]].copy()
-        self.X = df[feature_cols].astype("float64").to_numpy()
+        self.cost = cost
+        self.lambda_ = lambda_init
+        self.lambda_step = lambda_step
+        self.lambda_max = lambda_max
 
-        # Precompute ATR from raw refs
-        self.atr14 = _atr_from_ohlc(
-            self.ref["High"].to_numpy(dtype=float),
-            self.ref["Low"].to_numpy(dtype=float),
-            self.ref["Close"].to_numpy(dtype=float),
-            period=14,
-        )
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=self.obs_mat.shape[1:], dtype=np.float32)
 
-        self.n = len(df)
-        self.action_space = spaces.Discrete(3)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(feature_cols),), dtype=np.float64)
+        # state
+        self.t = 0
+        self.pos = 0.0           # executed position for current step
+        self.pos_target = 0.0    # desired target; execution at this step
+        self.pos_last_change = -10**9
+        self.turnover_roll = 0.0 # last 24h turnover rolling sum
+        self.turn_hist = []      # store last 288 steps turnovers for rolling sum
 
-        # State vars
-        self.i: int = 0
-        self.pos: int = 0  # -1/0/+1
-        self.entry_price: Optional[float] = None
-        self.hold_bars: int = 0
-        self.peak_pnl: float = 0.0
-        self.equity: float = 1.0  # normalized equity
-        self.cooldown: int = 0
-
-    # --- Internal utilities ---
-    @staticmethod
-    def _a_to_pos(a: int) -> int:
-        return (-1, 0, +1)[a]
-
-    def _min_switch_blocked(self) -> bool:
-        return self.pos != 0 and self.hold_bars < self.cfg.min_hold
-
-    def _stop_hit(self, price_t: float) -> bool:
-        if self.pos == 0 or self.entry_price is None:
-            return False
-        side = self.pos
-        ret = (price_t / self.entry_price - 1.0) * (1 if side == +1 else -1)
-        stop_atr = self.cfg.stop_atr_mult * (self.atr14[self.i] / price_t)
-        stop_cut = min(self.cfg.stop_pct, stop_atr)
-        return ret <= -stop_cut
-
-    def _trail_hit(self, price_t: float) -> bool:
-        if self.cfg.trail_mult is None or self.pos == 0 or self.entry_price is None:
-            return False
-        side = self.pos
-        cur = (price_t / self.entry_price - 1.0) * (1 if side == +1 else -1)
-        dd = (self.peak_pnl - cur) if side == +1 else (cur - self.peak_pnl)
-        trail_pct = self.cfg.trail_mult * min(
-            self.cfg.stop_pct, self.cfg.stop_atr_mult * (self.atr14[self.i] / price_t)
-        )
-        return dd >= trail_pct
-
-    def _funding_cost_step(self) -> float:
-        # Positive FundingRate means longs pay, shorts receive.
-        fr = float(self.ref.iloc[self.i]["FundingRate"])  # per 8h
-        return self.pos * (fr / self.cfg.funding_split) * self.cfg.leverage  # cost (+) if paying
-
-    # --- Gym API ---
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        if seed is not None:
-            self.rng = np.random.default_rng(int(seed))
-        start_min = 1
-        start_max = self.n - 200  # leave runway
-        self.i = int(self.rng.integers(start_min, start_max)) if self.cfg.random_reset else start_min
-        self.pos = 0
-        self.entry_price = None
-        self.hold_bars = 0
-        self.peak_pnl = 0.0
-        self.equity = 1.0
-        self.cooldown = 0
-        obs = self.X[self.i].copy()
-        info = {}
-        return obs, info
+        self.t = 0
+        self.pos = 0.0
+        self.pos_target = 0.0
+        self.pos_last_change = -10**9
+        self.turnover_roll = 0.0
+        self.turn_hist.clear()
+        self.lambda_ = min(self.lambda_, self.lambda_max)  # keep current λ (or reset to init if preferred)
+        return self.obs_mat[self.t], {}
 
-    def step(self, action: int):
-        assert 0 <= action <= 2
-        done = False
-        info = {}
-
-        # Prices t and t+1
-        if self.i >= self.n - 2:
-            done = True
-            return self.X[self.i], 0.0, done, False, info
-        price_t = float(self.ref.iloc[self.i]["close_ref"]) or float(self.ref.iloc[self.i]["Close"])  # safe fallback
-        price_tp1 = float(self.ref.iloc[self.i + 1]["close_ref"]) or float(self.ref.iloc[self.i + 1]["Close"])  # next bar
-
-        # Cooldown decay
-        if self.cooldown > 0:
-            self.cooldown -= 1
-
-        eq_before = self.equity
-
-        # Forced exits (risk guards)
-        forced_exit = self._stop_hit(price_t) or self._trail_hit(price_t) or (self.hold_bars >= self.cfg.max_hold)
-
-        # Policy desire
-        want_pos = self._a_to_pos(action)
-        want_flip = (self.pos != 0) and (want_pos == -self.pos)
-        want_flat = (self.pos != 0) and (want_pos == 0)
-
-        # Min-hold gate
-        if self._min_switch_blocked():
-            want_flip = False
-            want_flat = False
-
-        # Execute exits
-        if (self.pos != 0) and (forced_exit or want_flat or want_flip):
-            # Exit at price_t with slippage on price only
-            exec_price = price_t * (1 - self.cfg.slip_bp) if self.pos == +1 else price_t * (1 + self.cfg.slip_bp)
-            trade_ret = (exec_price / self.entry_price - 1.0) * self.pos * self.cfg.leverage
-            exit_fee = self.cfg.fee_rate
-            self.equity *= (1.0 + trade_ret) * (1.0 - exit_fee)
-
-            # Flat out
-            self.pos = 0
-            self.entry_price = None
-            self.hold_bars = 0
-            self.peak_pnl = 0.0
-            self.cooldown = self.cfg.cooldown_bars
-
-        # Execute entries (no immediate re-entry if cooldown>0)
-        can_enter = (self.pos == 0) and (want_pos != 0) and (not forced_exit) and (self.cooldown == 0)
-        if can_enter:
-            self.pos = want_pos
-            # Entry exec price with slippage on price only
-            self.entry_price = price_t * (1 + self.cfg.slip_bp) if self.pos == +1 else price_t * (1 - self.cfg.slip_bp)
-            entry_cost = self.cfg.fee_rate + self.cfg.alpha_flip_bp  # NO slippage here (already in price)
-            self.equity *= (1.0 - entry_cost)
-            self.hold_bars = 0
-            self.peak_pnl = 0.0
-            self.cooldown = self.cfg.cooldown_bars
-
-        # Running PnL for the bar (t→t+1) & funding
-        ret_tp1 = (price_tp1 / price_t - 1.0) * self.pos * self.cfg.leverage
-        funding_cost = self._funding_cost_step()  # (+) if paying
-        self.equity *= (1.0 + ret_tp1 - funding_cost)
-
-        # Track peak pnl for trailing
-        if self.pos != 0 and self.entry_price is not None:
-            cur = (price_t / self.entry_price - 1.0) * (1 if self.pos == +1 else -1)
-            if self.pos == +1:
-                self.peak_pnl = max(self.peak_pnl, cur)
+    def _apply_action(self, a_raw: float) -> Tuple[float, float]:
+        # cooldown
+        if (self.t - self.pos_last_change) < self.cost.cooldown:
+            a = self.pos_target  # locked
+        else:
+            # smoothing toward raw action
+            a = (1 - self.cost.smooth_alpha) * self.pos_target + self.cost.smooth_alpha * float(np.clip(a_raw, -1.0, 1.0))
+            # small change masking
+            if abs(a - self.pos_target) < self.cost.min_dpos:
+                a = self.pos_target
             else:
-                self.peak_pnl = min(self.peak_pnl, cur)
-            self.hold_bars += 1
+                self.pos_last_change = self.t
+        # turnover to go from current executed pos -> new target (exec now)
+        dpos = a - self.pos
+        return a, dpos
 
-        self.i += 1
-        obs = self.X[self.i].copy()
-        eq_after = self.equity
-        reward = float(eq_after / (eq_before + 1e-12) - 1.0)
+    def step(self, action: np.ndarray):
+        assert self.t < self.T, "Episode already done"
+        a_raw = float(action[0])
+        # Execute at start of step (next-bar execution)
+        a_target, dpos = self._apply_action(a_raw)
 
-        terminated = done or (not np.isfinite(self.equity)) or (self.equity <= 0.05)
+        # Costs on turnover (single execution)
+        fee_cost = self.cost.fee_bps * abs(dpos) * self.cost.leverage
+        slip_cost = self.cost.slip_bps * abs(dpos) * self.cost.leverage
+
+        # Update executed position AFTER paying costs
+        self.pos = a_target
+        self.pos_target = a_target
+
+        # Price PnL over this bar using executed position (pos held through the bar)
+        pnl_ret = (self.pos * self.cost.leverage) * self.rets[self.t]
+
+        # Funding per step (sign: +rate costs longs, −rate costs shorts)
+        fund_cost = self.pos * (self.fund[self.t])
+
+        # Rolling daily turnover budget (288 steps ≈ 1 day)
+        self.turn_hist.append(abs(dpos))
+        if len(self.turn_hist) > 288:
+            self.turn_hist.pop(0)
+        self.turnover_roll = sum(self.turn_hist)
+        excess = max(0.0, self.turnover_roll - self.cost.budget_daily)
+
+        # Lagrange update: push λ up when exceeding budget
+        if excess > 0.0:
+            self.lambda_ = min(self.lambda_max, self.lambda_ + self.lambda_step)
+
+        reward = pnl_ret - fee_cost - slip_cost - fund_cost - self.lambda_ * excess
+
+        info = dict(
+            t=int(self.t),
+            ts=str(self.ts[self.t].to_pydatetime()),
+            pos=float(self.pos),
+            dpos=float(dpos),
+            pnl_ret=float(pnl_ret),
+            fee=float(fee_cost),
+            slip=float(slip_cost),
+            fund=float(fund_cost),
+            lambda_=float(self.lambda_),
+            excess_turn=float(excess),
+            ret=float(self.rets[self.t])
+        )
+
+        self.t += 1
+        terminated = self.t >= self.T
         truncated = False
-        info.update({"equity": self.equity, "pos": self.pos})
-        return obs, reward, bool(terminated), bool(truncated), info
+        obs = self.obs_mat[self.t-1] if not terminated else self.obs_mat[self.T-1]
+        return obs, float(reward), terminated, truncated, info
 
-    def render(self):
-        print(f"i={self.i} pos={self.pos} equity={self.equity:.4f}")
+# ===== Callbacks =====
+class PrintDiagCallback(BaseCallback):
+    def __init__(self, freq=5000, verbose=0):
+        super().__init__(verbose)
+        self.freq = freq
+        self._eq = 1.0
+        self._pnl = 0.0
+        self._costs = 0.0
+        self._turn = 0.0
+        self._n = 0
 
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if not info: continue
+            self._eq *= (1.0 + info.get("ret", 0.0) * info.get("pos", 0.0))
+            self._pnl += info.get("pnl_ret", 0.0)
+            self._costs += (info.get("fee", 0.0) + info.get("slip", 0.0) + info.get("fund", 0.0))
+            self._turn = info.get("excess_turn", self._turn)
+            self._n += 1
+        if self.num_timesteps % self.freq == 0 and self._n:
+            print(f"[diag] steps={self.num_timesteps:,} eq={self._eq:.3f} pnl={self._pnl:.5f} "
+                  f"costs={self._costs:.5f} excess={self._turn:.3f}")
+        return True
 
-# ===== Learning rate schedules =====
+# ===== Training/Eval Utilities =====
+def make_env(split="train") -> gym.Env:
+    df, feat_cols = _load_fe(split)
+    data = _to_numpy_windows(df, feat_cols, WINDOW)
+    env = CryptoFuturesEnv(data, CostConfig(
+        fee_bps=FEE_BPS, slip_bps=SLIP_BPS, min_dpos=MIN_DPOS, cooldown=COOLDOWN,
+        budget_daily=TURN_BUDGET_DAILY, leverage=LEVERAGE, smooth_alpha=SMOOTH_ALPHA
+    ))
+    return env
 
-def linear_schedule(start: float, end: float):
-    def _fn(progress_remaining: float):
-        return end + (start - end) * progress_remaining
-    return _fn
-
-
-def cosine_schedule(start: float, end: float):
-    def _fn(progress_remaining: float):
-        # progress_remaining: 1→0
-        cos = 0.5 * (1 + math.cos(math.pi * (1 - progress_remaining)))
-        return end + (start - end) * cos
-    return _fn
-
-
-# ===== Utilities to load data/envs =====
-
-def _load_split(split_path: str) -> pd.DataFrame:
-    if not os.path.exists(split_path):
-        raise FileNotFoundError(f"Missing split file: {split_path}")
-    return pd.read_parquet(split_path)
-
-
-def make_env_from_split(split: str, feature_cols: List[str], cfg: EnvCfg, seed: int) -> gym.Env:
-    pmap = {"train": TRAIN_P, "val": VAL_P, "test": TEST_P}
-    df = _load_split(pmap[split])
-    env = MarketEnvTargetPos(df, feature_cols, cfg, seed=seed)
-    return Monitor(env)
-
-
-# ===== Simple evaluation on a single env =====
-
-def run_rollout(env: gym.Env, model: PPO, n_steps: int | None = None) -> dict:
-    obs, info = env.reset()
-    eq_hist = [1.0]
-    pos_hist = []
-    steps = 0
+def evaluate_model(model: PPO, split="val") -> Dict[str, float]:
+    env = make_env(split)
+    obs, _ = env.reset()
+    done = False
+    eq = 1.0
+    fees = slips = funds = 0.0
+    pnl = 0.0
     while True:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(int(action))
-        eq_hist.append(info.get("equity", eq_hist[-1]))
-        pos_hist.append(info.get("pos", 0))
-        steps += 1
+        obs, reward, terminated, truncated, info = env.step(action)
+        eq *= (1.0 + info["pos"] * info["ret"])
+        fees += info["fee"]; slips += info["slip"]; funds += info["fund"]; pnl += info["pnl_ret"]
         if terminated or truncated:
             break
-        if n_steps is not None and steps >= n_steps:
-            break
-    eq_arr = np.array(eq_hist)
-    rets = np.diff(eq_arr) / np.clip(eq_arr[:-1], 1e-12, None)
-    sharpe = (np.mean(rets) / (np.std(rets) + 1e-8)) * math.sqrt(365*24*12) if len(rets) > 1 else 0.0
-    return {
-        "final_equity": float(eq_arr[-1]),
-        "total_return": float(eq_arr[-1] - 1.0),
-        "sharpe": float(sharpe),
-        "steps": int(steps),
-    }
+    dd = 0.0
+    # naïve drawdown on equity path is omitted for brevity; eq is final equity multiple
+    return dict(final_eq=eq, pnl=pnl, fees=fees, slips=slips, funds=funds, lambda_=info["lambda_"])
 
+def train():
+    set_random_seed(SEED)
+    train_env = DummyVecEnv([lambda: make_env("train")])
+    val_env   = DummyVecEnv([lambda: make_env("val")])
 
-# ===== Main training =====
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--timesteps", type=int, default=1_200_000)
-    parser.add_argument("--lr_start", type=float, default=3e-4)
-    parser.add_argument("--lr_end", type=float, default=1e-4)
-    parser.add_argument("--lr_sched", type=str, default="linear", choices=["linear", "cosine"])
-    parser.add_argument("--seed", type=int, default=72)
-    parser.add_argument("--policy_width", type=int, default=256)
-    parser.add_argument("--logdir", type=str, default=os.path.join(MODEL_DIR, "tb"))
-    args = parser.parse_args()
-
-    # Load feature list
-    if not os.path.exists(FEAT_P):
-        raise FileNotFoundError(f"Missing feature list: {FEAT_P}")
-    with open(FEAT_P, "r", encoding="utf-8") as f:
-        feature_cols = json.load(f)
-
-    cfg = EnvCfg()
-
-    # Envs
-    def _make_train():
-        return make_env_from_split("train", feature_cols, cfg, seed=args.seed)
-    def _make_val():
-        cfg_eval = EnvCfg(**{**cfg.__dict__, "random_reset": False})
-        return make_env_from_split("val", feature_cols, cfg_eval, seed=args.seed)
-
-    train_env = DummyVecEnv([_make_train])
-    eval_env = DummyVecEnv([_make_val])
-
-    # LR schedule
-    if args.lr_sched == "linear":
-        lr = linear_schedule(args.lr_start, args.lr_end)
-    else:
-        lr = cosine_schedule(args.lr_start, args.lr_end)
-
-    policy_kwargs = dict(net_arch=[args.policy_width, args.policy_width])
-
+    # PPO configs (robust defaults; tune later)
     model = PPO(
-        policy="MlpPolicy",
-        env=train_env,
-        learning_rate=lr,
+        "MlpPolicy",
+        train_env,
+        verbose=0,
+        seed=SEED,
         n_steps=2048,
         batch_size=256,
-        n_epochs=10,
-        gamma=0.99,
         gae_lambda=0.95,
-        ent_coef=0.005,
+        gamma=0.99,
+        learning_rate=3e-4,
         clip_range=0.2,
+        ent_coef=0.0,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        seed=args.seed,
-        verbose=1,
-        tensorboard_log=args.logdir,
-        policy_kwargs=policy_kwargs,
+        tensorboard_log=os.path.join(MODEL_DIR, "tb")
     )
 
-    stop_cb = StopTrainingOnNoModelImprovement(max_no_improvement_evals=10, min_evals=10, verbose=1)
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=MODEL_DIR,
-        log_path=args.logdir,
-        eval_freq=50_000,
-        deterministic=True,
-        render=False,
-        callback_after_eval=stop_cb,
-    )
+    diag = PrintDiagCallback(freq=5000)
 
-    print("[RL] Training started…")
-    model.learn(total_timesteps=args.timesteps, callback=eval_cb, progress_bar=True)
+    # Lightweight eval saving
+    class _EvalAndSave(BaseCallback):
+        def __init__(self, eval_every=EVAL_EVERY):
+            super().__init__()
+            self.eval_every = eval_every
+            self.best = -1e9
+        def _on_step(self) -> bool:
+            if self.num_timesteps % self.eval_every == 0:
+                m = self.model
+                metrics = evaluate_model(m, "val")
+                score = metrics["final_eq"] - (metrics["fees"] + metrics["slips"] + abs(metrics["funds"]))
+                print(f"[eval] steps={self.num_timesteps:,} "
+                      f"eq={metrics['final_eq']:.3f} pnl={metrics['pnl']:.5f} "
+                      f"fees={metrics['fees']:.5f} slip={metrics['slips']:.5f} fund={metrics['funds']:.5f}")
+                if score > self.best:
+                    self.best = score
+                    path = os.path.join(MODEL_DIR, "ppo_practitioner_best.zip")
+                    m.save(path)
+                    print(f"[save] {path}")
+            return True
 
-    best_path = os.path.join(MODEL_DIR, "best_model.zip")
-    last_path = os.path.join(MODEL_DIR, "ppo_final_model.zip")
-    try:
-        model.save(last_path)
-    except Exception:
-        pass
-    print(f"[RL] Saved model → {last_path}")
-    if os.path.exists(best_path):
-        print(f"[RL] Best model exists → {best_path}")
-
-    # Final quick checks on val & test
-    print("[RL] Running quick evaluation…")
-    best_model = PPO.load(best_path) if os.path.exists(best_path) else model
-
-    val_env = make_env_from_split("val", feature_cols, EnvCfg(random_reset=False), seed=args.seed)
-    test_env = make_env_from_split("test", feature_cols, EnvCfg(random_reset=False), seed=args.seed)
-
-    val_res = run_rollout(val_env, best_model)
-    test_res = run_rollout(test_env, best_model)
-
-    print("================ EVAL SUMMARY ================")
-    print(f"Val  — steps={val_res['steps']:,} final_eq={val_res['final_equity']:.3f} ret={(val_res['total_return']*100):.2f}% sharpe={val_res['sharpe']:.2f}")
-    print(f"Test — steps={test_res['steps']:,} final_eq={test_res['final_equity']:.3f} ret={(test_res['total_return']*100):.2f}% sharpe={test_res['sharpe']:.2f}")
-    print("=============================================")
-
+    model.learn(total_timesteps=TOTAL_STEPS, callback=[diag, _EvalAndSave()])
+    final_path = os.path.join(MODEL_DIR, "ppo_practitioner_final.zip")
+    model.save(final_path)
+    print(f"[save] {final_path}")
 
 if __name__ == "__main__":
-    main()
+    warnings.filterwarnings("ignore")
+    train()

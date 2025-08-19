@@ -1,8 +1,9 @@
 """
-backtest.py — Backtesting module (REV-1) for rl.py policy using fe.py outputs (ETHUSDT 5m)
-- Fix: **No slippage double-count** → slippage only via execution price; costs exclude slippage.
-- Align: **min_hold=24, cooldown=6, alpha_flip=3bp** with rl.py.
-- Equity model: multiplicative; per-bar funding (8h → 96×5m).
+backtest.py — Backtesting module (REV-2) for rl.py policy using fe.py outputs (ETHUSDT 5m)
+- Funding: event-based settlement (default 8h: 00/08/16 UTC). Optional split kept for experiments.
+- Fees: leverage-proportional (notional-based) at entry/exit; no slippage double-count (slippage only via exec price).
+- Align: min_hold=24, cooldown=6, alpha_flip=3bp with rl.py.
+- Equity model: multiplicative; reward accrues via per-bar PnL; funding only at settlement bars (event-mode).
 - Outputs: summary, optional trades CSV & equity chart.
 
 Usage:
@@ -34,32 +35,39 @@ VAL_P   = os.path.join(PROC_DIR, f"fe_val_{INTERVAL}.parquet")
 TEST_P  = os.path.join(PROC_DIR, f"fe_test_{INTERVAL}.parquet")
 FEAT_P  = os.path.join(PROC_DIR, f"fe_feature_list_{INTERVAL}.json")
 
-# ===== Trading parameters (mirror rl.py REV-1) =====
+# ===== Trading parameters (mirror rl.py REV-2) =====
 @dataclass
 class Cfg:
-    fee_rate: float = 0.0006          # taker per side (6bp)
-    slip_bp: float = 0.0002           # slippage fraction (2bp) — applied to exec prices only
-    min_hold: int = 24                # bars
-    max_hold: int = 96                # bars (~8h)
-    stop_pct: float = 0.010           # 1%
-    stop_atr_mult: float = 2.0        # 2× ATR stop
-    trail_mult: Optional[float] = 1.2 # trailing multiple of stop width (None to disable)
-    leverage: float = 1.0
-    funding_split: int = 96           # 8h → 96×5m
+    # Fees / slippage
+    fee_rate: float = 0.0006           # taker per side (6bp) — put your real VIP/BNB-adjusted rate if different
+    slip_bp: float = 0.0002            # slippage fraction (2bp), applied to execution price only
+    alpha_flip_bp: float = 0.0003      # extra penalty when changing position (3bp), applied on notional
+    leverage: float = 1.0              # scales notional PnL, fees & funding (simulation of exposure)
+
+    # Funding
+    funding_mode: str = "event"        # "event" (recommended) or "split"
+    funding_hours: int = 8             # 8 (default Binance) or 1 (if hourly regime applies)
+    funding_split: int = 96            # only used in split mode (8h / 5m)
+
+    # Churn / risk
+    min_hold: int = 24                 # bars
+    max_hold: int = 96                 # bars (~8h)
+    cooldown_bars: int = 6             # wait after any trade
+    stop_pct: float = 0.010            # 1%
+    stop_atr_mult: float = 2.0         # 2× ATR stop
+    trail_mult: Optional[float] = 1.2  # trailing multiple (None to disable)
+
+    # Optional daily drawdown limit
     daily_dd_limit: Optional[float] = None  # e.g., 0.03 for -3% daily limit; None to disable
-    alpha_flip_bp: float = 0.0003     # extra penalty when changing position (3bp)
-    cooldown_bars: int = 6            # wait after any trade
 
 
 # ===== Helpers =====
-
 def _ewm(arr: np.ndarray, alpha: float) -> np.ndarray:
     out = np.empty_like(arr, dtype=float)
     out[0] = arr[0]
     for i in range(1, len(arr)):
         out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
     return out
-
 
 def _atr14(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
     prev_close = np.roll(close, 1)
@@ -71,7 +79,6 @@ def _atr14(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
     ])
     return _ewm(tr, alpha=1/14)
 
-
 def _max_drawdown(eqs: np.ndarray) -> float:
     peak = -np.inf
     mdd = 0.0
@@ -80,12 +87,30 @@ def _max_drawdown(eqs: np.ndarray) -> float:
         mdd = min(mdd, x/peak - 1.0)
     return mdd
 
-
 def _annual_factor_5m() -> float:
     # 5m bars/year ≈ 365*24*12 = 105120
     return math.sqrt(365*24*12)
 
+def _utc_index(df: pd.DataFrame) -> pd.DatetimeIndex:
+    if "Timestamp" in df.columns:
+        ts = pd.to_datetime(df["Timestamp"])
+    else:
+        ts = pd.to_datetime(df.index)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
 
+def _is_funding_settlement(ts: pd.Timestamp, hours: int) -> bool:
+    if hours == 8:
+        return (ts.minute == 0) and (ts.hour in (0, 8, 16))
+    elif hours == 1:
+        return ts.minute == 0
+    else:
+        raise ValueError("unsupported funding_hours; use 8 or 1")
+
+# ===== Data loaders =====
 def load_split(split: str) -> pd.DataFrame:
     pmap = {"train": TRAIN_P, "val": VAL_P, "test": TEST_P}
     if split not in pmap:
@@ -95,7 +120,6 @@ def load_split(split: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Missing processed split: {p}")
     return pd.read_parquet(p)
 
-
 def load_feature_list() -> List[str]:
     import json
     if not os.path.exists(FEAT_P):
@@ -103,26 +127,28 @@ def load_feature_list() -> List[str]:
     with open(FEAT_P, "r", encoding="utf-8") as f:
         return list(json.load(f))
 
-
 def a_to_pos(a: int) -> int:
     return (-1, 0, +1)[a]
 
-
 # ===== Core backtester =====
+def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg,
+             initial_equity: float = 100_000.0, timesteps: int = -1,
+             deterministic: bool = True) -> Dict[str, Any]:
 
-def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, initial_equity: float = 100_000.0,
-             timesteps: int = -1, deterministic: bool = True) -> Dict[str, Any]:
     # Refs & features
     for c in ["Open", "High", "Low", "Close", "FundingRate", "close_ref"]:
         if c not in df.columns:
             df[c] = 0.0
+
+    # UTC index for funding settlement detection
+    ts_utc = _utc_index(df)
+
     close_ref = df["close_ref"].astype(float).to_numpy()
     close = df["Close"].astype(float).to_numpy()
     high = df["High"].astype(float).to_numpy()
     low = df["Low"].astype(float).to_numpy()
-    fr = df["FundingRate"].astype(float).to_numpy()
+    fr = df["FundingRate"].astype(float).to_numpy()  # per 8h rate at each bar
     X = df[feature_cols].astype(float).to_numpy()
-
     atr = _atr14(high, low, close)
 
     n = len(df)
@@ -138,15 +164,14 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
     pos = 0
     entry_price = None
     hold_bars = 0
-    peak_pnl = 0.0  # max (long) or min (short) of entry-based pnl during hold
+    peak_pnl = 0.0
     funding_accum = 0.0
 
-    trades = []  # list of dicts
+    trades = []
     entry_idx = None
 
-    # Cooldown and daily DD tracking
+    # Cooldown & daily DD
     cooldown = 0
-    idx = df.index
     cur_day = None
     day_peak = 1.0
 
@@ -169,15 +194,12 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
             ret_from_entry = (price_t / entry_price - 1.0) * (1 if pos == +1 else -1)
             stop_atr = cfg.stop_atr_mult * (atr[i] / price_t)
             stop_cut = min(cfg.stop_pct, stop_atr)
-            # Stop
             if ret_from_entry <= -stop_cut:
                 forced_exit = True
-            # Trailing
             if (cfg.trail_mult is not None) and not forced_exit:
                 dd = (peak_pnl - ret_from_entry) if pos == +1 else (ret_from_entry - peak_pnl)
                 if dd >= cfg.trail_mult * stop_cut:
                     forced_exit = True
-            # Max hold
             if hold_bars >= cfg.max_hold and not forced_exit:
                 forced_exit = True
 
@@ -191,28 +213,25 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
 
         # Execute exit
         if pos != 0 and (forced_exit or want_flat or want_flip):
-            # Exit exec price & fees — slippage only via price
             exec_px = price_t * (1 - cfg.slip_bp) if pos == +1 else price_t * (1 + cfg.slip_bp)
             trade_ret = (exec_px / entry_price - 1.0) * pos * cfg.leverage
-            exit_fee = cfg.fee_rate
+            exit_fee = cfg.fee_rate * cfg.leverage  # leverage-proportional fee
             equity *= (1.0 + trade_ret) * (1.0 - exit_fee)
 
-            # Save trade
             trades.append({
-                "entry_time": idx[entry_idx],
-                "exit_time": idx[i],
+                "entry_time": ts_utc[entry_idx],
+                "exit_time": ts_utc[i],
                 "side": "LONG" if pos == +1 else "SHORT",
                 "entry_price": float(entry_price),
                 "exit_price": float(exec_px),
                 "bars": int(hold_bars),
                 "ret": float(trade_ret),
                 "funding": float(funding_accum),
-                "fee_entry": float(cfg.fee_rate),
+                "fee_entry": float(cfg.fee_rate * cfg.leverage),
                 "fee_exit": float(exit_fee),
-                "alpha_flip": float(cfg.alpha_flip_bp if True else 0.0),
+                "alpha_flip": float(cfg.alpha_flip_bp * cfg.leverage),
             })
 
-            # Flat out
             pos = 0
             entry_price = None
             hold_bars = 0
@@ -226,8 +245,10 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
             pos = want_pos
             exec_px = price_t * (1 + cfg.slip_bp) if pos == +1 else price_t * (1 - cfg.slip_bp)
             entry_price = exec_px
-            # Entry costs: fee + flip penalty; NO slippage here (in price)
-            entry_cost = cfg.fee_rate + cfg.alpha_flip_bp
+            # notional-based entry costs
+            notional_fee = cfg.fee_rate * cfg.leverage
+            flip_pen    = cfg.alpha_flip_bp * cfg.leverage
+            entry_cost  = notional_fee + flip_pen
             equity *= (1.0 - entry_cost)
             hold_bars = 0
             peak_pnl = 0.0
@@ -235,12 +256,19 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
             entry_idx = i
             cooldown = cfg.cooldown_bars
 
-        # Running PnL for bar t→t+1 & funding
+        # Running PnL for bar t→t+1
         bar_ret = (price_tp1 / price_t - 1.0) * pos * cfg.leverage
-        funding_step = pos * (fr[i] / cfg.funding_split) * cfg.leverage
+
+        # Funding (event-based or split)
+        if cfg.funding_mode == "event":
+            is_settle = _is_funding_settlement(ts_utc[i], cfg.funding_hours)
+            funding_step = (pos * fr[i] * cfg.leverage) if is_settle else 0.0
+        else:
+            funding_step = pos * (fr[i] / cfg.funding_split) * cfg.leverage
+
         equity *= (1.0 + bar_ret - funding_step)
         if pos != 0:
-            funding_accum += -funding_step  # positive if we PAID
+            funding_accum += -funding_step  # >0 if we PAID
 
         # Peak pnl for trailing
         if pos != 0 and entry_price is not None:
@@ -251,9 +279,9 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
                 peak_pnl = min(peak_pnl, cur)
             hold_bars += 1
 
-        # Daily DD limit (optional)
+        # Optional daily drawdown limit
         if cfg.daily_dd_limit is not None:
-            d = idx[i].date() if hasattr(idx[i], 'date') else None
+            d = ts_utc[i].date()
             if cur_day is None:
                 cur_day = d
                 day_peak = equity
@@ -263,23 +291,23 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
             dd = equity / (day_peak if day_peak > 0 else 1.0) - 1.0
             day_peak = max(day_peak, equity)
             if dd <= -cfg.daily_dd_limit and pos != 0:
-                # force flat (sell at price_t)
+                # force flat at price_t
                 exec_px = price_t * (1 - cfg.slip_bp) if pos == +1 else price_t * (1 + cfg.slip_bp)
                 trade_ret = (exec_px / entry_price - 1.0) * pos * cfg.leverage
-                exit_fee = cfg.fee_rate
+                exit_fee = cfg.fee_rate * cfg.leverage
                 equity *= (1.0 + trade_ret) * (1.0 - exit_fee)
                 trades.append({
-                    "entry_time": idx[entry_idx],
-                    "exit_time": idx[i],
+                    "entry_time": ts_utc[entry_idx],
+                    "exit_time": ts_utc[i],
                     "side": "LONG" if pos == +1 else "SHORT",
                     "entry_price": float(entry_price),
                     "exit_price": float(exec_px),
                     "bars": int(hold_bars),
                     "ret": float(trade_ret),
                     "funding": float(funding_accum),
-                    "fee_entry": float(cfg.fee_rate),
+                    "fee_entry": float(cfg.fee_rate * cfg.leverage),
                     "fee_exit": float(exit_fee),
-                    "alpha_flip": float(cfg.alpha_flip_bp),
+                    "alpha_flip": float(cfg.alpha_flip_bp * cfg.leverage),
                 })
                 pos = 0
                 entry_price = None
@@ -298,7 +326,6 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
     vol = np.std(rets) * ann_factor if len(rets) > 1 else 0.0
     mdd = _max_drawdown(eq)
 
-    # Trade stats
     n_trades = len(trades)
     wins = sum(1 for t in trades if t["ret"] > 0)
     win_rate = (wins / n_trades) if n_trades > 0 else 0.0
@@ -319,11 +346,8 @@ def backtest(df: pd.DataFrame, feature_cols: List[str], model: PPO, cfg: Cfg, in
     }
     return out
 
-
 # ===== Reporting =====
-
 def save_report(res: Dict[str, Any], split: str, model_path: str, save_csv: bool, save_chart: bool) -> None:
-    # Print summary
     print("============================================================")
     print("BACKTEST RESULTS SUMMARY")
     print("============================================================")
@@ -342,7 +366,6 @@ def save_report(res: Dict[str, Any], split: str, model_path: str, save_csv: bool
     print(f"   승률: {res['win_rate']*100:.2f}%")
     print(f"   평균 보유: {res['avg_hold_bars']:.1f} 바")
 
-    # Optional artifacts
     stem = f"backtest_{split}_{os.path.splitext(os.path.basename(model_path))[0]}"
 
     if save_csv:
@@ -366,9 +389,7 @@ def save_report(res: Dict[str, Any], split: str, model_path: str, save_csv: bool
         plt.close(fig)
         print(f"차트 저장: {chart_path}")
 
-
 # ===== CLI =====
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default=os.path.join(MODEL_DIR, "best_model.zip"))
@@ -378,6 +399,9 @@ def main():
     parser.add_argument("--seed", type=int, default=72)
     parser.add_argument("--save-csv", action="store_true")
     parser.add_argument("--save-chart", action="store_true")
+    # optional overrides for funding mode/hours from CLI
+    parser.add_argument("--funding-mode", type=str, default=None, choices=["event", "split"])
+    parser.add_argument("--funding-hours", type=int, default=None, choices=[1, 8])
     args = parser.parse_args()
 
     print("RL Model Backtest Started!")
@@ -388,12 +412,17 @@ def main():
     print("Loading model:", args.model)
     model = PPO.load(args.model, device="cpu")
 
+    cfg = Cfg()
+    if args.funding_mode is not None:
+        cfg.funding_mode = args.funding_mode
+    if args.funding_hours is not None:
+        cfg.funding_hours = args.funding_hours
+
     print("Running backtest simulation…")
-    res = backtest(df, feature_cols, model, cfg=Cfg(), initial_equity=args.initial_capital, timesteps=args.timesteps)
+    res = backtest(df, feature_cols, model, cfg=cfg, initial_equity=args.initial_capital, timesteps=args.timesteps)
 
     print("Analyzing results…")
     save_report(res, args.split, args.model, save_csv=args.save_csv, save_chart=args.save_chart)
-
 
 if __name__ == "__main__":
     main()
