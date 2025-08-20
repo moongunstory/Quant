@@ -16,25 +16,18 @@ PROC_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
 MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ===== Core Config (전액 진입/전액 청산, 예산 없음) =====
-FEE_RATE   = 0.0005     # 수수료 (교차/왕복 구조에 맞춰 조정)
-SLIP_BP    = 1.0        # 슬리피지(bp)
-TIMING_K   = 4          # 5m 기준 20분
-TIMING_K_COEF = 0.6     # 타점 보상 강화
-TURN_PENALTY  = 1.5 * FEE_RATE
-FLIP_PENALTY  = 3.0 * FEE_RATE
+# ===== Core Config =====
+FEE_RATE     = 0.0005       # 왕복 구조 맞춰 조정
+TRAIN_SLIP_BP= 0.0          # 훈련 초반 슬리피지 0 (추후 단계 주입)
+MIN_HOLD     = 6            # 최소 보유 6틱(=30분; 5m 기준)
+COOLDOWN     = 2            # 청산 후 2틱 쿨다운
+CONF_ENTER   = 0.70         # 매니저 확신 상향 임계(히스테리시스)
+CONF_EXIT    = 0.50         # 매니저 확신 하향 임계
 
-# Manager 보상 가중치
+# Manager 보상 가중치(단순화 버전)
 M_W1 = 1.0
 M_W3 = 0.5
 M_FLIP = 0.2
-M_MIS  = 0.2
-
-# Worker 탐색/게이트 워밍업
-GATE_WARMUP_STEPS = 20_000
-ALIGN_EPS         = 0.08
-OPPORTUNITY_COST  = 0.50 * FEE_RATE
-GATE_SOFT_PENALTY_MULT = 1.0   # ← 15m 게이트 불일치 시, fee_rate의 배수만큼 패널티
 
 # ===== Utils =====
 def _path_fe(split: str, tf: str) -> str:
@@ -55,12 +48,6 @@ def _feat_list(tf: str) -> List[str]:
     p = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
-
-def _zscore(s: pd.Series, win: int = 100) -> pd.Series:
-    mu = s.rolling(win, min_periods=win).mean()
-    sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
-    z = (s - mu) / sd
-    return z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
 def _heikin_ashi_ohlc(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     O = df["Open"].astype(float).to_numpy()
@@ -100,28 +87,17 @@ def build_worker_inputs(split: str):
 
     X = pd.concat([f5, f15, f1h, f4h, fb], axis=1).replace([np.inf,-np.inf],0.0).fillna(0.0)
 
-    # OHLC for rewards & gates
+    # OHLC (보상·신호용)
     ohlc5  = df5[["Open","High","Low","Close"]]
-    ohlc15 = df15[["Open","High","Low","Close"]].reindex(df5.index, method="ffill")
     ohlc4h = df4h[["Open","High","Low","Close"]].reindex(df5.index, method="ffill")
 
-    # 15m gate (HA_BC sign)
-    ha_c_15, ha_o_15 = _heikin_ashi_ohlc(ohlc15)
-    gate15_sign = np.sign(ha_c_15 - ha_o_15).astype(int)
-
-    # 4h regime (완화된 약레짐 기준)
+    # 4h 방향 참고(간단 rule): Heikin-Ashi
     ha_c_4h, ha_o_4h = _heikin_ashi_ohlc(ohlc4h)
-    bc4h  = ha_c_4h - ha_o_4h
-    atr4h = _atr(ohlc4h)
-    weak4h = (bc4h.abs() < (bc4h.abs().rolling(200, min_periods=50).median()*0.15).fillna(np.inf)) \
-             & (_zscore(atr4h, 200) < -0.8)
-    reg4h_sign = np.sign(bc4h).astype(int)
+    reg4h_sign = np.sign(ha_c_4h - ha_o_4h).astype(int)
 
     return dict(
         X=X,
         price=ohlc5["Close"].astype(float),
-        gate15_sign=gate15_sign.reindex(df5.index).fillna(0),
-        reg4h_weak=weak4h.reindex(df5.index).fillna(True),
         reg4h_sign=reg4h_sign.reindex(df5.index).fillna(0)
     )
 
@@ -136,16 +112,11 @@ def build_manager_inputs(split: str):
 
     ohlc4h = df4h[["Open","High","Low","Close"]]
     ha_c_4h, ha_o_4h = _heikin_ashi_ohlc(ohlc4h)
-    bc4h  = ha_c_4h - ha_o_4h
-    atr4h = _atr(ohlc4h)
-    weak4h = (bc4h.abs() < (bc4h.abs().rolling(200, min_periods=50).median()*0.15).fillna(np.inf)) \
-             & (_zscore(atr4h, 200) < -0.8)
-    reg4h_sign = np.sign(bc4h).astype(int)
+    reg4h_sign = np.sign(ha_c_4h - ha_o_4h).astype(int)
 
     return dict(
         XH=XH,
         price=df1h["Close"].astype(float),
-        reg4h_weak=weak4h.reindex(XH.index, method="ffill").fillna(True),
         reg4h_sign=reg4h_sign.reindex(XH.index, method="ffill").fillna(0)
     )
 
@@ -163,47 +134,73 @@ class GoalBridge:
     def vec(self) -> np.ndarray:
         return np.array([self.cur.dir, self.cur.conf], dtype=np.float32)
 
-# ===== Worker Env (5m) =====
+# ===== Worker Env (5m) — 거래단위 보상 & Flip 금지 =====
 class WorkerEnv(gym.Env):
     """
-    Obs: [X_5m+15m+1h+4h+btc1h (scaled), goal_dir, goal_conf]
-    Act: 0 Hold, 1 Long, 2 Short, 3 Flat
-    Mask: dir=+1 → {Hold,Long,Flat}, dir=-1 → {Hold,Short,Flat}, dir=0 → {Hold,Flat}
-    Gate: (소프트) 15m 방향 불일치면 패널티만 부여, 차단하지 않음
+    Obs: [X_5m.. + goal_dir, goal_conf]
+    Act: 0 Hold, 1 EnterLong, 2 EnterShort, 3 Exit
+    Rules:
+      - pos==0: {Hold, Enter}만. (매니저 마스크: conf<enter면 Enter 금지, dir에 반하는 Enter 금지)
+      - pos!=0: {Hold, Exit}만. (Flip 금지)
+      - min_hold, cooldown 적용
+    Reward:
+      - Entry: 보상 0 (수수료는 나중에 정산용으로 기록)
+      - Hold:  보상 0
+      - Exit:  (exit/entry - 1)*sign - (entry_fee + exit_fee)  → 그 순간 1회 지급
     """
     metadata = {"render_modes": []}
 
     def __init__(self, split: str, gb: GoalBridge,
-                 fee_rate=FEE_RATE, slip_bp=SLIP_BP):
+                 fee_rate=FEE_RATE, slip_bp=TRAIN_SLIP_BP,
+                 min_hold=MIN_HOLD, cooldown=COOLDOWN,
+                 conf_enter=CONF_ENTER, conf_exit=CONF_EXIT):
         super().__init__()
         self.gb = gb
         data = build_worker_inputs(split)
         self.X = data["X"]; self.price = data["price"]
-        self.gate15 = data["gate15_sign"].astype(int)
-        self.regweak = data["reg4h_weak"].astype(bool)
         self.regsign = data["reg4h_sign"].astype(int)
 
         self.idx = self.X.index
         self.t = 0
-        self.pos = 0  # -1,0,1
-        self.fee_rate = fee_rate
-        self.slip_bp = slip_bp
 
-        # exploration helpers
-        self.total_steps = 0
-        self.gate_warmup_steps = GATE_WARMUP_STEPS
-        self.align_eps = ALIGN_EPS
-        self.opp_cost = OPPORTUNITY_COST
+        # trading state
+        self.pos = 0               # -1,0,1
+        self.entry_px = None
+        self.entry_fee = 0.0
+        self.hold_ticks = 0
+        self.cooldown = 0
+
+        # params
+        self.fee_rate = float(fee_rate)
+        self.slip_bp = float(slip_bp)
+        self.min_hold = int(min_hold)
+        self.cooldown_reset = int(cooldown)
+        self.conf_enter = float(conf_enter)
+        self.conf_exit  = float(conf_exit)
 
         self.observation_space = spaces.Box(low=-10, high=10,
                                             shape=(self.X.shape[1] + 2,),
                                             dtype=np.float32)
         self.action_space = spaces.Discrete(4)
 
-    def _mask(self, d: int) -> np.ndarray:
-        if d > 0: return np.array([1,1,0,1], dtype=np.int8)
-        if d < 0: return np.array([1,0,1,1], dtype=np.int8)
-        return np.array([1,0,0,1], dtype=np.int8)
+    # 합법 액션 마스크 생성
+    def _legal_mask(self, dir_: int, conf: float) -> np.ndarray:
+        m = np.zeros(4, dtype=np.int8)
+        if self.pos == 0:
+            if self.cooldown > 0 or conf < self.conf_enter or dir_ == 0:
+                # 관망만 허용
+                m[0] = 1
+            else:
+                m[0] = 1
+                if dir_ > 0: m[1] = 1  # EnterLong
+                if dir_ < 0: m[2] = 1  # EnterShort
+        else:
+            # 보유 중: Exit만 (Flip 금지)
+            if self.hold_ticks >= self.min_hold:
+                m[0] = 1; m[3] = 1
+            else:
+                m[0] = 1
+        return m
 
     def _obs(self) -> np.ndarray:
         x = self.X.iloc[self.t].to_numpy(dtype=np.float32, copy=False)
@@ -212,84 +209,94 @@ class WorkerEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.t = 0; self.pos = 0
+        self.t = 0
+        self.pos = 0
+        self.entry_px = None
+        self.entry_fee = 0.0
+        self.hold_ticks = 0
+        self.cooldown = 0
         return self._obs(), {}
 
     def step(self, a: int):
         px = float(self.price.iloc[self.t])
-
         dir_, conf = int(self.gb.vec()[0]), float(self.gb.vec()[1])
-        mask = self._mask(dir_)
-        pen = 0.0
-        if mask[a] == 0:
-            a = 0; pen -= 0.01
 
-        gate_active = (self.total_steps >= self.gate_warmup_steps)
+        # 히스테리시스: conf 낮아지면 dir=0처럼 행동(Enter 금지)
+        if conf < self.conf_exit:
+            dir_eff = 0
+        else:
+            dir_eff = dir_
 
-        # 15m gate: 워밍업 이후엔 불일치에 '패널티'만 부여(하드 차단 금지)
-        wants_entry = (a in (1, 2)) and (self.pos == 0)
-        if gate_active and wants_entry:
-            gsig = int(self.gate15.iloc[self.t])
-            mismatch = (dir_ > 0 and gsig <= 0) or (dir_ < 0 and gsig >= 0)
-            if mismatch:
-                pen -= GATE_SOFT_PENALTY_MULT * self.fee_rate  # ← 소프트 패널티만
+        legal = self._legal_mask(dir_eff, conf)
+        if legal[a] == 0:
+            a = 0  # 불법 액션은 Hold로 대체 (패널티 없음)
 
-        target = {0: self.pos, 1: 1, 2: -1, 3: 0}[a]
-        changed = int(target != self.pos)
-        flip = int(abs(target - self.pos) == 2)
+        r = 0.0
 
-        fee = self.fee_rate * abs(target - self.pos) * px if changed else 0.0
-        signed = 0 if a in (0, 3) else (1 if a == 1 else -1)
-        exec_px = px * (1 + signed * self.slip_bp * 1e-4) if changed else px
+        # === 상태 전이 ===
+        if self.pos == 0:
+            # Enter?
+            if a == 1 or a == 2:
+                signed = 1 if a == 1 else -1
+                exec_px = px * (1 + signed * self.slip_bp * 1e-4)
+                self.pos = signed
+                self.entry_px = exec_px
+                self.entry_fee = self.fee_rate * px
+                self.hold_ticks = 0
+                # 보상은 0 (정산은 청산 시)
+        else:
+            # Hold / Exit?
+            if a == 3 and self.hold_ticks >= self.min_hold:
+                # Exit 실행
+                exec_px = px * (1 - self.pos * self.slip_bp * 1e-4)
+                pnl = (exec_px - self.entry_px) / self.entry_px * self.pos
+                exit_fee = self.fee_rate * px
+                r = pnl - (self.entry_fee + exit_fee)
 
-        nxt_px = float(self.price.iloc[min(self.t + 1, len(self.price) - 1)])
-        pnl = (nxt_px - exec_px) / exec_px * self.pos
+                # reset
+                self.pos = 0
+                self.entry_px = None
+                self.entry_fee = 0.0
+                self.hold_ticks = 0
+                self.cooldown = self.cooldown_reset
+            else:
+                # 보유 지속
+                self.hold_ticks += 1
 
-        # 타이밍 품질
-        k_idx = min(self.t + TIMING_K, len(self.price) - 1)
-        fut_px = float(self.price.iloc[k_idx])
-        dret = (fut_px - px) / px
-        timing = (dret if a == 1 else -dret) if a in (1, 2) else 0.0
+        # 쿨다운 감소
+        if self.cooldown > 0 and self.pos == 0:
+            self.cooldown -= 1
 
-        # reward 구성
-        r = pnl - fee + TIMING_K_COEF * timing \
-            - TURN_PENALTY * changed - FLIP_PENALTY * flip + pen
-
-        # ① 소프트 방향 정렬(포지션 유무 관계없이 약하게)
-        align = self.align_eps * dir_ * ((nxt_px - px) / px)
-        r += align
-
-        # ② 기회비용: 게이트 통과+방향 있는데 Hold 선택
-        if gate_active and dir_ != 0 and a == 0 and self.t > 0:
-            gsig_prev = int(self.gate15.iloc[self.t - 1])
-            if (dir_ > 0 and gsig_prev > 0) or (dir_ < 0 and gsig_prev < 0):
-                r -= self.opp_cost
-
-        # ③ entry bonus: 방향 일치 신규 진입에 소액 보상
-        if a in (1, 2) and self.pos == 0:
-            if (a == 1 and dir_ > 0) or (a == 2 and dir_ < 0):
-                entry_bonus = 0.002 + 0.5 * abs(dret)
-                r += entry_bonus
-
-        # transition
-        self.pos = target
+        # time step
         self.t += 1
-        self.total_steps += 1
-        terminated = (self.t >= len(self.X) - 2)
+        terminated = (self.t >= len(self.X) - 1)
+
+        # 에피소드 강제 청산(마지막 스텝)
+        if terminated and self.pos != 0:
+            exec_px = px  # 마지막 가격으로 청산
+            pnl = (exec_px - self.entry_px) / self.entry_px * self.pos
+            exit_fee = self.fee_rate * px
+            r += pnl - (self.entry_fee + exit_fee)
+            # reset
+            self.pos = 0
+            self.entry_px = None
+            self.entry_fee = 0.0
+            self.hold_ticks = 0
+            self.cooldown = 0
+
         info = {
-            "fee": fee, "mask": mask, "dir": dir_,
-            "gate15": int(self.gate15.iloc[self.t - 1]),
-            "trade": int(changed), "flip": int(flip)
+            "dir": dir_eff, "conf": conf, "legal": legal,
+            "pos": self.pos, "cooldown": self.cooldown, "hold": self.hold_ticks
         }
         return self._obs(), float(r), terminated, False, info
 
-# ===== Manager Env (1h) =====
+# ===== Manager Env (1h) — 단순 방향 학습 =====
 class ManagerEnv(gym.Env):
     """
     Obs: [X_1h + 4h(ffill) scaled]
     Act: MultiDiscrete([3, 11])  → dir ∈ {-1,0,1}, conf ∈ {0..10}/10
-    Rule: 4h 레짐 weak면 dir은 강제로 0 (거래 금지), 해당 시도는 소액 패널티
-    Reward: 방향 정확도(1h,3h) - flip 패널티 - 4h 상충 패널티
+    Reward: w1*dir*r_1h + w3*dir*r_3h - flip_penalty
+    (레짐 미스매치/weak 필터는 초기 학습에서는 사용하지 않음)
     """
     metadata = {"render_modes": []}
 
@@ -298,8 +305,6 @@ class ManagerEnv(gym.Env):
         data = build_manager_inputs(split)
         self.XH = data["XH"]
         self.price = data["price"]
-        self.regweak = data["reg4h_weak"].astype(bool)
-        self.regsign = data["reg4h_sign"].astype(int)
         self.idx = self.XH.index
         self.t = 0
         self.gb = gb
@@ -323,12 +328,8 @@ class ManagerEnv(gym.Env):
         dir_raw = [-1, 0, 1][int(a[0])]
         conf = float(int(a[1]) / 10.0)
 
-        weak = bool(self.regweak.iloc[self.t])
-        tried_nonflat = (dir_raw != 0)
-        dir_eff = 0 if weak else dir_raw
-        pen = -0.02 if (weak and tried_nonflat) else 0.0
-
-        self.gb.set(Goal(dir_eff, conf))
+        # goal set
+        self.gb.set(Goal(dir_raw, conf))
 
         cur = float(self.price.iloc[self.t])
         nxt1 = float(self.price.iloc[min(self.t + 1, len(self.price) - 1)])
@@ -336,18 +337,17 @@ class ManagerEnv(gym.Env):
         r1 = (nxt1 - cur) / cur
         r3 = (nxt3 - cur) / cur
 
-        R_dir  = M_W1 * dir_eff * r1 + M_W3 * dir_eff * r3
-        R_flip = -M_FLIP * int(dir_eff != self.prev_dir)
-        R_mis  = -M_MIS  * int(np.sign(dir_eff) != int(self.regsign.iloc[self.t]) and dir_eff != 0)
-        R = R_dir + R_flip + R_mis + pen
+        R_dir  = M_W1 * dir_raw * r1 + M_W3 * dir_raw * r3
+        R_flip = -M_FLIP * int(dir_raw != self.prev_dir and dir_raw != 0)
+        R = R_dir + R_flip
 
-        self.prev_dir = dir_eff
+        self.prev_dir = dir_raw if dir_raw != 0 else self.prev_dir
         self.t += 1
         terminated = (self.t >= len(self.XH) - 2)
-        info = {"weak4h": weak, "reg4h": int(self.regsign.iloc[self.t - 1]), "dir": dir_eff}
+        info = {"dir": dir_raw, "conf": conf}
         return self._obs(), float(R), terminated, False, info
 
-# ===== Entropy Decay Callback (탐색 → 수렴) =====
+# ===== Entropy Decay (탐색 → 수렴) =====
 class EntropyDecay(BaseCallback):
     def __init__(self, start=0.10, end=0.03, decay_steps=600_000, verbose=0):
         super().__init__(verbose)
@@ -360,91 +360,139 @@ class EntropyDecay(BaseCallback):
         self.model.ent_coef = float(self.start + (self.end - self.start) * frac)
         return True
 
+# ===== Manager Runner (inference for guided worker) =====
+class _ManagerRunner:
+    def __init__(self, split: str, manager_ckpt: str, conf_enter=CONF_ENTER, conf_exit=CONF_EXIT):
+        self.m = build_manager_inputs(split)
+        self.idx = self.m["XH"].index
+        self.k = 0
+        self.prev_dir = 0
+        self.conf_enter = conf_enter
+        self.conf_exit = conf_exit
+        # Load PPO manager (obs normalization 안 씀)
+        self.model = PPO.load(manager_ckpt, device="cpu")
+
+    def _obs_at_k(self) -> np.ndarray:
+        return self.m["XH"].iloc[self.k].to_numpy(dtype=np.float32, copy=False)
+
+    def tick(self, ts_5m) -> Goal:
+        th = pd.Timestamp(ts_5m).floor("1h")
+        while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
+            self.k += 1
+        obs = self._obs_at_k()
+        act, _ = self.model.predict(obs, deterministic=True)
+        dir_raw = [-1, 0, 1][int(act[0])]
+        conf = float(int(act[1]) / 10.0)
+
+        # 히스테리시스
+        if conf >= self.conf_enter:
+            dir_eff = dir_raw
+        elif conf <= self.conf_exit:
+            dir_eff = 0
+        else:
+            dir_eff = self.prev_dir
+
+        self.prev_dir = dir_eff
+        return Goal(dir_eff, conf)
+
 # ===== Training Orchestration =====
-def train_worker(split: str = "train", steps: int = 1_000_000, seed: int = 42, save_path: str | None = None):
-    """
-    Worker 예열: 휴리스틱 Manager goal 주입.
-    ★ 약레짐 무시: 4h 약레짐도 방향(부호)만 따라가게 하여 초기 탐색 확보.
-    """
-    class _HeuristicGB(GoalBridge):
-        def __init__(self, split):
-            super().__init__()
-            self.m = build_manager_inputs(split)
-            self.idx = self.m["XH"].index
-            self.k = 0
-        def tick(self, ts_5m):
-            th = pd.Timestamp(ts_5m).floor("1h")
-            while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
-                self.k += 1
-            reg = int(self.m["reg4h_sign"].iloc[self.k])  # ★ 약레짐 무시
-            self.set(Goal(reg, 0.5))
-
-    gb = _HeuristicGB(split)
-    class _Harness(WorkerEnv):
-        def step(self, a: int):
-            gb.tick(self.idx[self.t])
-            return super().step(a)
-
-    # VecNormalize: 보상만 정규화 (가치함수 안정화)
-    env = DummyVecEnv([lambda: _Harness(split=split, gb=gb)])
+def train_manager(split: str = "train", steps: int = 800_000, seed: int = 42,
+                  save_path: str | None = None):
+    gb = GoalBridge()
+    env = DummyVecEnv([lambda: ManagerEnv(split=split, gb=gb)])
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     model = PPO(
         "MlpPolicy", env,
-        n_steps=2048,
-        batch_size=1024,
-        device="cpu",
-        learning_rate=3e-4, gamma=0.99,
-        ent_coef=0.10, clip_range=0.2, gae_lambda=0.95,
-        vf_coef=1.2,            # ← 가치망 비중 강화
+        n_steps=256, batch_size=256, device="cpu",
+        learning_rate=1e-4, gamma=0.95,
+        ent_coef=0.005, clip_range=0.2, gae_lambda=0.95,
+        vf_coef=1.2, clip_range_vf=0.2,
         seed=seed, verbose=1
     )
-    model.learn(total_timesteps=steps, callback=EntropyDecay())
+    model.learn(total_timesteps=steps)
+    sp = save_path or os.path.join(MODEL_DIR, "manager_stage1.zip")
+    model.save(sp)
+    env.save(os.path.join(MODEL_DIR, "manager_stage1_vecnorm.pkl"))
+    return sp
+
+def train_worker_guided(split: str = "train",
+                        manager_ckpt: str | None = None,
+                        steps: int = 1_000_000, seed: int = 42,
+                        save_path: str | None = None,
+                        min_hold: int = MIN_HOLD, cooldown: int = COOLDOWN,
+                        conf_enter: float = CONF_ENTER, conf_exit: float = CONF_EXIT,
+                        slip_bp: float = TRAIN_SLIP_BP):
+    """
+    매니저 모델이 내는 (dir, conf)로 워커를 가이드하여 학습.
+    - Enter는 conf>=conf_enter & dir!=0 일 때만 허용
+    - Exit는 min_hold 이후 허용
+    - Flip 금지, cooldown 적용
+    - 보상은 청산 시 1회
+    """
+    assert manager_ckpt and os.path.exists(manager_ckpt), f"manager ckpt not found: {manager_ckpt}"
+
+    class _GuidedGB(GoalBridge):
+        def __init__(self, runner: _ManagerRunner, idx5):
+            super().__init__()
+            self.runner = runner
+            self.idx5 = idx5
+            self.i = 0
+        def tick(self, t):
+            ts = self.idx5[t]
+            g = self.runner.tick(ts)
+            self.set(g)
+
+    # Harness: 매 step마다 매니저 예측으로 goal 갱신
+    mr = _ManagerRunner(split, manager_ckpt, conf_enter, conf_exit)
+    class _Harness(WorkerEnv):
+        def __init__(self, split, gb):
+            super().__init__(split=split, gb=gb,
+                             min_hold=min_hold, cooldown=cooldown,
+                             conf_enter=conf_enter, conf_exit=conf_exit,
+                             slip_bp=slip_bp)
+        def step(self, a: int):
+            gb.tick(self.t)
+            return super().step(a)
+
+    # VecNormalize: 보상만 정규화 (가치함수 안정화)
+    # obs는 이미 스케일된 피처라고 가정
+    gb = _GuidedGB(mr, build_worker_inputs(split)["X"].index)
+    env = DummyVecEnv([lambda: _Harness(split=split, gb=gb)])
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=5.0)
+
+    model = PPO(
+        "MlpPolicy", env,
+        n_steps=8192, batch_size=2048, device="cpu",
+        learning_rate=3e-4, gamma=0.99,
+        ent_coef=0.05, clip_range=0.2, gae_lambda=0.95,
+        vf_coef=1.2, clip_range_vf=0.2,
+        seed=seed, verbose=1
+    )
+    # 간단한 엔트로피 선형 감소
+    model.learn(total_timesteps=steps, callback=EntropyDecay(start=0.05, end=0.01, decay_steps=steps))
 
     sp = save_path or os.path.join(MODEL_DIR, "worker_stage1.zip")
     model.save(sp)
     env.save(os.path.join(MODEL_DIR, "worker_stage1_vecnorm.pkl"))
     return sp
 
-def train_manager(split: str = "train", steps: int = 800_000, seed: int = 42, save_path: str | None = None):
-    gb = GoalBridge()
-
-    # VecNormalize: 보상만 정규화
-    env = DummyVecEnv([lambda: ManagerEnv(split=split, gb=gb)])
-    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
-
-    model = PPO(
-        "MlpPolicy", env,
-        n_steps=256,
-        batch_size=256,
-        device="cpu",
-        learning_rate=1e-4, gamma=0.95,
-        ent_coef=0.005, clip_range=0.2, gae_lambda=0.95,
-        vf_coef=1.2,            # ← 가치망 비중 강화
-        seed=seed, verbose=1
-    )
-    model.learn(total_timesteps=steps)
-
-    sp = save_path or os.path.join(MODEL_DIR, "manager_stage1.zip")
-    model.save(sp)
-    env.save(os.path.join(MODEL_DIR, "manager_stage1_vecnorm.pkl"))
-    return sp
-
-# ===== Simple runners (no CLI) =====
-def run_worker():
-    print("[HRL] Training Worker…")
-    wp = train_worker()
-    print(f"[OK] Worker saved → {wp}")
-
+# ===== Simple runners =====
 def run_manager():
-    print("[HRL] Training Manager…")
+    print("[HRL] Training Manager first…")
     mp = train_manager()
     print(f"[OK] Manager saved → {mp}")
 
+def run_worker_guided_with(mp: str):
+    print("[HRL] Training Worker (guided by Manager)…")
+    wp = train_worker_guided(manager_ckpt=mp)
+    print(f"[OK] Worker saved → {wp}")
+
 def run_all():
-    run_worker()
-    run_manager()
+    print("[HRL] Manager → Worker(guided)")
+    mp = train_manager()
+    run_worker_guided_with(mp)
 
 if __name__ == "__main__":
-    # 기본 실행: 워커 → 매니저 순으로 학습
+    # 기본 실행: 매니저 먼저 → 워커(가이드) 순서
     run_all()
