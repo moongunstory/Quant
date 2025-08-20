@@ -7,8 +7,10 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 # ===== Paths =====
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+# processed는 ai_binance/data/processed (원본 그대로)
 PROC_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "data", "processed"))
-MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
+# ★ FIX: model도 ai_binance/data/model로 통일 (기존 train/data/model → 불일치)
+MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "data", "model"))
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ===== Core Config (전액 진입/전액 청산) =====
