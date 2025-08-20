@@ -17,17 +17,21 @@ MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "model"))
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ===== Core Config =====
-FEE_RATE     = 0.0005       # 왕복 구조 맞춰 조정
-TRAIN_SLIP_BP= 0.0          # 훈련 초반 슬리피지 0 (추후 단계 주입)
-MIN_HOLD     = 6            # 최소 보유 6틱(=30분; 5m 기준)
-COOLDOWN     = 2            # 청산 후 2틱 쿨다운
-CONF_ENTER   = 0.70         # 매니저 확신 상향 임계(히스테리시스)
-CONF_EXIT    = 0.50         # 매니저 확신 하향 임계
+FEE_RATE      = 0.0005       # 왕복 구조 맞춰 조정
+TRAIN_SLIP_BP = 0.0          # 훈련 초반 슬리피지 0 (추후 단계 주입)
+MIN_HOLD      = 6            # 최소 보유 6틱(=30분; 5m 기준)
+COOLDOWN      = 2            # 청산 후 2틱 쿨다운
+CONF_ENTER    = 0.70         # 매니저 확신 상향 임계(히스테리시스)
+CONF_EXIT     = 0.50         # 매니저 확신 하향 임계
 
 # Manager 보상 가중치(단순화 버전)
 M_W1 = 1.0
 M_W3 = 0.5
 M_FLIP = 0.2
+
+# ==== 관망 유도/억제 미세 보상 ====
+M_IDLE   = 5e-5   # dir=0(관망)일 때 아주 작은 세금
+M_COMMIT = 1e-4   # |dir|=1(방향 선택) 시 작은 보너스
 
 # ===== Utils =====
 def _path_fe(split: str, tf: str) -> str:
@@ -188,8 +192,7 @@ class WorkerEnv(gym.Env):
         m = np.zeros(4, dtype=np.int8)
         if self.pos == 0:
             if self.cooldown > 0 or conf < self.conf_enter or dir_ == 0:
-                # 관망만 허용
-                m[0] = 1
+                m[0] = 1  # Hold만
             else:
                 m[0] = 1
                 if dir_ > 0: m[1] = 1  # EnterLong
@@ -290,12 +293,12 @@ class WorkerEnv(gym.Env):
         }
         return self._obs(), float(r), terminated, False, info
 
-# ===== Manager Env (1h) — 단순 방향 학습 =====
+# ===== Manager Env (1h) — 단순 방향 학습 + 관망세 억제 =====
 class ManagerEnv(gym.Env):
     """
     Obs: [X_1h + 4h(ffill) scaled]
     Act: MultiDiscrete([3, 11])  → dir ∈ {-1,0,1}, conf ∈ {0..10}/10
-    Reward: w1*dir*r_1h + w3*dir*r_3h - flip_penalty
+    Reward: w1*dir*r_1h + w3*dir*r_3h - flip_penalty + (idle/commit micro)
     (레짐 미스매치/weak 필터는 초기 학습에서는 사용하지 않음)
     """
     metadata = {"render_modes": []}
@@ -339,7 +342,12 @@ class ManagerEnv(gym.Env):
 
         R_dir  = M_W1 * dir_raw * r1 + M_W3 * dir_raw * r3
         R_flip = -M_FLIP * int(dir_raw != self.prev_dir and dir_raw != 0)
-        R = R_dir + R_flip
+
+        # 관망 세금 & 방향 커밋 보너스
+        R_idle   = -M_IDLE if dir_raw == 0 else 0.0
+        R_commit =  M_COMMIT if dir_raw != 0 else 0.0
+
+        R = R_dir + R_flip + R_idle + R_commit
 
         self.prev_dir = dir_raw if dir_raw != 0 else self.prev_dir
         self.t += 1
@@ -369,7 +377,7 @@ class _ManagerRunner:
         self.prev_dir = 0
         self.conf_enter = conf_enter
         self.conf_exit = conf_exit
-        # Load PPO manager (obs normalization 안 씀)
+        # Load PPO manager (obs normalization 안 씀: norm_obs=False로 학습)
         self.model = PPO.load(manager_ckpt, device="cpu")
 
     def _obs_at_k(self) -> np.ndarray:
@@ -400,17 +408,22 @@ def train_manager(split: str = "train", steps: int = 800_000, seed: int = 42,
                   save_path: str | None = None):
     gb = GoalBridge()
     env = DummyVecEnv([lambda: ManagerEnv(split=split, gb=gb)])
-    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    # 보상 클리핑 강화: 1.0
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=1.0)
 
     model = PPO(
         "MlpPolicy", env,
         n_steps=256, batch_size=256, device="cpu",
-        learning_rate=1e-4, gamma=0.95,
-        ent_coef=0.005, clip_range=0.2, gae_lambda=0.95,
+        learning_rate=3e-4,      # 1e-4 → 3e-4
+        gamma=0.95,
+        ent_coef=0.03,           # 0.005 → 0.03 (초반 탐색 강화)
+        clip_range=0.2, gae_lambda=0.95,
         vf_coef=1.2, clip_range_vf=0.2,
         seed=seed, verbose=1
     )
-    model.learn(total_timesteps=steps)
+    # 엔트로피 선형 감소: 0.03 → 0.005
+    model.learn(total_timesteps=steps, callback=EntropyDecay(start=0.03, end=0.005, decay_steps=steps))
+
     sp = save_path or os.path.join(MODEL_DIR, "manager_stage1.zip")
     model.save(sp)
     env.save(os.path.join(MODEL_DIR, "manager_stage1_vecnorm.pkl"))
@@ -437,7 +450,6 @@ def train_worker_guided(split: str = "train",
             super().__init__()
             self.runner = runner
             self.idx5 = idx5
-            self.i = 0
         def tick(self, t):
             ts = self.idx5[t]
             g = self.runner.tick(ts)
@@ -456,7 +468,6 @@ def train_worker_guided(split: str = "train",
             return super().step(a)
 
     # VecNormalize: 보상만 정규화 (가치함수 안정화)
-    # obs는 이미 스케일된 피처라고 가정
     gb = _GuidedGB(mr, build_worker_inputs(split)["X"].index)
     env = DummyVecEnv([lambda: _Harness(split=split, gb=gb)])
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=5.0)
@@ -469,7 +480,6 @@ def train_worker_guided(split: str = "train",
         vf_coef=1.2, clip_range_vf=0.2,
         seed=seed, verbose=1
     )
-    # 간단한 엔트로피 선형 감소
     model.learn(total_timesteps=steps, callback=EntropyDecay(start=0.05, end=0.01, decay_steps=steps))
 
     sp = save_path or os.path.join(MODEL_DIR, "worker_stage1.zip")
