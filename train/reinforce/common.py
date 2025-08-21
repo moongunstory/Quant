@@ -19,10 +19,11 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # ===== Core Config (전액 진입/전액 청산) =====
 FEE_RATE   = 0.0005
 SLIP_BP    = 1.0
-TIMING_K   = 4                # 5m 기준 20분
+TIMING_K   = 24               # 5m 기준 2시간 (매니저 보상 시간단위 근사)
 TIMING_K_COEF = 1.0           # 타점 shaping 강화
 TURN_PENALTY  = 1.5 * FEE_RATE
 FLIP_PENALTY  = 3.0 * FEE_RATE
+HOLDING_BONUS = 0.1 * FEE_RATE # 매니저 방향과 일치하는 포지션 유지 시 보너스
 
 # Manager 보상 가중치
 M_W1 = 1.0
