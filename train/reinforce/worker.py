@@ -71,7 +71,7 @@ class WorkerEnv(gym.Env):
         self.eps_decay = 200_000  # 선형 감소 스텝
         self.warm_fee_frac = 0.30 # 웜업 동안 수수료/슬립 완화 비율
         self.warm_steps = 150_000
-        self.inaction_tol = 12    # 게이트/매니저 OK인데 진입 안 하면 페널티 주기까지 허용 step
+        self.inaction_tol = 12    # 게이트/매니저 OK인데 진입 안 하면 벌점 주기까지 허용 step
         self.inaction_cnt = 0
 
         # spaces
@@ -203,19 +203,33 @@ class WorkerEnv(gym.Env):
         return self._obs(), float(r), terminated, False, info
 
 
-# ===== Heuristic GoalBridge (워커 예열; 1h를 4h 레짐과 단순화) =====
+# ===== Heuristic GoalBridge (워커 예열; 4h 트렌드 강도로 conf 스케일) =====
 class _HeuristicGB(GoalBridge):
     def __init__(self, split):
         super().__init__()
         self.m = build_manager_inputs(split)
         self.idx = self.m["XH"].index
         self.k = 0
+
     def tick(self, ts_5m):
         th = pd.Timestamp(ts_5m).floor("1h")
         while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
             self.k += 1
+
         reg = int(self.m["reg4h_sign"].iloc[self.k])
-        self.set(Goal(reg, 0.5))
+        # trend_conf(0~1) 없으면 0.5로 폴백
+        try:
+            conf = float(self.m["trend_conf"].iloc[self.k])
+        except KeyError:
+            conf = 0.5
+
+        # 약레짐이면 과신 방지 cap, 무추세(reg=0)면 conf=0
+        if bool(self.m["reg4h_weak"].iloc[self.k]):
+            conf = min(conf, 0.35)
+        if reg == 0:
+            conf = 0.0
+
+        self.set(Goal(reg, conf))
 
 
 # ===== Model GoalBridge (교대 학습 시 매니저 추론 주입) =====
@@ -226,14 +240,16 @@ class _ModelGB(GoalBridge):
         self.idx = self.m["XH"].index
         self.k = 0
         self.model = manager_model
+
     def tick(self, ts_5m):
         th = pd.Timestamp(ts_5m).floor("1h")
         while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
             self.k += 1
         obs = self.m["XH"].iloc[self.k].to_numpy(np.float32, copy=False)
         act = self.model.predict(obs, deterministic=True)[0]
-        dir_eff = [-1, 0, 1][int(np.array(act).reshape(-1)[0])]
-        conf = float(int(np.array(act).reshape(-1)[1]) / 10.0) if len(np.array(act).reshape(-1)) > 1 else 0.5
+        flat = np.array(act).reshape(-1)
+        dir_eff = [-1, 0, 1][int(flat[0])]
+        conf = float(int(flat[1]) / 10.0) if len(flat) > 1 else 0.5
         self.set(Goal(dir_eff, conf))
 
 
@@ -257,13 +273,22 @@ def _eval_worker(make_env_fn: Callable[[], WorkerEnv],
     hit20_cnt = 0
     entry_cnt = 0
     R_sum = 0.0
+    conf_acc = 0.0
+    conf_n = 0
 
     # reward breakdown sums
     rb_keys = ["r_pnl","r_fee","r_turn","r_flip","r_gate","r_timing","r_align","r_opp","r_entry","r_inaction","r_mask"]
     rb_sum: Dict[str, float] = {k: 0.0 for k in rb_keys}
 
-    prev_pos = 0
     while steps_done < steps:
+        # 현재 conf 기록(평균용)
+        try:
+            cur_conf = float(env.gb.vec()[1])
+            conf_acc += cur_conf
+            conf_n += 1
+        except Exception:
+            pass
+
         # predict action robustly
         a_raw = model.predict(obs, deterministic=deterministic)[0]
         a = int(np.array(a_raw).reshape(-1)[0])
@@ -317,21 +342,20 @@ def _eval_worker(make_env_fn: Callable[[], WorkerEnv],
     hit5  = (hit5_cnt  / max(1, entry_cnt)) if entry_cnt > 0 else 0.0
     hit20 = (hit20_cnt / max(1, entry_cnt)) if entry_cnt > 0 else 0.0
     avgR  = R_sum / max(1, steps_done)
+    conf_mean = conf_acc / max(1, conf_n)
 
-    # policy entropy proxy: 직접 접근 어려우니 행동 분포 엔트로피로 근사
+    # policy entropy proxy: 행동 분포 엔트로피로 근사
     probs = np.array(list(act_ratio.values()), dtype=np.float64) + 1e-12
     H = float(-np.sum(probs * np.log(probs)))
 
-    # critic stats (approx): 마지막 rb 합에서 value 스케일 감 안 됨 → 생략/요약
     rb_str = ", ".join([f"{k}={rb_sum[k]:.5g}" for k in rb_keys])
-
     mode = "det" if deterministic else "sample"
     print(
         f"[EVAL] t={env.total_steps:,} steps={steps_done:,} "
         f"hit5m={hit5:.3f} hit20m={hit20:.3f} flip={flip_rate:.3f} gate={gate_rate:.3f} "
         f"act={{-1: {act_ratio[-1]:.3f}, 0: {act_ratio[0]:.3f}, 1: {act_ratio[1]:.3f}}} "
         f"exec={{-1: {exec_ratio[-1]:.3f}, 0: {exec_ratio[0]:.3f}, 1: {exec_ratio[1]:.3f}}} "
-        f"avgR={avgR:+.1g} mode={mode} | H={H:.4f} | rb{{{rb_str}}}"
+        f"avgR={avgR:+.1g} mode={mode} | H={H:.4f} | conf~{conf_mean:.2f} | rb{{{rb_str}}}"
     )
 
 
