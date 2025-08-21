@@ -128,7 +128,20 @@ class WorkerEnv(gym.Env):
         nxt_px = float(self.price.iloc[min(self.t + 1, len(self.price) - 1)])
         old_pos = self.pos
 
-        # goal
+        # ===== PnL & Holding 보상 (누적/실현) - 파트 1: 현재 상태 기준 =====
+        r_pnl_unrealized = 0.0
+        r_holding = 0.0
+        if self.pos != 0: # 포지션 보유 중
+            # 1. 미실현 손익 (shaping) - self.entry_price가 0이 아님을 보장
+            if self.entry_price > 0:
+                r_pnl_unrealized = (px - self.entry_price) / self.entry_price * self.pos
+            # 2. 홀딩 보너스
+            gvec_for_holding = self.gb.vec()
+            dir_for_holding = int(gvec_for_holding[0])
+            if self.pos == dir_for_holding and dir_for_holding != 0:
+                r_holding = self.holding_bonus
+
+        # ===== 액션 결정 및 유효성 검사 =====
         gvec = self.gb.vec()
         dir_, conf = int(gvec[0]), float(gvec[1])
         mask = self._mask(dir_)
@@ -138,17 +151,14 @@ class WorkerEnv(gym.Env):
         rweak = bool(self.regweak.iloc[self.t])
         rsgn  = int(self.regsign.iloc[self.t])
 
-        # trend strength ∈ [0,1]
         tmult = _trend_strength(dir_, conf, gsig, rweak, rsgn)
 
-        # ----- ε-entry: 게이트 온 + 방향 있고 + 포지션 0이면 확률적으로 진입 유도 -----
         eps_frac = max(self.eps_end, self.eps0 * (1.0 - min(1.0, self.total_steps / float(self.eps_decay))))
         eps_frac *= (0.5 + 0.5 * tmult)
         if (dir_ != 0) and (self.pos == 0) and gate_active:
             if np.random.random() < eps_frac:
                 a = 1 if dir_ > 0 else 2
 
-        # 마스크 위반 시 강제 Hold + 소액 페널티
         r_mask = 0.0
         if mask[a] == 0:
             a_eff = 0
@@ -160,46 +170,32 @@ class WorkerEnv(gym.Env):
         changed = int(target != self.pos)
         flip = int(abs(target - self.pos) == 2)
 
-        # 웜업 수수료/슬립 완화
+        # ===== PnL & 비용 - 파트 2: 액션 실행 후 기준 =====
         fee_rate_eff = self.fee_rate * (self.warm_fee_frac if self.total_steps < self.warm_steps else 1.0)
         slip_bp_eff  = self.slip_bp   * (self.warm_fee_frac if self.total_steps < self.warm_steps else 1.0)
-
-        # 수익률 스케일 수수료 (px 곱하지 않음)
         fee = fee_rate_eff * abs(target - self.pos) if changed else 0.0
         signed = 0 if a_eff in (0, 3) else (1 if a_eff == 1 else -1)
         exec_px = px * (1 + signed * slip_bp_eff * 1e-4) if changed else px
 
-        # ===== PnL & Holding 보상 (누적/실현) =====
         r_pnl_realized = 0.0
-        r_pnl_unrealized = 0.0
-        r_holding = 0.0
-
         if changed:
-            if old_pos != 0:  # 포지션 종료 또는 플립 시 실현 손익
-                r_pnl_realized = (exec_px - self.entry_price) / self.entry_price * old_pos
-            if target != 0:  # 신규 포지션 진입
+            if old_pos != 0:
+                if self.entry_price > 0:
+                    r_pnl_realized = (exec_px - self.entry_price) / self.entry_price * old_pos
+            if target != 0:
                 self.entry_price = exec_px
-            else:  # 포지션 청산
+            else:
                 self.entry_price = 0.0
         
-        if self.pos != 0: # 포지션 보유 중
-            # 1. 미실현 손익 (shaping)
-            r_pnl_unrealized = (px - self.entry_price) / self.entry_price * self.pos
-            # 2. 홀딩 보너스
-            if self.pos == dir_ and dir_ != 0:
-                r_holding = self.holding_bonus
-
-        # 타이밍(2시간) → 트렌드 강도 가중
+        # ===== 나머지 보상들 =====
         k_idx = min(self.t + TIMING_K, len(self.price) - 1)
         fut_px = float(self.price.iloc[k_idx])
         dret = (fut_px - px) / px
         raw_timing = ((dret if a_eff == 1 else -dret) if a_eff in (1, 2) else 0.0)
         r_timing = TIMING_K_COEF * (0.5 + 0.5 * tmult) * raw_timing
 
-        # 매니저 정렬 (conf 가중)
         r_align = self.align_eps * conf * dir_ * ((nxt_px - px) / px)
         
-        # 15m 게이트: 불일치 소프트 패널티만
         r_gate = 0.0
         wants_entry = (a_eff in (1, 2)) and (old_pos == 0)
         if gate_active and wants_entry:
@@ -207,7 +203,6 @@ class WorkerEnv(gym.Env):
             if mismatch:
                 r_gate -= GATE_SOFT_PENALTY_MULT * self.fee_rate
 
-        # 비진입/기회비용 페널티
         r_inaction = 0.0
         if gate_active and (dir_ != 0) and (self.pos == 0) and (a_eff == 0):
             self.inaction_cnt += 1
@@ -222,23 +217,20 @@ class WorkerEnv(gym.Env):
             if (dir_ > 0 and gsig_prev > 0) or (dir_ < 0 and gsig_prev < 0):
                 r_opp -= self.opp_cost
 
-        # 진입 보너스 → 트렌드 강도 가중
         r_entry = 0.0
         if wants_entry:
             if (a_eff == 1 and dir_ > 0) or (a_eff == 2 and dir_ < 0):
                 r_entry += (0.002 + 0.5 * abs(dret)) * (0.5 + 0.5 * tmult)
 
-        # 트랜잭션/스위치 비용
         r_fee  = -fee
         r_turn = -TURN_PENALTY * changed
         r_flip = -FLIP_PENALTY * flip
 
-        # 합계
+        # ===== 최종 보상 합계 및 상태 전이 =====
         r = (r_pnl_realized + r_pnl_unrealized * 0.1 + r_holding +
-             r_fee + r_turn + r_flip + r_gate + r_timing + r_align +
+             r_fee + r_turn + r_flip + r_gate + r_timing + r_align + 
              r_opp + r_entry + r_inaction + r_mask)
 
-        # 상태 전이
         self.pos = target
         self.t += 1
         self.total_steps += 1
@@ -248,7 +240,6 @@ class WorkerEnv(gym.Env):
             "mask": mask, "dir": dir_, "gate15": int(self.gate15.iloc[self.t - 1]),
             "trade": int(changed), "flip": int(flip),
             "a_eff": int(a_eff), "conf": float(conf), "trend": float(tmult),
-            # reward breakdown
             "r_pnl_realized": r_pnl_realized, "r_pnl_unrealized": r_pnl_unrealized,
             "r_holding": r_holding, "r_fee": r_fee, "r_turn": r_turn, "r_flip": r_flip,
             "r_gate": r_gate, "r_timing": r_timing, "r_align": r_align,
