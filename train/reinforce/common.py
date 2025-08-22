@@ -167,7 +167,7 @@ def build_manager_inputs(split: str) -> Dict[str, pd.Series | pd.DataFrame]:
         XH=XH,
         price=df1h["Close"].astype(float),
         # ↓ 경고 제거 + dtype 확정 (값 동일)
-        reg4h_weak=weak4h.reindex(XH.index, method="ffill").fillna(True).astype(bool),
+        reg4h_weak=weak4h.reindex(XH.index, method="ffill").fillna(True).infer_objects(copy=False).astype(bool),
         reg4h_sign=reg4h_sign.reindex(XH.index, method="ffill").fillna(0).infer_objects(copy=False).astype("int8"),
     )
 

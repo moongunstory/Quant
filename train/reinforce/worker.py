@@ -468,11 +468,38 @@ def train_worker_with_manager(
     return sp
 
 
-def run_worker_warmup():
-    print("[HRL] Training Entry-Worker (optimal stopping)…")
-    wp = train_worker_warmup()
-    print(f"[OK] Worker saved → {wp}")
+def run_full_pipeline():
+    """
+    Runs the full training pipeline: Stage 1 (warmup) followed by Stage 2 (fine-tuning with manager).
+    """
+    import glob
+    import os
+
+    # ===== Stage 1: Warmup =====
+    print("[HRL] Starting Stage 1: Training Entry-Worker (optimal stopping)…")
+    warmup_model_path = train_worker_warmup()
+    print(f"[HRL] Stage 1 complete. Warmup model saved to {warmup_model_path}")
+    print("-" * 50)
+
+    # ===== Stage 2: Fine-tuning with Manager =====
+    print("[HRL] Starting Stage 2: Fine-tuning Worker with trained Manager…")
+    
+    # Find the latest manager model automatically
+    # This searches from the current working directory.
+    search_pattern = os.path.join("ai_binance", "**", "manager*.zip")
+    manager_models = glob.glob(search_pattern, recursive=True)
+    
+    if not manager_models:
+        print("[ERROR] No manager model found. Cannot proceed to Stage 2.")
+        return
+
+    # Get the most recently modified model
+    latest_manager_path = max(manager_models, key=os.path.getmtime)
+    print(f"[HRL] Using latest manager model: {latest_manager_path}")
+
+    final_model_path = train_worker_with_manager(manager_path=latest_manager_path)
+    print(f"[HRL] Stage 2 complete. Final worker model saved to {final_model_path}")
 
 
 if __name__ == "__main__":
-    run_worker_warmup()
+    run_full_pipeline()
