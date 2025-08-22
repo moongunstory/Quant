@@ -172,19 +172,13 @@ def build_manager_inputs(split: str) -> Dict[str, pd.Series | pd.DataFrame]:
     )
 
 # ===== Goal Bridge =====
-class Goal:
-    __slots__ = ("dir", "conf", "regime")
-    def __init__(self, dir_: int = 0, conf: float = 0.0, regime: int = 0):
-        self.dir = int(np.sign(dir_))
-        self.conf = float(np.clip(conf, 0.0, 1.0))
-        self.regime = int(regime)
-
 class GoalBridge:
+    """A simple container to pass the manager's output (long/short conf) to the worker."""
     def __init__(self):
-        self.cur = Goal(0, 0.0, 0)
-    def set(self, g: Goal): self.cur = g
-    def vec(self) -> np.ndarray:
-        return np.array([self.cur.dir, self.cur.conf, self.cur.regime], dtype=np.float32)
+        # Default: neutral
+        self.cur = np.array([0.0, 0.0], dtype=np.float32) # [long_conf, short_conf]
+    def set(self, g: np.ndarray): self.cur = g
+    def vec(self) -> np.ndarray: return self.cur
 
 # ===== Entropy Decay (탐색 → 수렴) =====
 class EntropyDecay(BaseCallback):

@@ -44,16 +44,20 @@ EVAL_EPISODES = 100 # Reduced for faster eval of longer episodes
 class TradeEnv(gym.Env):
     """
     A unified worker environment that handles both entry and exit timing.
-    Receives a high-level goal (direction, confidence) from a manager.
+    Receives a high-level goal (long/short conf) from a manager.
     """
     metadata = {"render_modes": []}
 
     def __init__(self, split: str, gb: GoalBridge,
                  fee_rate: float = FEE_RATE,
                  slip_bp: float = SLIP_BP,
-                 randomize_start: bool = True):
+                 randomize_start: bool = True,
+                 conf_deadzone: float = 0.1,
+                 ambiguity_threshold: float = 0.1):
         super().__init__()
         self.gb = gb
+        self.conf_deadzone = conf_deadzone
+        self.ambiguity_threshold = ambiguity_threshold
 
         # --- Data Loading ---
         data = build_worker_inputs(split)
@@ -81,13 +85,24 @@ class TradeEnv(gym.Env):
         self.observation_space = spaces.Box(low=-10, high=10, shape=(feat_dim + 5,), dtype=np.float32)
         self.action_space = spaces.Discrete(3)  # 0:Wait, 1:Enter, 2:Exit
 
-    def _tick_goal(self, i: int) -> Tuple[int, float, int]:
+    def _get_derived_goal(self, i: int) -> Tuple[int, float, int]:
+        """ Interprets the raw [long_conf, short_conf] from the GoalBridge. """
         self.gb.tick(self.idx[i])
-        v = self.gb.vec()
-        d = int(v[0]) if len(v) >= 1 else 0
-        c = float(v[1]) if len(v) >= 2 else 0.0
-        r = int(v[2]) if len(v) >= 3 else 0
-        return d, c, r
+        long_conf, short_conf = self.gb.vec()
+
+        # 1. Derive Direction
+        if max(long_conf, short_conf) < self.conf_deadzone:
+            direction = 0
+        else:
+            direction = 1 if long_conf > short_conf else -1
+        
+        # 2. Derive Confidence
+        confidence = max(long_conf, short_conf)
+
+        # 3. Derive Regime (Ambiguity)
+        is_ambiguous = 1 if abs(long_conf - short_conf) < self.ambiguity_threshold else 0
+        
+        return direction, confidence, is_ambiguous
 
     def _calculate_pnl(self, exit_time: int) -> float:
         if not self.in_position or self.entry_time >= exit_time:
@@ -120,7 +135,7 @@ class TradeEnv(gym.Env):
         i = self._cursor
         x = self.X.iloc[i].to_numpy(np.float32, copy=False)
         
-        manager_dir, manager_conf, manager_regime = self._tick_goal(i)
+        manager_dir, manager_conf, manager_regime = self._get_derived_goal(i)
         holding_norm = float(self.holding_steps / MAX_HOLDING_STEPS)
 
         return np.concatenate([
@@ -170,7 +185,13 @@ class TradeEnv(gym.Env):
         if action_is_enter and not self.in_position:
             self.in_position = True
             self.entry_time = self._cursor
-            self.current_dir, _, _ = self._tick_goal(self._cursor) # Regime info is in obs
+            self.current_dir, _, _ = self._get_derived_goal(self._cursor)
+
+            # Block entry if manager is neutral
+            if self.current_dir == 0:
+                self.in_position = False # Revert state
+                reward = -WAIT_PENALTY   # Treat as a wait
+                return self._obs(), reward, False, False, {}
             
             px_e = float(self.price.iloc[self.entry_time])
             if self.current_dir > 0: # Long
@@ -223,13 +244,13 @@ class _HeuristicGB(GoalBridge):
 class _ModelGB(GoalBridge):
     def __init__(self, split, manager_model):
         super().__init__()
-        self.m = build_manager_inputs(split)
+        self.m = build_manager_inputs(split) # For sequencing
         self.idx = self.m["XH"].index
         self.k = 0
         self.model = manager_model
         
-        # Manager가 학습된 방식(시퀀스)에 맞춰 obs를 구성하기 위한 버퍼
-        self.W = 8  # ManagerEnv의 SEQ_WINDOW와 동일해야 함
+        # Buffer to construct the observation sequence for the manager
+        self.W = 8  # Must match SEQ_WINDOW in ManagerV2Env
         feat_dim = self.m["XH"].shape[1]
         self._buf = np.zeros((self.W, feat_dim), dtype=np.float32)
 
@@ -238,7 +259,7 @@ class _ModelGB(GoalBridge):
         while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
             self.k += 1
         
-        # 버퍼 채우기
+        # Fill buffer
         s = max(0, self.k - self.W + 1)
         chunk = self.m["XH"].iloc[s:self.k + 1].to_numpy(dtype=np.float32, copy=False)
         if len(chunk) < self.W:
@@ -246,16 +267,11 @@ class _ModelGB(GoalBridge):
             chunk = np.concatenate([pad, chunk], axis=0)
         self._buf[...] = chunk
         
-        obs_seq = self._buf.ravel() # shape (272,)
+        obs_seq = self._buf.ravel()
         
-        act = self.model.predict(obs_seq, deterministic=True)[0]
-        arr = np.array(act).reshape(-1)
-        dir_eff = [-1, 0, 1][int(arr[0])]
-        conf = float(int(arr[1]) / 10.0) if len(arr) > 1 else 0.5
-        
-        # 약한 시장(weak regime)인지 여부를 판단하여 regime 정보로 추가
-        is_weak = bool(self.m["reg4h_weak"].iloc[self.k])
-        self.set(Goal(dir_eff, conf, regime=int(is_weak)))
+        # Get [long_conf, short_conf] from the manager and set it in the bridge
+        action = self.model.predict(obs_seq, deterministic=True)[0]
+        self.set(action)
 
 # ===== Action Mask hook =====
 def _mask_fn(env: TradeEnv) -> np.ndarray:
