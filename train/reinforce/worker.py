@@ -19,7 +19,7 @@ from stable_baselines3.common.callbacks import CallbackList, BaseCallback
 from ai_binance.train.reinforce.common import (
     MODEL_DIR,
     build_worker_inputs, build_manager_inputs,
-    Goal, GoalBridge, EntropyDecay,
+    GoalBridge, EntropyDecay,
     FEE_RATE, SLIP_BP,
 )
 
@@ -227,19 +227,6 @@ class TradeEnv(gym.Env):
         return self._obs(), reward, done, False, info
 
 # ===== GoalBridges (Unchanged) =====
-class _HeuristicGB(GoalBridge):
-    def __init__(self, split):
-        super().__init__()
-        self.m = build_manager_inputs(split)
-        self.idx = self.m["XH"].index
-        self.k = 0
-    def tick(self, ts_5m):
-        th = pd.Timestamp(ts_5m).floor("1h")
-        while self.k + 1 < len(self.idx) and self.idx[self.k + 1] <= th:
-            self.k += 1
-        reg = int(self.m["reg4h_sign"].iloc[self.k])
-        conf = 0.7
-        self.set(Goal(reg, conf))
 
 class _ModelGB(GoalBridge):
     def __init__(self, split, manager_model):
