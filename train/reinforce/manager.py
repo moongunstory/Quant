@@ -167,9 +167,9 @@ def train_manager_v2(split: str = "train", steps: int = 600_000, seed: int = 42,
 
     policy_kwargs = dict(
         activation_fn=nn.Tanh,
-        net_arch=[dict(pi=[128, 128], vf=[256, 256])]
+        net_arch=dict(pi=[128, 128], vf=[256, 256])  # 리스트 제거
     )
-
+    
     model = PPO(
         "MlpPolicy", vec,
         n_steps=2048,
