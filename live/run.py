@@ -43,7 +43,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 # ⚠️ MTF 인제스터로 교체
-from ai_binance.live.realtime_ingest import RealtimeIngestMTF as RealtimeIngest
+from ai_binance.live.realtime_ingest import RealtimeIngest as RealtimeIngest
 from ai_binance.live.trader import Trader                    # HRL/MaskablePPO 대응 리팩터
 from ai_binance.live.learner import OnlineLearner     # 모듈명 수정(learner → online_learner)
 

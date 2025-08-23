@@ -1,12 +1,11 @@
 # ai_binance/live/trader.py
 """
 Trader (HRL-Ready) for UM Futures — Manager(방향/확신) + Worker(타이밍)
-- 인제스터 패킷(MTF 정규화 피처 X, funding per 5m, ts)을 받아 실시간 의사결정.
-- Manager: 모델 사용 가능 시 예측, 없으면 MTF 휴리스틱으로 대체.
-- Worker: MaskablePPO + VecNormalize로 행동(0 Wait, 1 Enter, 2 Exit).
-- 관측: TradeEnv와 동일 포맷으로 구성하여 분포 정합 유지.
-- 게이트: 기존 k·σ 게이트 + 히스테리시스 유지(노이즈 진입 억제).
-- 펀딩: rate/96 per 5m를 매 스텝 반영(환경과 동일).
+- 인제스터 패킷(정규화 피처 X, funding per 5m, ts)을 받아 실시간 의사결정.
+- X는 DataFrame(병합 MTF) 또는 dict({'5m','15m','1h','4h'}) 모두 지원.
+- Worker 관측: 훈련과 동일한 5m 피처만 역정규화하여 사용(분포 정합 유지).
+- Manager: 가능하면 모델, 어려우면 안전한 MTF 휴리스틱.
+- 게이트: k·σ + 히스테리시스 유지. 펀딩은 rate/96 per 5m 반영.
 - 모드: "live" | "paper"
 """
 
@@ -14,7 +13,7 @@ from __future__ import annotations
 
 import os, math, json
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -42,8 +41,8 @@ PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
 SYMBOL = "ETHUSDT"
 
 # --- TradeEnv 정합 상수 ---
-MAX_HOLDING_STEPS = 72      # 5m * 72 = 6h (worker와 일치)
-WINDOW = 48                 # (구 트레이더의 윈도우는 유지하되, worker 관측에는 사용하지 않음)
+MAX_HOLDING_STEPS = 72      # 5m * 72 = 6h
+WINDOW = 48                 # (구 트레이더 윈도우 — worker 관측에는 사용하지 않음)
 
 # 비용/게이트
 COMMISSION_SIDE   = 0.0005   # 0.05%/side
@@ -88,9 +87,9 @@ class _ObsOnlyEnv(Env):
     def reset(self, *, seed=None, options=None): return np.zeros(self.observation_space.shape, np.float32), {}
     def step(self, action): return self.reset()[0], 0.0, True, False, {}
 
-# -------------------------
+# =========================
 # HRL 트레이더
-# -------------------------
+# =========================
 class Trader:
     def __init__(self, mode: str, q: Queue, api_key: Optional[str] = None, secret_key: Optional[str] = None, learn_q: Optional[Queue] = None):
         assert mode in ("live", "paper")
@@ -102,14 +101,29 @@ class Trader:
         if self.mode == "live" and (not api_key or not secret_key):
             print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
 
-        # === Scaler & feature list (X 역정규화용) ===
-        scaler_path = os.path.join(PROC_DIR, "scaler.joblib")
-        feats_path  = os.path.join(PROC_DIR, "feature_list.json")
-        if not (os.path.exists(scaler_path) and os.path.exists(feats_path)):
-            raise FileNotFoundError(f"Processed artifacts missing: {scaler_path}, {feats_path}")
-        self.scaler = joblib.load(scaler_path)
-        with open(feats_path, "r") as f:
-            self.feature_list = json.load(f)
+        # === Scaler & feature list (훈련 분포 정합) ===
+        # 1) 단일 파일 우선
+        scaler_path_single = os.path.join(PROC_DIR, "scaler.joblib")
+        feats_path_single  = os.path.join(PROC_DIR, "feature_list.json")
+        # 2) 없으면 5m 전용으로 대체
+        scaler_path_5m = os.path.join(PROC_DIR, "scaler_5m.joblib")
+        feats_path_5m  = os.path.join(PROC_DIR, "fe_feature_list_5m.json")
+
+        if os.path.exists(scaler_path_single) and os.path.exists(feats_path_single):
+            self.scaler = joblib.load(scaler_path_single)
+            with open(feats_path_single, "r") as f:
+                self.feature_list = json.load(f)
+            print("[트레이더] processed/scaler.joblib + feature_list.json 사용")
+        elif os.path.exists(scaler_path_5m) and os.path.exists(feats_path_5m):
+            self.scaler = joblib.load(scaler_path_5m)
+            with open(feats_path_5m, "r") as f:
+                self.feature_list = json.load(f)
+            print("[트레이더] processed/scaler_5m.joblib + fe_feature_list_5m.json 사용")
+        else:
+            raise FileNotFoundError(
+                "Processed artifacts missing: "
+                f"{scaler_path_single} & {feats_path_single} (or {scaler_path_5m} & {feats_path_5m})"
+            )
 
         # === Manager (선택) ===
         self.manager_model: Optional[PPO] = None
@@ -117,7 +131,6 @@ class Trader:
         self.W_MGR = 8  # ManagerV2Env.SEQ_WINDOW
         if os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH):
             try:
-                # 더미 env로 VecNormalize 로드 (obs_dim은 zip에서 읽을 수 없어 pkl로부터 shape 체크)
                 tmp_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=(1,), action_space=spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32))])
                 self.manager_vecnorm = VecNormalize.load(MANAGER_VECNORM_PATH, tmp_env)
                 self.manager_vecnorm.training = False
@@ -133,7 +146,6 @@ class Trader:
 
         # === Worker (필수) ===
         self.worker_model: MaskablePPO = MaskablePPO.load(WORKER_MODEL_PATH, device="cpu")
-        # worker obs_shape를 모델에서 추출 → 더미 env로 VecNormalize 로드
         obs_shape = self.worker_model.observation_space.shape
         tmp_w_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=obs_shape, action_space=self.worker_model.action_space)])
         self.worker_vecnorm: VecNormalize = VecNormalize.load(WORKER_VECNORM_PATH, tmp_w_env)
@@ -200,7 +212,7 @@ class Trader:
                 print(f"[트레이더] 실행 어댑터 초기화 실패 → paper 경로로 진행: {e}")
                 self.exec = None
 
-        # Manager obs 시퀀스 버퍼(있을 때만 사용)
+        # Manager obs 시퀀스 버퍼(모델 사용시)
         self._mgr_buf: Optional[np.ndarray] = None  # shape=(W, feat_dim_mgr)
 
     # -------------------------
@@ -241,27 +253,26 @@ class Trader:
     # -------------------------
     # Manager 신호 생성
     # -------------------------
-    def _manager_goal(self, X_row: pd.Series, X_df: pd.DataFrame) -> Tuple[int, float, int]:
+    def _manager_goal_df(self, X_row: pd.Series, X_df: pd.DataFrame) -> Tuple[int, float, int]:
         """
+        병합형 DataFrame(MTF suffix 포함)에서 Manager 신호 추정.
         반환: (direction {-1,0,1}, confidence 0..1, is_ambiguous {0,1})
-        우선 매니저 모델 사용; 실패 시 휴리스틱.
         """
-        # 시도 1: 모델
+        # 모델 시도: _1h/_4h 컬럼만 선별
         if self.manager_model is not None and self.manager_vecnorm is not None:
             try:
-                # 1h 관련 컬럼만 골라서(후보), 고정된 순서로 스택 → 시퀀스 버퍼 W개 유지
                 cand_cols = [c for c in X_df.columns if c.endswith("_1h") or c.endswith("_4h")]
                 cand_cols.sort()
                 if not cand_cols:
                     raise RuntimeError("no 1h/4h columns for manager obs")
 
-                xh = X_df[cand_cols].iloc[-1].astype(np.float32).values  # feat_dim_mgr
+                xh = X_df[cand_cols].iloc[-1].astype(np.float32).values
                 if self._mgr_buf is None:
                     self._mgr_buf = np.tile(xh, (self.W_MGR, 1))
                 else:
                     self._mgr_buf = np.vstack([self._mgr_buf[1:], xh])
 
-                obs_seq = self._mgr_buf.reshape(1, -1).astype(np.float32)  # (1, feat_dim_mgr*W)
+                obs_seq = self._mgr_buf.reshape(1, -1).astype(np.float32)
                 norm_obs = self.manager_vecnorm.normalize_obs(obs_seq)
                 act, _ = self.manager_model.predict(norm_obs, deterministic=True)  # [long_conf, short_conf]
                 long_conf, short_conf = float(act[0][0]), float(act[0][1])
@@ -275,8 +286,7 @@ class Trader:
             except Exception as e:
                 print(f"[트레이더] Manager 예측 실패 → 휴리스틱 대체: {e}")
 
-        # 시도 2: 휴리스틱 (MTF 피처 기반)
-        # 간단하고 견고하게: MACD 히스토그램 + RSI 편차 + 1h/4h 수익 누적
+        # 휴리스틱
         def _safe(col, default=0.0):
             return float(X_row.get(col, default))
 
@@ -289,16 +299,46 @@ class Trader:
         score = (1.8*macd_h1 + 1.2*macd_h4 + 0.6*(rsi_h1/50.0) + 1.0*ret3_h1 + 0.7*ret12_h1)
         direction = 1 if score > 0.0 else (-1 if score < 0.0 else 0)
         conf_raw = abs(score)
-        conf = float(1 - math.exp(-min(5.0, max(0.0, conf_raw)) * 1.2))  # 0..1
+        conf = float(1 - math.exp(-min(5.0, max(0.0, conf_raw)) * 1.2))
+        ambiguous = 1 if conf < 0.15 else 0
+        return direction, conf, ambiguous
+
+    def _manager_goal_dict(self, X_dict: Dict[str, pd.DataFrame]) -> Tuple[int, float, int]:
+        """
+        dict 구조에서 Manager 휴리스틱만 사용(모델 입력 차원 안전성).
+        - '1h'/'4h' 프레임의 최신 행에서 지표 사용.
+        """
+        def _latest(df: Optional[pd.DataFrame], col: str, default: float = 0.0) -> float:
+            try:
+                if df is None or df.empty or (col not in df.columns): return default
+                return float(df[col].iloc[-1])
+            except Exception:
+                return default
+
+        X1 = X_dict.get("1h")
+        X4 = X_dict.get("4h")
+
+        macd_h1  = _latest(X1, "macd_hist", 0.0)
+        macd_h4  = _latest(X4, "macd_hist", 0.0)
+        rsi_h1   = _latest(X1, "rsi14", 50.0) - 50.0
+        rsi_h4   = _latest(X4, "rsi14", 50.0) - 50.0
+        ret3_h1  = _latest(X1, "ret3", 0.0)
+        ret12_h1 = _latest(X1, "ret12", 0.0)
+
+        score = (1.8*macd_h1 + 1.2*macd_h4 + 0.6*(rsi_h1/50.0) + 1.0*ret3_h1 + 0.7*ret12_h1)
+        direction = 1 if score > 0.0 else (-1 if score < 0.0 else 0)
+        conf_raw = abs(score)
+        conf = float(1 - math.exp(-min(5.0, max(0.0, conf_raw)) * 1.2))
         ambiguous = 1 if conf < 0.15 else 0
         return direction, conf, ambiguous
 
     # -------------------------
-    # Worker 관측 구성 (TradeEnv._obs와 동일)
+    # Worker 관측 구성 (TradeEnv._obs와 동일 포맷)
     # -------------------------
-    def _build_worker_obs(self, X: pd.DataFrame, t: int, manager_dir: int, manager_conf: float, manager_regime: int) -> np.ndarray:
-        # 인제스터 X(정규화)를 원시 피처 복원 → worker VecNormalize와 분포 정합
-        x_norm = X.iloc[t].reindex(self.feature_list) if set(self.feature_list).issubset(X.columns) else X.iloc[t]
+    def _build_worker_obs_from_df(self, X_df: pd.DataFrame, t: int,
+                                  manager_dir: int, manager_conf: float, manager_regime: int) -> np.ndarray:
+        # 5m 훈련 피처만 역정규화(정확한 열 순서 보장)
+        x_norm = X_df.iloc[t].reindex(self.feature_list).fillna(0.0)
         x_raw = self.scaler.inverse_transform(np.asarray([x_norm.values], dtype=np.float64))[0].astype(np.float32)
         holding_norm = float(min(self.holding_steps, MAX_HOLDING_STEPS) / MAX_HOLDING_STEPS)
         obs = np.concatenate([
@@ -311,7 +351,34 @@ class Trader:
                 holding_norm
             ], dtype=np.float32)
         ], axis=0)
-        # VecNormalize 적용은 predict 직전에
+        return obs
+
+    def _build_worker_obs_from_dict(self, X_dict: Dict[str, pd.DataFrame], t_idx: pd.Timestamp,
+                                    manager_dir: int, manager_conf: float, manager_regime: int) -> Optional[np.ndarray]:
+        """
+        dict 구조 → 5m 프레임에서 feature_list 열만 추출하여 역정규화.
+        t_idx: 기준 시간(5m 최신 인덱스)
+        """
+        X5 = X_dict.get("5m")
+        if X5 is None or X5.empty:
+            return None
+        if t_idx not in X5.index:
+            # 가장 가까운 과거 시점으로 보정
+            t_idx = X5.index[X5.index.get_indexer([t_idx], method="pad")[0]]
+        row = X5.loc[t_idx]
+        x_norm = row.reindex(self.feature_list).fillna(0.0)
+        x_raw = self.scaler.inverse_transform(np.asarray([x_norm.values], dtype=np.float64))[0].astype(np.float32)
+        holding_norm = float(min(self.holding_steps, MAX_HOLDING_STEPS) / MAX_HOLDING_STEPS)
+        obs = np.concatenate([
+            x_raw,
+            np.array([
+                float(manager_dir),
+                float(manager_conf),
+                float(manager_regime),
+                float(self.pos != 0),
+                holding_norm
+            ], dtype=np.float32)
+        ], axis=0)
         return obs
 
     # -------------------------
@@ -320,18 +387,12 @@ class Trader:
     @staticmethod
     def _mask(pos: int) -> np.ndarray:
         # worker: 0 Wait, 1 Enter, 2 Exit
-        if pos == 0:  # 무포지션: Wait/Enter 허용
+        if pos == 0:
             return np.array([True, True, False], dtype=bool)
-        else:         # 보유중: Wait/Exit 허용
+        else:
             return np.array([True, False, True], dtype=bool)
 
     def _interpret(self, raw_action: int, manager_dir: int) -> Tuple[int, str]:
-        """
-        반환: (target_pos ∈ {-1,0,1}, reason)
-        - 무포지션에서 Enter면 manager_dir 따라 Long/Short.
-        - 보유중에서 Exit면 0.
-        - 그 외는 유지/대기.
-        """
         if self.pos == 0:
             if raw_action == 1 and manager_dir != 0:
                 return (1 if manager_dir > 0 else -1), "enter"
@@ -350,9 +411,9 @@ class Trader:
         thr_enter = FEE_BUFFER + k_sigma * float(vol_t)
         thr_exit  = HYSTERESIS_RATIO * thr_enter
         z = abs(float(logret_t))
-        if self.pos == 0:  # 진입
+        if self.pos == 0:
             return desired_target if z >= thr_enter else self.pos
-        else:              # 청산
+        else:
             return 0 if (desired_target == 0 and z >= thr_exit) else self.pos
 
     # -------------------------
@@ -465,32 +526,66 @@ class Trader:
                 self._write_report()
                 continue
 
-            # 인제스트 패킷
-            X: pd.DataFrame = pkt["X"]           # 정규화 MTF 피처, DatetimeIndex(UTC)
-            close: pd.Series = pkt["close"]      # 종가 시리즈(동일 인덱스)
-            funding_series: pd.Series = pkt.get("funding", pd.Series(0.0, index=X.index))
+            # 인제스트 패킷: X는 DataFrame(병합) 또는 dict({'5m','15m','1h','4h'})
+            X_any: Union[pd.DataFrame, Dict[str, pd.DataFrame]] = pkt["X"]
+            funding_series_any = pkt.get("funding")
             ts: pd.Timestamp = pkt["ts"]
 
-            if len(X) < 1:  # 윈도우 필요 없음(TradeEnv는 1스텝 관측)
+            # 기준 5m close 시리즈
+            if isinstance(X_any, dict):
+                X5 = X_any.get("5m")
+                if X5 is None or X5.empty:  # 안전 가드
+                    continue
+                close = pkt.get("close")
+                if close is None:
+                    # 없으면 5m Close로 대체
+                    close = X5.get("Close", pd.Series(index=X5.index, dtype=float)).astype(float)
+                X_index = X5.index
+            else:
+                X_df: pd.DataFrame = X_any
+                close = pkt["close"]
+                X_index = X_df.index
+
+            if len(X_index) < 1:
                 continue
 
-            t = len(X) - 1
+            t = len(X_index) - 1
+            t_idx = X_index[t]
             p1 = float(close.iloc[t])
             self.last_price = p1 if self.last_price is None else self.last_price
 
             # === Manager 신호 ===
-            manager_dir, manager_conf, manager_regime = self._manager_goal(X.iloc[t], X)
+            if isinstance(X_any, dict):
+                manager_dir, manager_conf, manager_regime = self._manager_goal_dict(X_any)
+            else:
+                manager_dir, manager_conf, manager_regime = self._manager_goal_df(
+                    X_any.iloc[t], X_any
+                )
 
             # === Worker 관측 구성 → VecNormalize → 예측 ===
-            obs_raw = self._build_worker_obs(X, t, manager_dir, manager_conf, manager_regime)
+            if isinstance(X_any, dict):
+                obs_raw = self._build_worker_obs_from_dict(X_any, t_idx, manager_dir, manager_conf, manager_regime)
+                if obs_raw is None:
+                    continue
+                funding_series = funding_series_any
+                if isinstance(funding_series, pd.Series):
+                    f_idx = funding_series.index.get_indexer([t_idx], method="pad")[0]
+                    funding_t = float(funding_series.iloc[f_idx])
+                else:
+                    funding_t = 0.0
+                lr = math.log(p1 / float(close.iloc[t-1])) if t > 0 else 0.0
+            else:
+                obs_raw = self._build_worker_obs_from_df(X_any, t, manager_dir, manager_conf, manager_regime)
+                funding_series = funding_series_any if isinstance(funding_series_any, pd.Series) else pd.Series(0.0, index=X_index)
+                funding_t = float(funding_series.iloc[t]) if len(funding_series) == len(X_index) else 0.0
+                lr = math.log(p1 / float(close.iloc[t-1])) if t > 0 else 0.0
+
             obs_norm = self.worker_vecnorm.normalize_obs(obs_raw.reshape(1, -1))
             masks = self._mask(self.pos)
             action, _ = self.worker_model.predict(obs_norm, deterministic=True, action_masks=masks)
 
             # === 상태별 해석 + 게이트 ===
             desired, why = self._interpret(int(action), manager_dir)
-
-            lr = float(np.log(float(close.iloc[t]) / float(close.iloc[t - 1]))) if t > 0 else 0.0
             vol_t = float(np.log(close / close.shift(1)).rolling(VOL_WIN, min_periods=1).std().iloc[t])
             target = self._gate(desired, lr, vol_t)
 
@@ -509,14 +604,13 @@ class Trader:
                 if self.pos != 0: self._close(p1, ts)
                 if target != 0:   self._open(target, p1, ts)
 
-            # === RL 보상(환경과 동일 개념): 보유수익 - 수수료 - 펀딩(연속 분배) ===
-            funding_penalty = (self.pos * float(funding_series.iloc[t])) if len(funding_series) else 0.0
+            # === RL 보상(환경 개념): 보유수익 - 수수료 - 펀딩(연속 분배) ===
+            funding_penalty = self.pos * funding_t
             rl_reward = (self.pos * lr) - tx_cost - funding_penalty
 
             # === 롤아웃 적재(옵션) ===
             self._roll_step += 1
             done = (self._roll_step % ROLLOUT_STEPS == 0)
-            # MaskablePPO의 분포/가치 추정 (로깅 목적, 실패시 NaN)
             try:
                 obs_t = torch.as_tensor(obs_norm).float()
                 dist = self.worker_model.policy.get_distribution(obs_t)

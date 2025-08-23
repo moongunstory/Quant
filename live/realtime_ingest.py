@@ -232,35 +232,47 @@ class RealtimeIngest:
     run() 호출 시, 확정된 최신 5m 캔들이 생길 때마다 Queue로 패킷 푸시.
 
     packet = {
-        "X": normalized_features_df,
-        "close": close_series,
-        "funding": funding_series_5m,      # rate/96
-        "funding_rate": float,             # latest bar share
-        "ts": latest_open_timestamp (UTC)
+        "X": {
+            "5m": DataFrame(normalized features),
+            "15m": DataFrame(...),
+            "1h": DataFrame(...),
+            "4h": DataFrame(...)
+        },
+        "close": close_series(5m 기준),
+        "funding": funding_series_5m,   # rate/96
+        "funding_rate": float,          # 최신 5m 바의 분배 단위
+        "ts": Timestamp(UTC)            # 최신 확정봉의 Open_time
     }
     """
-    def __init__(self, out_queue: Queue, symbol: str = SYMBOL, interval: str = INTERVAL):
-        assert interval == "5m", "베이스 인터벌은 5m 고정(상위 TF는 내부에서 생성)"
+    TF_RULES = {
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+        "4h": "4h"
+    }
+
+    def __init__(self, out_queue: Queue, symbol: str = SYMBOL):
         self.q = out_queue
         self.symbol = symbol
-        self.interval = interval
 
-        # 스케일러/피처 목록 로드 (학습과 동일 경로)
-        scaler_path = os.path.join(PROC_DIR, "scaler.joblib")
-        feats_path  = os.path.join(PROC_DIR, "feature_list.json")
-        if not (os.path.exists(scaler_path) and os.path.exists(feats_path)):
-            raise FileNotFoundError(f"Processed artifacts missing: {scaler_path}, {feats_path}")
-        self.scaler = joblib.load(scaler_path)
-        self.features = json.load(open(feats_path, "r"))
+        # TF별 스케일러/피처 로드
+        self.scalers = {}
+        self.features = {}
+        for tf in self.TF_RULES.keys():
+            scaler_path = os.path.join(PROC_DIR, f"scaler_{tf}.joblib")
+            feats_path  = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
+            if not (os.path.exists(scaler_path) and os.path.exists(feats_path)):
+                raise FileNotFoundError(f"Processed artifacts missing for {tf}: {scaler_path}, {feats_path}")
+            self.scalers[tf] = joblib.load(scaler_path)
+            self.features[tf] = json.load(open(feats_path, "r"))
 
-        # 초기 백필
-        self.df = self._backfill_5m()
-        # 펀딩 이력
+        # 초기 백필 (5m only → 상위 TF는 resample)
+        self.df5m = self._backfill_5m()
         self.funding_df = self._backfill_funding()
 
     # ----- Backfill -----
     def _backfill_5m(self) -> pd.DataFrame:
-        rows = _fetch_klines(self.symbol, self.interval, BACKFILL_LIMIT)
+        rows = _fetch_klines(self.symbol, "5m", BACKFILL_LIMIT)
         df = _klines_to_df(rows)
         if df.empty:
             raise RuntimeError("초기 5m 캔들 로드 실패")
@@ -278,46 +290,59 @@ class RealtimeIngest:
         try:
             rows = _fetch_funding(self.symbol, limit=50)
             df_new = _funding_to_df(rows)
-            if df_new.empty:
-                return
-            if self.funding_df is None or self.funding_df.empty:
-                self.funding_df = df_new
-            else:
+            if not df_new.empty:
                 self.funding_df = (
                     pd.concat([self.funding_df, df_new])
                     .sort_index()
                     .drop_duplicates(keep="last")
-                ).iloc[-400:]  # 메모리 가드
+                ).iloc[-400:]
         except Exception as e:
             print(f"[ingest] funding refresh warn: {e}")
 
+    # ----- Feature Build -----
+    def _build_features(self, df5: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        """TF별 indicator 생성 + 정규화"""
+        out = {}
+        for tf, rule in self.TF_RULES.items():
+            if tf == "5m":
+                df = df5.copy()
+            else:
+                agg = {
+                    'Open':'first','High':'max','Low':'min','Close':'last',
+                    'Volume':'sum','Quote_asset_volume':'sum',
+                    'Number_of_trades':'sum','Taker_buy_base':'sum','Taker_buy_quote':'sum'
+                }
+                df = df5.resample(rule).agg(agg).dropna()
+            feat = _indicators(df, tf)
+            X = _normalize(feat, self.scalers[tf], self.features[tf])
+            out[tf] = X
+        return out
+
     # ----- Emit -----
     def _emit_if_closed(self) -> Optional[pd.Timestamp]:
-        if self.df.empty:
+        if self.df5m.empty:
             return None
-        latest_open = self.df.index[-1]
-        close_ms = int(self.df.iloc[-1]["Close_time"].value // 10**6)  # ns→ms
+        latest_open = self.df5m.index[-1]
+        close_ms = int(self.df5m.iloc[-1]["Close_time"].value // 10**6)
         if not _is_closed_bar(close_ms):
             return None
 
-        # 피처 & 정규화 (MTF)
-        feat = _featurize_mtf(self.df)
-        X = _normalize(feat, self.scaler, self.features)
-        close = self.df["Close"].reindex(X.index).ffill().bfill()
+        # TF별 피처
+        X_dict = self._build_features(self.df5m)
+        close = self.df5m["Close"].reindex(X_dict["5m"].index).ffill().bfill()
 
-        # 펀딩 5m 분해
-        funding_series = _distribute_funding_to_5m(X.index, self.funding_df)
-        funding_series = funding_series.reindex(X.index).fillna(0.0)
+        # 펀딩
+        funding_series = _distribute_funding_to_5m(X_dict["5m"].index, self.funding_df)
+        funding_series = funding_series.reindex(X_dict["5m"].index).fillna(0.0)
         current_funding = float(funding_series.iloc[-1]) if len(funding_series) else 0.0
 
         packet = {
-            "X": X,
+            "X": X_dict,
             "close": close,
             "funding": funding_series,
             "funding_rate": current_funding,
             "ts": latest_open
         }
-        # 비차단 push (가득 차 있으면 오래된 것 버림)
         try:
             if self.q.full():
                 self.q.get_nowait()
@@ -328,19 +353,17 @@ class RealtimeIngest:
 
     # ----- Tail fetch -----
     def _fetch_tail(self) -> None:
-        # 최신 꼬리 갱신
-        rows = _fetch_klines(self.symbol, self.interval, 200)
+        rows = _fetch_klines(self.symbol, "5m", 200)
         tail = _klines_to_df(rows)
         if not tail.empty:
-            merged = pd.concat([self.df.iloc[:-200], tail]).sort_index()
+            merged = pd.concat([self.df5m.iloc[:-200], tail]).sort_index()
             merged = merged[~merged.index.duplicated(keep="last")]
-            self.df = merged
-        # 펀딩 갱신
+            self.df5m = merged
         self._refresh_funding()
 
     # ----- Run -----
     def run(self) -> None:
-        print(f"[ingest] symbol={self.symbol} base_tf=5m | backfill={len(self.df)}")
+        print(f"[ingest] symbol={self.symbol} base_tf=5m | backfill={len(self.df5m)}")
         last_emitted = self._emit_if_closed()
         if last_emitted is not None:
             print(f"[ingest] initial closed bar emitted: {last_emitted}")
@@ -348,7 +371,7 @@ class RealtimeIngest:
         while True:
             try:
                 self._fetch_tail()
-                latest_open = self.df.index[-1]
+                latest_open = self.df5m.index[-1]
                 if last_emitted is None or latest_open > last_emitted:
                     em = self._emit_if_closed()
                     if em is not None:
