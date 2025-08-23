@@ -11,6 +11,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, Tuple, Callable, Optional
 
+from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -22,6 +23,7 @@ from ai_binance.train.reinforce.common import (
     GoalBridge, EntropyDecay,
     FEE_RATE, SLIP_BP,
 )
+from ai_binance.train.reinforce.manager import ManagerV2Env
 
 # =============================================================================
 # Design: Unified Trading Worker
@@ -104,22 +106,33 @@ class TradeEnv(gym.Env):
         
         return direction, confidence, is_ambiguous
 
-    def _calculate_pnl(self, exit_time: int) -> float:
+    def _calculate_pnl(self, exit_time: int) -> Dict[str, float]:
         if not self.in_position or self.entry_time >= exit_time:
-            return 0.0
+            return dict(pnl=0.0, gross=0.0, fee=0.0, fund=0.0, slip=0.0)
 
-        px_e = self.entry_price
-        px_h = float(self.price.iloc[exit_time])
+        px_e = self.entry_price                    # 슬립 적용된 진입가(이미)
+        px_raw_e = float(self.price.iloc[self.entry_time])  # 원시 진입가
+        px_raw_x = float(self.price.iloc[exit_time])        # 원시 청산가
 
-        # Apply slippage to exit price
-        if self.current_dir > 0: # Long
-            exec_out = px_h * (1 - self.slip_bp * 1e-4)
-        else: # Short
-            exec_out = px_h * (1 + self.slip_bp * 1e-4)
+        # 청산 슬립 적용
+        if self.current_dir > 0:   # Long
+            px_exec_x = px_raw_x * (1 - self.slip_bp * 1e-4)
+            slip_out = (px_raw_x - px_exec_x) / px_raw_e
+        else:                       # Short
+            px_exec_x = px_raw_x * (1 + self.slip_bp * 1e-4)
+            slip_out = (px_exec_x - px_raw_x) / px_raw_e
 
-        gross_pnl = (exec_out - px_e) / px_e * self.current_dir
-        
-        # Apply funding fees
+        # 진입 슬립(이미 entry_price에 반영) → 상대 수익률 기준으로 계산
+        if self.current_dir > 0:
+            slip_in = (self.entry_price - px_raw_e) / px_raw_e
+        else:
+            slip_in = (px_raw_e - self.entry_price) / px_raw_e
+
+        # 총 슬립(양쪽)
+        slip_total = (slip_in + slip_out) * np.sign(self.current_dir)
+
+        gross = (px_exec_x - px_e) / px_e * self.current_dir  # 체결가 기준 수익
+        # 펀딩
         fund = 0.0
         for k in range(self.entry_time, exit_time):
             fr = float(self.funding.iloc[k])
@@ -127,9 +140,10 @@ class TradeEnv(gym.Env):
             delta = abs(fr) * FUNDING_STEP_FRAC
             fund += (-delta if same else +delta)
 
-        # Round-trip fee
-        total_fees = 2 * self.fee
-        return gross_pnl - total_fees + fund
+        fee = 2 * self.fee
+        pnl = gross - fee + fund
+        return dict(pnl=float(pnl), gross=float(gross), fee=float(fee),
+                    fund=float(fund), slip=float(slip_total))
 
     def _obs(self) -> np.ndarray:
         i = self._cursor
@@ -202,11 +216,24 @@ class TradeEnv(gym.Env):
             reward = 0.0 # No reward until exit
 
         elif action_is_exit and self.in_position:
-            reward = self._calculate_pnl(self._cursor)
-            info = {'pnl': reward, 'holding_steps': self.holding_steps}
-            
+            comps = self._calculate_pnl(self._cursor)
+            reward = comps["pnl"]
+            # 메타
+            i_start = self.entry_time
+            i_end = self._cursor
+            info = {
+                'pnl': reward,
+                'holding_steps': self.holding_steps,
+                'dir': int(self.current_dir),
+                'entry_ts': str(self.idx[i_start]),
+                'exit_ts': str(self.idx[min(i_end, self.N-1)]),
+                'gross': comps['gross'],
+                'fee': comps['fee'],
+                'fund': comps['fund'],
+                'slip': comps['slip'],
+            }
             self.in_position = False
-            done = True # Episode ends when a trade is closed
+            done = True
 
         else: # Wait action
             reward = -WAIT_PENALTY
@@ -219,22 +246,35 @@ class TradeEnv(gym.Env):
             done = True
         
         if self.in_position and self.holding_steps >= MAX_HOLDING_STEPS:
-            reward = self._calculate_pnl(self._cursor)
-            info = {'pnl': reward, 'holding_steps': self.holding_steps, 'forced_exit': True}
+            comps = self._calculate_pnl(self._cursor)
+            reward = comps["pnl"]
+            info = {
+                'pnl': reward,
+                'holding_steps': self.holding_steps,
+                'forced_exit': True,
+                'dir': int(self.current_dir),
+                'entry_ts': str(self.idx[self.entry_time]),
+                'exit_ts': str(self.idx[min(self._cursor, self.N-1)]),
+                'gross': comps['gross'],
+                'fee': comps['fee'],
+                'fund': comps['fund'],
+                'slip': comps['slip'],
+            }
             self.in_position = False
             done = True
 
         return self._obs(), reward, done, False, info
 
-# ===== GoalBridges (Unchanged) =====
+# ===== GoalBridges (Updated) =====
 
 class _ModelGB(GoalBridge):
-    def __init__(self, split, manager_model):
+    def __init__(self, split: str, manager_model: PPO, manager_vecnorm: VecNormalize):
         super().__init__()
         self.m = build_manager_inputs(split) # For sequencing
         self.idx = self.m["XH"].index
         self.k = 0
         self.model = manager_model
+        self.vecnorm = manager_vecnorm
         
         # Buffer to construct the observation sequence for the manager
         self.W = 8  # Must match SEQ_WINDOW in ManagerV2Env
@@ -256,9 +296,12 @@ class _ModelGB(GoalBridge):
         
         obs_seq = self._buf.ravel()
         
+        # IMPORTANT: Normalize the observation before prediction
+        normalized_obs = self.vecnorm.normalize_obs(obs_seq.reshape(1, -1))
+        
         # Get [long_conf, short_conf] from the manager and set it in the bridge
-        action = self.model.predict(obs_seq, deterministic=True)[0]
-        self.set(action)
+        actions, _ = self.model.predict(normalized_obs, deterministic=True)
+        self.set(actions[0])
 
 # ===== Action Mask hook =====
 def _mask_fn(env: TradeEnv) -> np.ndarray:
@@ -267,6 +310,7 @@ def _mask_fn(env: TradeEnv) -> np.ndarray:
 # ===== Train Function (New Unified Version) =====
 def train_unified_worker(
     manager_path: str,
+    manager_vecnorm_path: str,
     split: str = "train",
     steps: int = 500_000,
     seed: int = 42,
@@ -275,11 +319,14 @@ def train_unified_worker(
     """
     Trains the unified TradeEnv worker with a pre-trained manager.
     """
-    from stable_baselines3 import PPO
-
-    print(f"[HRL] Loading manager model from: {manager_path}")
-    manager_model = PPO.load(manager_path)
-    goal_bridge = _ModelGB(split, manager_model)
+    manager_model = PPO.load(manager_path, device="cpu")
+    # Create a dummy env to load the VecNormalize stats
+    dummy_manager_env = DummyVecEnv([lambda: ManagerV2Env(split=split)])
+    manager_vecnorm = VecNormalize.load(manager_vecnorm_path, dummy_manager_env)
+    manager_vecnorm.training = False
+    manager_vecnorm.norm_reward = False
+    
+    goal_bridge = _ModelGB(split, manager_model, manager_vecnorm)
 
     def make_env_fn() -> gym.Env:
         env = TradeEnv(split=split, gb=goal_bridge, randomize_start=True)
@@ -349,7 +396,15 @@ def run_unified_training_pipeline():
     latest_manager_path = max(manager_models, key=os.path.getmtime)
     print(f"[HRL] Using manager: {latest_manager_path}")
 
-    train_unified_worker(manager_path=latest_manager_path)
+    # Derive vecnorm path from manager path
+    base_path, _ = os.path.splitext(latest_manager_path)
+    vecnorm_path = f"{base_path}_vecnorm.pkl"
+
+    if not os.path.exists(vecnorm_path):
+        print(f"[ERROR] VecNormalize path not found: {vecnorm_path}")
+        return
+
+    train_unified_worker(manager_path=latest_manager_path, manager_vecnorm_path=vecnorm_path)
 
 if __name__ == "__main__":
     # This will run the full, unified training pipeline automatically when the script is executed.

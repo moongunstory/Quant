@@ -1,9 +1,8 @@
 # ai_binance/run.py
 """
-Main Runner for Live Trading Stack
-- RealtimeIngest(5m 확정바) → Dispatcher → Trader / OnlineLearner
-- 옵션: 온라인 미세학습(개선시만 저장) + 트레이더 모델 자동 리로드
-- 분기: 실제(live) / 페이퍼(paper) / 섀도(shadow)
+Main Runner for Live Trading Stack (HRL/MTF compatible)
+- RealtimeIngestMTF(5m 확정봉 + 15m/1h/4h 피처) → Dispatcher → Trader / OnlineLearner
+- 온라인 업데이트(KL 가드) + 모델 자동 리로드(Worker/MaskablePPO 대응)
 """
 
 from __future__ import annotations
@@ -15,21 +14,19 @@ import logging
 import warnings
 import csv
 import subprocess
-from queue import Queue, Empty
+from queue import Queue
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
-from stable_baselines3 import PPO
 from dotenv import load_dotenv
 
-# ===== SB3 로드 안전 패치 (FloatSchedule 등 역직렬화 실패 우회) =====
+# ===== SB3 안전 로더 (PPO 커스텀 스케줄 역직렬화 가드) =====
+from stable_baselines3 import PPO
 def _const_schedule(v: float):
     return lambda _progress_remaining: v
-
 __ORIG_PPO_LOAD = PPO.load
-
 def _ppo_load_safe(path, *args, **kwargs):
     try:
         return __ORIG_PPO_LOAD(path, *args, **kwargs)
@@ -39,54 +36,56 @@ def _ppo_load_safe(path, *args, **kwargs):
         co.setdefault("clip_range", _const_schedule(0.2))
         kwargs["custom_objects"] = co
         return __ORIG_PPO_LOAD(path, *args, **kwargs)
+PPO.load = _ppo_load_safe  # 전역 패치
 
-PPO.load = _ppo_load_safe  # 전역 패치: Trader/Loader 등 모든 로드에 적용
-
-# --- 내부 모듈 ---
+# --- 내부 모듈 경로 ---
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from ai_binance.live.realtime_ingest import RealtimeIngest
-from ai_binance.live.trader import Trader
-from ai_binance.live.learner import OnlineLearner
 
-# .env 파일의 절대 경로를 명시적으로 지정하여 로드합니다.
-# 이렇게 하면 스크립트가 어느 위치에서 실행되든 정확한 경로의 .env 파일을 찾을 수 있습니다.
-from pathlib import Path
+# ⚠️ MTF 인제스터로 교체
+from ai_binance.live.realtime_ingest import RealtimeIngestMTF as RealtimeIngest
+from ai_binance.live.trader import Trader                    # HRL/MaskablePPO 대응 리팩터
+from ai_binance.live.learner import OnlineLearner     # 모듈명 수정(learner → online_learner)
+
+# .env 로드 (프로젝트 루트 기준)
 dotenv_path = Path(__file__).resolve().parent.parent.parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
 
 # =========================
-# 설정 (절대경로 버전)
+# 설정
 # =========================
-BASE_DIR = Path(__file__).resolve().parent.parent  # ~/ai_binance
+BASE_DIR = Path(__file__).resolve().parent.parent         # ~/ai_binance
 MODEL_DIR = BASE_DIR / "data" / "model"
-LOGS_DIR = BASE_DIR / "data" / "logs"
-ENABLE_TRADING = True
-TRADING_MODE = "live"          # live / paper 
-ENABLE_ONLINE_LEARNING = True
+LOGS_DIR  = BASE_DIR / "data" / "logs"
+
+ENABLE_TRADING          = True
+TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper 
+ENABLE_ONLINE_LEARNING  = True
 
 # === 텔레그램 봇 실행 옵션 ===
 ENABLE_TELEGRAM_BOT = True
-TELEGRAM_BOT_PATH = BASE_DIR / "telegram_bot.py"  # .env는 telegram_bot.py가 자체 로드
+TELEGRAM_BOT_PATH   = BASE_DIR / "telegram_bot.py"  # .env는 bot 내부에서 로드
 
-# === 미세학습 주기(보수 프로파일) ===
-MIN_BUFFER_BARS     = 15_000   # ~52일 @5m
-TRIGGER_EVERY_BARS  = 5_000    # ~17.4일 @5m
-PROMO_COOLDOWN_BARS = 576      # 승격 후 48h 쿨다운
+# === 온라인 학습 트리거(보수형) ===
+MIN_BUFFER_BARS     = 15_000   # ~52d @5m
+TRIGGER_EVERY_BARS  = 5_000    # ~17.4d @5m
+PROMO_COOLDOWN_BARS = 576      # 48h @5m
 
-LIVE_OUT_NAME = "best_model_live.zip"
+# OnlineLearner의 기본 저장명과 일치(Worker/MaskablePPO)
+LIVE_OUT_NAME = os.getenv("LIVE_OUT_NAME", "worker_unified_live.zip")
 LIVE_OUT_PATH = MODEL_DIR / LIVE_OUT_NAME
+
 INGEST_QUEUE_MAX = 2
 TRADER_QUEUE_MAX = 2
 LEARN_QUEUE_MAX  = 2
-BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
-BINANCE_SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
+
+BINANCE_API_KEY   = os.getenv('BINANCE_API_KEY')
+BINANCE_SECRET_KEY= os.getenv('BINANCE_SECRET_KEY')
 
 # =========================
-# CSV 로거 설정
+# CSV/콘솔 로거 설정
 # =========================
 class TradingLogFilter(logging.Filter):
-    """Trader 스레드에서 생성된 로그만 통과시키는 필터"""
     def filter(self, record):
         return record.threadName == 'Trader'
 
@@ -97,12 +96,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
-# 콘솔 로거(항상 사용)
 console_handler = logging.StreamHandler(sys.__stdout__)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
-# 라이브 모드에서는 CSV 파일 저장 비활성화
 CSV_HEADER = ['timestamp', 'level', 'threadName', 'message']
 csv_handler = None
 if TRADING_MODE != "live":
@@ -128,16 +125,15 @@ if TRADING_MODE != "live":
 
     csv_handler = CsvFileHandler(log_file_path)
     csv_handler.setFormatter(logging.Formatter('%(message)s'))
-    csv_handler.addFilter(TradingLogFilter())  # <-- Trader 스레드 로그만 CSV 저장
+    csv_handler.addFilter(TradingLogFilter())
     logger.addHandler(csv_handler)
 
-# warnings를 로깅 WARNING 레벨로 송신 (stderr로 ERROR 찍히는 것 방지)
 logging.captureWarnings(True)
 pywarn = logging.getLogger("py.warnings")
 pywarn.setLevel(logging.WARNING)
 pywarn.handlers = []
 pywarn.addHandler(console_handler)
-if csv_handler is not None:  # live 모드가 아니면 파일에도
+if csv_handler is not None:
     pywarn.addHandler(csv_handler)
 
 # === stdout/stderr → logger 리다이렉트 ===
@@ -181,11 +177,10 @@ def _mtime(path: str) -> float:
 class Dispatcher(threading.Thread):
     daemon = True
     def __init__(self, ingest_q: Queue, trader_q: Queue, learn_q: Queue):
-        super().__init__()
+        super().__init__(name="Dispatcher")
         self.ingest_q = ingest_q
         self.trader_q = trader_q
         self.learn_q = learn_q
-        self.name = "Dispatcher"
     def run(self):
         logger.info("디스패처 시작됨")
         while True:
@@ -199,17 +194,16 @@ class Dispatcher(threading.Thread):
                     pass
 
 # =========================
-# 트레이더 리로더
+# 트레이더 리로더 (모델 클래스 보존)
 # =========================
 class TraderReloader(threading.Thread):
     daemon = True
     def __init__(self, trader: Trader, target_path: str, check_sec: float = 5.0):
-        super().__init__()
+        super().__init__(name="Reloader")
         self.trader = trader
         self.target_path = target_path
         self.check_sec = check_sec
         self._last_mtime = _mtime(target_path)
-        self.name = "Reloader"
     def run(self):
         logger.info(f"리로더 감시 중: {self.target_path}")
         while True:
@@ -218,7 +212,8 @@ class TraderReloader(threading.Thread):
             if mt > self._last_mtime:
                 self._last_mtime = mt
                 try:
-                    new_model = PPO.load(self.target_path, device="cpu")
+                    loader = getattr(self.trader.model.__class__, "load", None) or PPO.load
+                    new_model = loader(self.target_path, device="cpu")
                     self.trader.model = new_model
                     logger.info(f"모델 리로드 완료: {self.target_path}")
                 except Exception as e:
@@ -230,7 +225,7 @@ class TraderReloader(threading.Thread):
 class OnlineLearnWorker(threading.Thread):
     daemon = True
     def __init__(self, learn_q: Queue):
-        super().__init__()
+        super().__init__(name="Learner")
         self.learn_q = learn_q
         self.X_tail: Optional[pd.DataFrame] = None
         self.close_tail: Optional[pd.Series] = None
@@ -239,21 +234,17 @@ class OnlineLearnWorker(threading.Thread):
         self.last_trigger_bars = 0
         self.last_promo_bars = 0
         self.ol = OnlineLearner(out_model_name=LIVE_OUT_NAME)
-        self.name = "Learner"
-
     def run(self):
         logger.info("온라인 학습 워커 시작됨")
         while True:
             pkt = self.learn_q.get()
 
-            # ---- (A) Trader → 온라인 롤아웃 패킷 처리 ----
-            # 필수 키가 있으면 rollout으로 간주
+            # ---- (A) Trader → rollout 온라인 업데이트 ----
             if isinstance(pkt, dict) and {"obs", "actions", "rewards", "dones", "values", "log_probs"} <= set(pkt.keys()):
                 try:
                     improved = self.ol.update_from_rollout(
                         pkt,
                         max_kl=0.02, epochs=1, batch_size=1024, lr=5e-5,
-                        # (옵션) 최근 꼬리로 짧은 VAL도 할 수 있음
                         X_val=self.X_tail.iloc[-3000:] if isinstance(self.X_tail, pd.DataFrame) and len(self.X_tail) >= 3000 else None,
                         close_val=self.close_tail.iloc[-3000:] if isinstance(self.close_tail, pd.Series) and len(self.close_tail) >= 3000 else None,
                         funding_val=self.funding_tail.iloc[-3000:] if isinstance(self.funding_tail, pd.Series) and len(self.funding_tail) >= 3000 else None,
@@ -265,27 +256,26 @@ class OnlineLearnWorker(threading.Thread):
                         logger.info("ℹ️ 온라인 업데이트 미적용(KL 초과/조건 미충족)")
                 except Exception as e:
                     logger.error(f"온라인 업데이트 실패: {e}", exc_info=True)
-                continue  # 다음 루프
+                continue
 
-            # ---- (B) Ingest → 오프라인 미세학습 패킷 처리 ----
-            X: pd.DataFrame = pkt["X"]
+            # ---- (B) Ingest → 최근 꼬리 적재 및 주기적 미세조정 ----
+            X_5m: pd.DataFrame = pkt.get("X_5m") or pkt.get("X")  # 호환
             close: pd.Series = pkt["close"]
-            funding: Optional[pd.Series] = pkt.get("funding")  # 있을 경우 사용
+            funding: Optional[pd.Series] = pkt.get("funding")
 
+            # 5m 기준 꼬리만 보관(학습 분포 안정)
             want_tail = max(MIN_BUFFER_BARS + TRIGGER_EVERY_BARS + 5000, 30000)
-            X = X.iloc[-want_tail:].copy()
-            close = close.reindex(X.index).ffill().bfill()
+            X_5m = X_5m.iloc[-want_tail:].copy()
+            close = close.reindex(X_5m.index).ffill().bfill()
             if funding is not None:
-                funding = funding.reindex(X.index).ffill().bfill()
+                funding = funding.reindex(X_5m.index).ffill().bfill()
 
-            self.X_tail = X
+            self.X_tail = X_5m
             self.close_tail = close
             self.funding_tail = funding
-            self.bars_seen = len(X)
+            self.bars_seen = len(X_5m)
 
-            # 트리거 & 쿨다운
             if (self.bars_seen >= MIN_BUFFER_BARS) and (self.bars_seen - self.last_trigger_bars >= TRIGGER_EVERY_BARS):
-                # 승격 쿨다운 체크
                 if (self.bars_seen - self.last_promo_bars) < PROMO_COOLDOWN_BARS:
                     remain = PROMO_COOLDOWN_BARS - (self.bars_seen - self.last_promo_bars)
                     logger.info(f"쿨다운 중: {remain} bars 남음 — 미세학습 스킵")
@@ -303,33 +293,32 @@ class OnlineLearnWorker(threading.Thread):
                 except Exception as e:
                     logger.error(f"미세조정 실패: {e}", exc_info=True)
 
+# =========================
+# 텔레그램 봇 런너
+# =========================
 class TelegramBotRunner(threading.Thread):
     daemon = True
     def __init__(self, bot_path: Path):
         super().__init__(name="TgBot")
         self.bot_path = str(bot_path)
         self.proc: Optional[subprocess.Popen] = None
-
     def run(self):
         logger.info(f"텔레그램 봇 감시 시작: {self.bot_path}")
         log_path = LOGS_DIR / "telegram_bot.log"
         while True:
             try:
-                # .env는 telegram_bot.py가 자체적으로 load_dotenv() 호출
-                # 봇의 에러 로그만 telegram_bot.log 파일에 기록
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(f"\n===== BOT RESTARTING AT {datetime.now().isoformat()} =====\n")
                     self.proc = subprocess.Popen(
                         [sys.executable, self.bot_path],
                         cwd=str(BASE_DIR),
-                        stdout=subprocess.DEVNULL, # 표준 출력은 버림
-                        stderr=f # 표준 에러만 파일에 기록
+                        stdout=subprocess.DEVNULL,
+                        stderr=f
                     )
-                    self.proc.wait() # 프로세스가 끝날 때까지 대기
+                    self.proc.wait()
             except Exception as e:
                 logger.error(f"텔레그램 봇 프로세스 오류: {e}", exc_info=True)
             finally:
-                # 비정상 종료 시 재시작 딜레이
                 logger.info("텔레그램 봇 재시작 대기 중...")
                 time.sleep(3)
 
@@ -346,41 +335,36 @@ def main():
     trader_q = Queue(maxsize=TRADER_QUEUE_MAX)
     learn_q  = Queue(maxsize=LEARN_QUEUE_MAX)
 
-    ingest = RealtimeIngest(ingest_q)
+    ingest = RealtimeIngest(ingest_q)  # MTF 인제스터(5m 확정+MTF 피처)
     trader = None
     if ENABLE_TRADING:
         trader = Trader(
             mode=TRADING_MODE,
             q=trader_q,
-            api_key=BINANCE_API_KEY,
-            secret_key=BINANCE_SECRET_KEY
+            api_key=os.getenv('BINANCE_API_KEY'),
+            secret_key=os.getenv('BINANCE_SECRET_KEY')
         )
-        # 온라인 학습 연결(Trader가 롤아웃을 직접 learn_q로 보낼 수 있도록)
         try:
-            setattr(trader, "learn_q", learn_q)
+            setattr(trader, "learn_q", learn_q)  # Trader → Learner rollout 전달
         except Exception:
             pass
 
-    disp = Dispatcher(ingest_q, trader_q if ENABLE_TRADING else Queue(1), learn_q if ENABLE_ONLINE_LEARNING else Queue(1))
-    learn_worker = None
-    if ENABLE_ONLINE_LEARNING:
-        learn_worker = OnlineLearnWorker(learn_q)
-    reloader = None
-    if ENABLE_TRADING and ENABLE_ONLINE_LEARNING:
-        reloader = TraderReloader(trader, str(LIVE_OUT_PATH))
+    disp = Dispatcher(ingest_q, trader_q if ENABLE_TRADING else Queue(1),
+                      learn_q if ENABLE_ONLINE_LEARNING else Queue(1))
 
-    ingest_thread = threading.Thread(target=ingest.run, daemon=True, name="Ingest")
-    ingest_thread.start()
+    learn_worker = OnlineLearnWorker(learn_q) if ENABLE_ONLINE_LEARNING else None
+    reloader = TraderReloader(trader, str(LIVE_OUT_PATH)) if (ENABLE_TRADING and ENABLE_ONLINE_LEARNING) else None
+
+    threading.Thread(target=ingest.run, daemon=True, name="Ingest").start()
     disp.start()
     if ENABLE_TRADING:
-        trader_thread = threading.Thread(target=trader.run, daemon=True, name="Trader")
-        trader_thread.start()
+        threading.Thread(target=trader.run, daemon=True, name="Trader").start()
     if ENABLE_ONLINE_LEARNING:
         learn_worker.start()
     if reloader:
         reloader.start()
 
-    # === 텔레그램 봇 시작 ===
+    # 텔레그램 봇 (live 모드에서는 비활성 권장)
     tg_runner = None
     if ENABLE_TELEGRAM_BOT and TRADING_MODE != "live" and TELEGRAM_BOT_PATH.exists():
         if not os.getenv("TELEGRAM_BOT_TOKEN"):
@@ -401,7 +385,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("사용자에 의해 중지됨")
     finally:
-        # 자식 텔레그램 프로세스 정리(있다면)
         try:
             if tg_runner and tg_runner.proc and tg_runner.proc.poll() is None:
                 tg_runner.proc.terminate()
