@@ -3,26 +3,29 @@ from collections import deque
 from typing import List
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-# ====== .env 로드 ======
-load_dotenv()
+# ====== .env 로드 (dotenv_values 방식으로 안전하게 읽기) ======
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+cfg = dotenv_values(ENV_PATH)
+
+TOKEN = (cfg.get("TELEGRAM_BOT_TOKEN") or "").strip()
+ALLOWED_IDS = {
+    int(x.strip())
+    for x in (cfg.get("TELEGRAM_ALLOWED_USER_IDS") or "").split(",")
+    if x.strip()
+}
+
+REPORT_PATH = cfg.get("REPORT_PATH", "./data/reports/trading_report.md")
+TRADELOG_PATH = cfg.get("TRADELOG_PATH", "./data/logs/run_log.csv")
+MAX_MSG = 4000  # 텔레그램 메시지 길이 한계 안전선
 
 # ====== 로거 설정 ======
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logging.getLogger("httpx").setLevel(logging.WARNING)  # HTTPX 로거 레벨 조정
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# ====== 설정 ======
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_IDS = {
-    int(x.strip()) for x in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if x.strip()
-}
 logger.info(f"Loaded ALLOWED_IDS: {ALLOWED_IDS}")
-
-REPORT_PATH = os.getenv("REPORT_PATH", "./data/reports/trading_report.md")
-TRADELOG_PATH = os.getenv("TRADELOG_PATH", "./data/logs/run_log.csv")
-MAX_MSG = 4000  # 텔레그램 메시지 길이 한계 안전선
 
 # ====== 유틸 ======
 def _authorized(update: Update) -> bool:
@@ -59,7 +62,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Trading Bot Ready.\n"
         "명령어:\n"
         "  /whoami  — 내 user id 확인\n"
-        "  /reports — trading_report.md 내용 보기(길면 문서로 전송)\n"
+        "  /reports — trading_report.md 내용 보기 (텍스트)\n"
         "  /reportfile — trading_report.md 파일 전송\n"
         "  /log [N] — run_log.csv 최근 N줄(기본 50줄)\n"
         "  /logfile — run_log.csv 파일 전송\n"
@@ -77,15 +80,14 @@ async def reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(REPORT_PATH):
         await _send_text(update, context, f"[ERR] report not found: {REPORT_PATH}")
         return
-    size = os.path.getsize(REPORT_PATH)
-    if size > 3000:  # 길면 파일로 전송
-        await update.message.reply_document(InputFile(REPORT_PATH, filename=os.path.basename(REPORT_PATH)))
-        return
+
     with open(REPORT_PATH, "r", encoding="utf-8") as f:
         txt = f.read().strip()
+
     if not txt:
         await _send_text(update, context, "[INFO] report is empty.")
     else:
+        # 길더라도 무조건 텍스트로 쪼개서 전송
         await _send_text(update, context, txt)
 
 async def reportfile(update: Update, context: ContextTypes.DEFAULT_TYPE):

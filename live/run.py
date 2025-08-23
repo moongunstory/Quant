@@ -294,7 +294,7 @@ class OnlineLearnWorker(threading.Thread):
                     logger.error(f"미세조정 실패: {e}", exc_info=True)
 
 # =========================
-# 텔레그램 봇 런너
+# 텔레그램 봇 러너
 # =========================
 class TelegramBotRunner(threading.Thread):
     daemon = True

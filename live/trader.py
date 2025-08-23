@@ -102,28 +102,40 @@ class Trader:
             print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
 
         # === Scaler & feature list (훈련 분포 정합) ===
-        # 1) 단일 파일 우선
-        scaler_path_single = os.path.join(PROC_DIR, "scaler.joblib")
-        feats_path_single  = os.path.join(PROC_DIR, "feature_list.json")
-        # 2) 없으면 5m 전용으로 대체
-        scaler_path_5m = os.path.join(PROC_DIR, "scaler_5m.joblib")
-        feats_path_5m  = os.path.join(PROC_DIR, "fe_feature_list_5m.json")
+        # Manager/Worker 모델에 필요한 모든 피처 리스트를 직접 로드하여 통합
+        self.feature_list = []
+        self.worker_feature_list = []
+        timeframes = ["5m", "15m", "1h", "4h"]  # 필요한 타임프레임
+        
+        print("[트레이더] Loading feature lists...")
+        for tf in timeframes:
+            feats_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
+            if os.path.exists(feats_path):
+                with open(feats_path, "r") as f:
+                    feats = json.load(f)
+                    self.feature_list.extend(feats)
+                    if tf == "5m":
+                        self.worker_feature_list = feats
+                print(f"  - Loaded {os.path.basename(feats_path)} ({len(feats)} features)")
+            else:
+                print(f"  - Warning: {os.path.basename(feats_path)} not found, skipping.")
 
-        if os.path.exists(scaler_path_single) and os.path.exists(feats_path_single):
-            self.scaler = joblib.load(scaler_path_single)
-            with open(feats_path_single, "r") as f:
-                self.feature_list = json.load(f)
-            print("[트레이더] processed/scaler.joblib + feature_list.json 사용")
-        elif os.path.exists(scaler_path_5m) and os.path.exists(feats_path_5m):
-            self.scaler = joblib.load(scaler_path_5m)
-            with open(feats_path_5m, "r") as f:
-                self.feature_list = json.load(f)
-            print("[트레이더] processed/scaler_5m.joblib + fe_feature_list_5m.json 사용")
-        else:
-            raise FileNotFoundError(
-                "Processed artifacts missing: "
-                f"{scaler_path_single} & {feats_path_single} (or {scaler_path_5m} & {feats_path_5m})"
-            )
+        if not self.feature_list:
+            raise FileNotFoundError("No feature lists could be loaded.")
+        if not self.worker_feature_list:
+            raise FileNotFoundError("5m feature list is required for the worker but was not found.")
+
+        # 중복 제거
+        self.feature_list = sorted(list(set(self.feature_list)))
+        print(f"[트레이더] Total unique features loaded: {len(self.feature_list)}")
+
+        # Worker는 5m 스케일러를 사용
+        scaler_path_5m = os.path.join(PROC_DIR, "scaler_5m.joblib")
+        if not os.path.exists(scaler_path_5m):
+            raise FileNotFoundError(f"Required scaler not found: {scaler_path_5m}")
+        
+        self.scaler = joblib.load(scaler_path_5m)
+        print(f"[트레이더] Loaded scaler: {os.path.basename(scaler_path_5m)}")
 
         # === Manager (선택) ===
         self.manager_model: Optional[PPO] = None
@@ -350,7 +362,7 @@ class Trader:
     def _build_worker_obs_from_df(self, X_df: pd.DataFrame, t: int,
                                   manager_dir: int, manager_conf: float, manager_regime: int) -> np.ndarray:
         # 5m 훈련 피처만 역정규화(정확한 열 순서 보장)
-        x_norm = X_df.iloc[t].reindex(self.feature_list).fillna(0.0)
+        x_norm = X_df.iloc[t].reindex(self.worker_feature_list).fillna(0.0)
         x_raw = self.scaler.inverse_transform(np.asarray([x_norm.values], dtype=np.float64))[0].astype(np.float32)
         holding_norm = float(min(self.holding_steps, MAX_HOLDING_STEPS) / MAX_HOLDING_STEPS)
         obs = np.concatenate([
@@ -378,7 +390,7 @@ class Trader:
             # 가장 가까운 과거 시점으로 보정
             t_idx = X5.index[X5.index.get_indexer([t_idx], method="pad")[0]]
         row = X5.loc[t_idx]
-        x_norm = row.reindex(self.feature_list).fillna(0.0)
+        x_norm = row.reindex(self.worker_feature_list).fillna(0.0)
         x_raw = self.scaler.inverse_transform(np.asarray([x_norm.values], dtype=np.float64))[0].astype(np.float32)
         holding_norm = float(min(self.holding_steps, MAX_HOLDING_STEPS) / MAX_HOLDING_STEPS)
         obs = np.concatenate([
