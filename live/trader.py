@@ -129,14 +129,27 @@ class Trader:
         self.manager_model: Optional[PPO] = None
         self.manager_vecnorm: Optional[VecNormalize] = None
         self.W_MGR = 8  # ManagerV2Env.SEQ_WINDOW
+
         if os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH):
             try:
-                tmp_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=(1,), action_space=spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32))])
+                # Manager 관측 차원 추정: (W_MGR × MTF(1h/4h) 피처 수)
+                mgr_cols = [c for c in self.feature_list if c.endswith("_1h") or c.endswith("_4h")]
+                mgr_cols.sort()
+                if len(mgr_cols) == 0:
+                    raise RuntimeError("manager obs columns(1h/4h) not found in feature_list")
+
+                obs_shape_mgr = (self.W_MGR * len(mgr_cols),)
+                # Manager 액션 스페이스는 2차원 실수(Box(2,))로 가정([long_conf, short_conf])
+                act_space_mgr = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+
+                # VecNormalize.load에 필요한 더미 env (shape 정합 중요)
+                tmp_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=obs_shape_mgr, action_space=act_space_mgr)])
                 self.manager_vecnorm = VecNormalize.load(MANAGER_VECNORM_PATH, tmp_env)
                 self.manager_vecnorm.training = False
                 self.manager_vecnorm.norm_reward = False
+
                 self.manager_model = PPO.load(MANAGER_MODEL_PATH, device="cpu")
-                print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)}")
+                print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)} | obs_shape={obs_shape_mgr}, feats={len(mgr_cols)}")
             except Exception as e:
                 print(f"[트레이더] Manager 로드 실패 → 휴리스틱 사용: {e}")
                 self.manager_model = None
@@ -253,29 +266,28 @@ class Trader:
     # -------------------------
     # Manager 신호 생성
     # -------------------------
-    def _manager_goal_df(self, X_row: pd.Series, X_df: pd.DataFrame) -> Tuple[int, float, int]:
+    def _manager_goal(self, X_row: pd.Series, X_df: pd.DataFrame) -> Tuple[int, float, int]:
         """
-        병합형 DataFrame(MTF suffix 포함)에서 Manager 신호 추정.
         반환: (direction {-1,0,1}, confidence 0..1, is_ambiguous {0,1})
+        우선 매니저 모델 사용; 실패 시 휴리스틱.
         """
-        # 모델 시도: _1h/_4h 컬럼만 선별
-        if self.manager_model is not None and self.manager_vecnorm is not None:
+        # 시도 1: 모델
+        if self.manager_model is not None and self.manager_vecnorm is not None and self._mgr_buf is not None:
             try:
-                cand_cols = [c for c in X_df.columns if c.endswith("_1h") or c.endswith("_4h")]
-                cand_cols.sort()
-                if not cand_cols:
-                    raise RuntimeError("no 1h/4h columns for manager obs")
+                # 현재 스텝의 1h/4h 피처만 추출 (훈련시와 동일한 이름/순서)
+                if not set(self.mgr_cols).issubset(X_df.columns):
+                    raise RuntimeError("manager feature columns missing in X")
 
-                xh = X_df[cand_cols].iloc[-1].astype(np.float32).values
-                if self._mgr_buf is None:
-                    self._mgr_buf = np.tile(xh, (self.W_MGR, 1))
-                else:
-                    self._mgr_buf = np.vstack([self._mgr_buf[1:], xh])
+                xh = X_df[self.mgr_cols].iloc[-1].astype(np.float32).values  # (feat_dim_mgr,)
+                # 순환 시퀀스 버퍼 갱신
+                self._mgr_buf = np.vstack([self._mgr_buf[1:], xh])
+                obs_seq = self._mgr_buf.reshape(1, -1).astype(np.float32)   # (1, feat_dim_mgr * W)
 
-                obs_seq = self._mgr_buf.reshape(1, -1).astype(np.float32)
+                # VecNormalize 적용 후 예측
                 norm_obs = self.manager_vecnorm.normalize_obs(obs_seq)
-                act, _ = self.manager_model.predict(norm_obs, deterministic=True)  # [long_conf, short_conf]
+                act, _ = self.manager_model.predict(norm_obs, deterministic=True)  # shape (1,2)
                 long_conf, short_conf = float(act[0][0]), float(act[0][1])
+
                 if max(long_conf, short_conf) < 0.1:
                     direction = 0
                 else:
@@ -286,7 +298,7 @@ class Trader:
             except Exception as e:
                 print(f"[트레이더] Manager 예측 실패 → 휴리스틱 대체: {e}")
 
-        # 휴리스틱
+        # 시도 2: 휴리스틱 (MTF 피처 기반)
         def _safe(col, default=0.0):
             return float(X_row.get(col, default))
 
@@ -299,7 +311,7 @@ class Trader:
         score = (1.8*macd_h1 + 1.2*macd_h4 + 0.6*(rsi_h1/50.0) + 1.0*ret3_h1 + 0.7*ret12_h1)
         direction = 1 if score > 0.0 else (-1 if score < 0.0 else 0)
         conf_raw = abs(score)
-        conf = float(1 - math.exp(-min(5.0, max(0.0, conf_raw)) * 1.2))
+        conf = float(1 - math.exp(-min(5.0, max(0.0, conf_raw)) * 1.2))  # 0..1
         ambiguous = 1 if conf < 0.15 else 0
         return direction, conf, ambiguous
 
