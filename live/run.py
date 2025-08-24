@@ -57,6 +57,7 @@ load_dotenv(dotenv_path=dotenv_path)
 BASE_DIR = Path(__file__).resolve().parent.parent         # ~/ai_binance
 MODEL_DIR = BASE_DIR / "data" / "model"
 LOGS_DIR  = BASE_DIR / "data" / "logs"
+REPORT_DIR = BASE_DIR / "data" / "reports"
 
 ENABLE_TRADING          = True
 TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper 
@@ -330,6 +331,7 @@ def main():
     logger.info("스택 시작 중…")
     logger.info(f"트레이더 모드={TRADING_MODE} | 모델={LIVE_OUT_NAME}")
     os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(REPORT_DIR, exist_ok=True)
 
     ingest_q = Queue(maxsize=INGEST_QUEUE_MAX)
     trader_q = Queue(maxsize=TRADER_QUEUE_MAX)
