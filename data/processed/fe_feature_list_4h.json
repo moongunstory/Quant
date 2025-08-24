@@ -1,19 +1,19 @@
 [
   "HA_R_4h",
-  "hl_spread_4h",
   "HA_H_4h",
+  "hl_spread_4h",
   "HA_C_4h",
   "z_close_48_4h",
   "ret_1_4h",
   "HA_O_4h",
   "HA_TR_4h",
-  "macd_sig_4h",
-  "macd_hist_4h",
   "ret_3_4h",
-  "atr14_4h",
+  "rsi_14_4h",
+  "macd_hist_4h",
+  "macd_sig_4h",
   "macd_4h",
-  "HA_L_4h",
   "vol_z_48_4h",
-  "HA_BC_4h",
-  "rsi_14_4h"
+  "atr14_4h",
+  "HA_L_4h",
+  "HA_BC_4h"
 ]
