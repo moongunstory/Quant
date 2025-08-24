@@ -138,6 +138,25 @@ class Trader:
             try: self.exec = BinanceExecutor(self.api_key, self.secret_key)
             except Exception as e: print(f"[트레이더] 실행 어댑터 초기화 실패: {e}")
 
+        # 초기 리포트 생성
+        report_path = os.path.join(REPORT_DIR, "trading_report.md")
+        initial_report_data = {
+            'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            'initial_capital': INITIAL_CAPITAL,
+            'total_equity': self.eq,
+            'position': "STANDBY",
+            'unrealized_pnl_amount': 0,
+            'unrealized_pnl_percent': 0,
+            'total_trades': 0,
+            'win_rate': 0,
+            'long_trades': 0,
+            'long_win_rate': 0,
+            'short_trades': 0,
+            'short_win_rate': 0,
+            'hold_trades': 0
+        }
+        generate_report(report_path, initial_report_data, is_new_session=True)
+
     def _manager_goal_dict(self, X_dict: Dict[str, pd.DataFrame]) -> Tuple[int, float, int]:
         def _latest(df: Optional[pd.DataFrame], col: str, default: float = 0.0) -> float:
             try: return float(df[col].iloc[-1]) if df is not None and not df.empty and col in df.columns else default
@@ -178,6 +197,45 @@ class Trader:
         if self.pos == 0: return (np.sign(mgr_dir).astype(int), "enter") if raw_action == 1 and mgr_dir != 0 else (0, "wait")
         else: return (0, "exit") if raw_action == 2 else (self.pos, "hold")
 
+    def _generate_current_report(self):
+        report_path = os.path.join(REPORT_DIR, "trading_report.md")
+        
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        long_win_rate = (self.long_wins / self.long_trades * 100) if self.long_trades > 0 else 0
+        short_win_rate = (self.short_wins / self.short_trades * 100) if self.short_trades > 0 else 0
+
+        unrealized_pnl_amount = 0.0
+        unrealized_pnl_percent = 0.0
+        
+        if self.pos != 0 and self.entry_price and self.last_price:
+            leverage = LEVERAGE if self.mode == 'live' else 1.0
+            if self.pos == 1:
+                unrealized_pnl_percent = (self.last_price / self.entry_price - 1.0) * 100.0 * leverage
+            else:
+                unrealized_pnl_percent = (self.entry_price / self.last_price - 1.0) * 100.0 * leverage
+
+        current_pos_str = "STANDBY"
+        if self.pos == 1: current_pos_str = "LONG"
+        if self.pos == -1: current_pos_str = "SHORT"
+
+        report_data = {
+            'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            'initial_capital': INITIAL_CAPITAL,
+            'total_equity': self.eq,
+            'position': current_pos_str,
+            'unrealized_pnl_amount': self.eq - INITIAL_CAPITAL, # 총 실현/미실현 손익 표시
+            'unrealized_pnl_percent': unrealized_pnl_percent,
+            'total_trades': self.total_trades,
+            'win_rate': win_rate,
+            'long_trades': self.long_trades,
+            'long_win_rate': long_win_rate,
+            'short_trades': self.short_trades,
+            'short_win_rate': short_win_rate,
+            'hold_trades': 0
+        }
+        
+        generate_report(report_path, report_data, is_new_session=False)
+
     @torch.no_grad()
     def run(self):
         print("[트레이더] HRL 모드 실행 중... (큐 수신 대기)")
@@ -213,9 +271,10 @@ class Trader:
                 if desired != 0: self._open(desired, p1, ts)
 
             self.global_steps += 1
-            if self.global_steps % 12 == 0:
-                pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-                print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {int(action)}->{why}")
+            # 5분마다 로그 및 리포트 생성
+            pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
+            print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {int(action)}->{why}")
+            self._generate_current_report()
 
     def _calc_order_qty(self, price: float) -> float:
         '''
@@ -239,12 +298,37 @@ class Trader:
         self.pos, self.entry_price, self.entry_time, self.holding_steps = side, px, ts, 0
         if self.mode == "live" and self.exec: self.exec.entry_with_stop(symbol=SYMBOL, side=("BUY" if side == 1 else "SELL"), quantity=self._calc_order_qty(px), last_price=px, sl_rate=0.03)
 
+        # 매매 로그 기록
+        log_path = os.path.join(LOG_DIR, "run_log.csv")
+        trade_info = {
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "ENTER",
+            "position": "LONG" if side == 1 else "SHORT",
+            "price": f"{px:,.4f}",
+        }
+        update_trade_log(log_path, trade_info)
+
     def _close(self, price: float, ts: pd.Timestamp):
         if self.pos == 0: return
         px = price * (1 - SLIPPAGE if self.pos == 1 else 1 + SLIPPAGE)
         pnl_pct = (px / self.entry_price - 1) if self.pos == 1 else (self.entry_price / px - 1)
         self.eq += self.eq * pnl_pct - self.eq * COMMISSION_SIDE
         self.total_trades += 1; self.winning_trades += 1 if pnl_pct > 0 else 0
+        
+        duration_sec = (ts - self.entry_time).total_seconds() if self.entry_time else 0
+        
+        # 매매 로그 기록
+        log_path = os.path.join(LOG_DIR, "run_log.csv")
+        trade_info = {
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "EXIT",
+            "position": "LONG" if self.pos == 1 else "SHORT",
+            "price": f"{px:,.4f}",
+            "profit": f"{pnl_pct * 100:.2f}%",
+            "duration": f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
+        }
+        update_trade_log(log_path, trade_info)
+
         if self.pos == 1: self.long_trades+=1; self.long_wins += 1 if pnl_pct > 0 else 0
         else: self.short_trades+=1; self.short_wins += 1 if pnl_pct > 0 else 0
         self.pos = 0
