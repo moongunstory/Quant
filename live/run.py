@@ -40,7 +40,7 @@ PPO.load = _ppo_load_safe  # 전역 패치
 
 # --- 내부 모듈 경로 ---
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 # ⚠️ MTF 인제스터로 교체
 from ai_binance.live.realtime_ingest import RealtimeIngest as RealtimeIngest

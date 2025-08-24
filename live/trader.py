@@ -18,6 +18,12 @@ import pandas as pd
 import torch
 from queue import Queue, Empty
 
+import sys
+import os
+
+# Ensure ai_binance is in sys.path for model loading
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
