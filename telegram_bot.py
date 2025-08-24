@@ -16,7 +16,7 @@ ALLOWED_IDS = {
     if x.strip()
 }
 
-REPORT_PATH = cfg.get("REPORT_PATH", "./data/reports/trading_report.md")
+REPORT_PATH = cfg.get("REPORT_PATH", "./data/logs/reports/trading_report.md")
 TRADELOG_PATH = cfg.get("TRADELOG_PATH", "./data/logs/run_log.csv")
 MAX_MSG = 4000  # 텔레그램 메시지 길이 한계 안전선
 

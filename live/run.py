@@ -57,7 +57,7 @@ load_dotenv(dotenv_path=dotenv_path)
 BASE_DIR = Path(__file__).resolve().parent.parent         # ~/ai_binance
 MODEL_DIR = BASE_DIR / "data" / "model"
 LOGS_DIR  = BASE_DIR / "data" / "logs"
-REPORT_DIR = BASE_DIR / "data" / "reports"
+REPORT_DIR = BASE_DIR / "data" / "logs" / "reports"
 
 ENABLE_TRADING          = True
 TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper 

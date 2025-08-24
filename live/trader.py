@@ -31,7 +31,7 @@ from ai_binance.live.execution import BinanceExecutor
 # =====================
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR  = os.path.join(BASE_DIR, "data", "model")
-REPORT_DIR = os.path.join(BASE_DIR, "data", "reports")
+REPORT_DIR = os.path.join(BASE_DIR, "data", "logs", "reports")
 LOG_DIR    = os.path.join(BASE_DIR, "data", "logs")
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
 
