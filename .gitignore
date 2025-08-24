@@ -16,3 +16,7 @@ data/reports/
 data/processed/*
 !data/processed/scaler.joblib
 !data/processed/feature_list.json
+!data/processed/fe_feature_list_5m.json
+!data/processed/fe_feature_list_15m.json
+!data/processed/fe_feature_list_1h.json
+!data/processed/fe_feature_list_4h.json
