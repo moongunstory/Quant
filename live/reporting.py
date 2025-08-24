@@ -65,7 +65,8 @@ def generate_report(report_path: str, report_data: dict, is_new_session: bool) -
 
     content = (
         "\n\n" if is_new_session else ""
-    ) + f"""==================== TRADING REPORT ====================
+    ) + f"""
+==================== TRADING REPORT ====================
 매매 시작 시각 : {report_data.get('session_start_time', '')}
 최근 갱신 시각 : {now_utc}
 
@@ -89,3 +90,5 @@ def generate_report(report_path: str, report_data: dict, is_new_session: bool) -
     mode = "a" if is_new_session else "w"
     with open(report_path, mode, encoding="utf-8") as f:
         f.write(content)
+
+
