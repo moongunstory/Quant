@@ -42,6 +42,7 @@ SLIPPAGE          = 0.0001
 VOL_WIN           = 24
 HYSTERESIS_RATIO  = 0.5
 FEE_BUFFER        = 2 * COMMISSION_SIDE
+LEVERAGE = 5  # 실전 모드에서 사용할 레버리지
 
 def get_phase_config(global_steps: int) -> Dict[str, float]:
     if global_steps < 75_000:      return {"k_sigma": 0.8, "phase": 1}
@@ -51,9 +52,6 @@ def get_phase_config(global_steps: int) -> Dict[str, float]:
 
 INITIAL_CAPITAL  = 100_000.0
 ROLLOUT_STEPS = 4096
-DEFAULT_FIXED_USDT = float(os.getenv("TRADER_FIXED_USDT", "0") or 0)
-DEFAULT_RISK_PCT   = float(os.getenv("TRADER_RISK_PCT", "0") or 0)
-DEFAULT_LEVERAGE   = int(os.getenv("TRADER_LEVERAGE", "0") or 0) or None
 
 MANAGER_MODEL_PATH   = os.path.join(MODEL_DIR, "manager_v2.zip")
 MANAGER_VECNORM_PATH = os.path.join(MODEL_DIR, "manager_v2_vecnorm.pkl")
@@ -219,11 +217,27 @@ class Trader:
                 pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
                 print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {int(action)}->{why}")
 
+    def _calc_order_qty(self, price: float) -> float:
+        '''
+        주문 수량을 계산합니다.
+        - live 모드: 전체 자산에 5배 레버리지를 적용하여 진입합니다.
+        - paper 모드: 레버리지 없이 전체 자산으로 진입합니다.
+        '''
+        leverage_to_use = 1.0
+        if self.mode == "live":
+            leverage_to_use = LEVERAGE
+
+        # 현재 총 자산(equity)을 기반으로 주문 USDT 크기를 결정
+        usdt_size = self.eq * leverage_to_use
+        
+        # USDT 크기를 현재 가격으로 나누어 주문할 코인 수량을 계산
+        return round(usdt_size / price, 6)
+
     def _open(self, side: int, price: float, ts: pd.Timestamp):
         px = price * (1 + SLIPPAGE if side == 1 else 1 - SLIPPAGE)
         self.eq -= self.eq * COMMISSION_SIDE
         self.pos, self.entry_price, self.entry_time, self.holding_steps = side, px, ts, 0
-        if self.mode == "live" and self.exec: self.exec.entry_with_stop(symbol=SYMBOL, side=("BUY" if side == 1 else "SELL"), quantity=self._calc_order_qty(px), last_price=px, sl_rate=0.035)
+        if self.mode == "live" and self.exec: self.exec.entry_with_stop(symbol=SYMBOL, side=("BUY" if side == 1 else "SELL"), quantity=self._calc_order_qty(px), last_price=px, sl_rate=0.03)
 
     def _close(self, price: float, ts: pd.Timestamp):
         if self.pos == 0: return
