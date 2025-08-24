@@ -265,7 +265,7 @@ class OnlineLearnWorker(threading.Thread):
 
             # 5m 기준 꼬리만 보관(학습 분포 안정)
             want_tail = max(MIN_BUFFER_BARS + TRIGGER_EVERY_BARS + 5000, 30000)
-            X_5m = X_5m.iloc[-want_tail:].copy()
+            X_5m = (X_5m.get("X") or X_5m.get("5m")).iloc[-want_tail:].copy()
             close = close.reindex(X_5m.index).ffill().bfill()
             if funding is not None:
                 funding = funding.reindex(X_5m.index).ffill().bfill()

@@ -137,7 +137,7 @@ def main():
     app.add_handler(CommandHandler("reportfile", reportfile))
     app.add_handler(CommandHandler("log", log))
     app.add_handler(CommandHandler("logfile", logfile))
-    app.run_polling(read_timeout=30, close_loop=False)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

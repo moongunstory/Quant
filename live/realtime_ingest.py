@@ -1,23 +1,23 @@
 # ai_binance/live/realtime_ingest.py
 """
-Realtime Ingest (MTF: 5m / 15m / 1h / 4h)
+Realtime Ingest (MTF: 5m / 15m / 1h / 4h + BTC 1h)
+- NEW: fe.py와 동일한 피처 생성 로직 사용.
 - REST 폴링, '확정된' 5m 캔들만 내보냄(WS 미사용).
-- 학습 시와 동일한 피처 생성(5m 기반 → 15m/1h/4h resample).
-- 저장된 scaler/feature_list로 'TF별' 정규화.
-- 각 TF의 정규화 피처를 5m 인덱스에 as-of(=ffill) 정렬하여 내보냄.
-- 8h 펀딩 이벤트를 5m 단위로 균등 분배(rate/96)하여 per-bar 시리즈 제공.
+- 학습 시와 동일한 '원시 피처' 생성 (정규화 X).
+- 5m 기반 → 15m/1h/4h resample, BTC 1h 별도 fetch.
+- 각 TF의 원시 피처를 5m 인덱스에 as-of(=ffill) 정렬하여 내보냄.
 
 Queue로 푸시되는 packet 스키마:
 {
     "X": {
-        "5m":  DataFrame(normalized features; index=5m UTC),
-        "15m": DataFrame(normalized features; index=5m UTC, asof-aligned),
-        "1h":  DataFrame(normalized features; index=5m UTC, asof-aligned),
-        "4h":  DataFrame(normalized features; index=5m UTC, asof-aligned),
+        "5m":    DataFrame(raw features; index=5m UTC),
+        "15m":   DataFrame(raw features; index=5m UTC, asof-aligned),
+        "1h":    DataFrame(raw features; index=5m UTC, asof-aligned),
+        "4h":    DataFrame(raw features; index=5m UTC, asof-aligned),
+        "btc1h": DataFrame(raw features; index=5m UTC, asof-aligned),
     },
     "close": Series(float) aligned to 5m index (ETHUSDT 5m 종가),
     "funding": Series(float) aligned to 5m index (rate/96 per 5m),
-    "funding_rate": float,       # 최신 5m 바의 분배 단위
     "ts": Timestamp(UTC)         # 최신 확정봉의 Open_time
 }
 """
@@ -32,58 +32,45 @@ from queue import Queue
 import numpy as np
 import pandas as pd
 import requests
-import joblib
 
 # =====================
 # 설정
 # =====================
 SYMBOL = "ETHUSDT"
+SYMBOL_BTC = "BTCUSDT"
 BASE_URL = "https://fapi.binance.com"
 KLINES_EP = "/fapi/v1/klines"
 FUNDING_EP = "/fapi/v1/fundingRate"
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # ~/ai_binance
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR = os.path.join(BASE_DIR, "data", "processed")
 
 POLL_SEC = 2.0
-BACKFILL_LIMIT = 1500                # ~5.2일 (5m)
+BACKFILL_LIMIT = 1500
 REQ_TIMEOUT = 15
 MAX_RETRY = 5
 RETRY_SLEEP = 1.0
+FUNDING_SPLIT = 96
 
-FUNDING_SPLIT = 96                   # 8h / 5m
-
-TF_RULES = {
-    "5m": "5min",
-    "15m": "15min",
-    "1h": "1h",
-    "4h": "4h",
-}
+TF_RULES = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
 
 # =====================
 # HTTP
 # =====================
 _session = requests.Session()
 
-def _now_ms() -> int:
-    return int(pd.Timestamp.utcnow().timestamp() * 1000)
-
-def _is_closed_bar(close_time_ms: int) -> bool:
-    # 클로즈 타임 + 1초 버퍼 <= 현재
-    return close_time_ms <= _now_ms() - 1000
+def _now_ms() -> int: return int(pd.Timestamp.utcnow().timestamp() * 1000)
+def _is_closed_bar(close_time_ms: int) -> bool: return close_time_ms <= _now_ms() - 1000
 
 def _get(url: str, params: Dict) -> dict | list:
-    tries = 0
-    while True:
+    for _ in range(MAX_RETRY):
         try:
             r = _session.get(url, params=params, timeout=REQ_TIMEOUT)
             r.raise_for_status()
             return r.json()
         except Exception:
-            tries += 1
-            if tries >= MAX_RETRY:
-                raise
             time.sleep(RETRY_SLEEP)
+    raise ConnectionError(f"Failed to fetch {url} after {MAX_RETRY} retries")
 
 def _fetch_klines(symbol: str, interval: str, limit: int) -> list:
     return _get(BASE_URL + KLINES_EP, {"symbol": symbol, "interval": interval, "limit": limit})
@@ -95,306 +82,181 @@ def _fetch_funding(symbol: str, limit: int = 200) -> list:
 # 변환
 # =====================
 def _klines_to_df(rows: list) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
-    cols = [
-        "Open_time","Open","High","Low","Close","Volume","Close_time",
-        "Quote_asset_volume","Number_of_trades","Taker_buy_base",
-        "Taker_buy_quote","Ignore"
-    ]
+    if not rows: return pd.DataFrame()
+    cols = ["Open_time","Open","High","Low","Close","Volume","Close_time","Quote_asset_volume","Number_of_trades","Taker_buy_base","Taker_buy_quote","Ignore"]
     df = pd.DataFrame(rows, columns=cols)
     df["Open_time"] = pd.to_datetime(df["Open_time"], unit="ms", utc=True)
-    df["Close_time"] = pd.to_datetime(df["Close_time"], unit="ms", utc=True)
     df = df.set_index("Open_time").sort_index()
-    for c in ["Open","High","Low","Close","Volume","Quote_asset_volume","Taker_buy_base","Taker_buy_quote"]:
+    for c in ["Open","High","Low","Close","Volume","Quote_asset_volume","Taker_buy_base","Taker_buy_quote", "Number_of_trades"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Number_of_trades"] = pd.to_numeric(df["Number_of_trades"], errors="coerce")
-    df = df[~df.index.duplicated(keep="last")]
-    return df
+    df["FundingRate"] = 0.0 # Placeholder for compatibility with fe.py
+    return df[~df.index.duplicated(keep="last")]
 
-def _funding_to_df(rows: list) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=["rate"])
-    df = pd.DataFrame(rows)
-    time_key = "fundingTime" if "fundingTime" in df.columns else "funding_time"
-    rate_key = "fundingRate" if "fundingRate" in df.columns else "funding_rate"
-    df["ts"] = pd.to_datetime(pd.to_numeric(df[time_key], errors="coerce").astype("Int64"), unit="ms", utc=True)
-    df["rate"] = pd.to_numeric(df[rate_key], errors="coerce")
-    df = df[["ts","rate"]].dropna()
-    df = df.sort_values("ts").drop_duplicates("ts", keep="last").set_index("ts")
-    return df
+# ===================================================================
+# 피처 생성 (fe.py에서 로직 복사 및 수정)
+# ===================================================================
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"].astype("float64")
+    low  = df["Low"].astype("float64")
+    close= df["Close"].astype("float64")
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-# =====================
-# 피처 생성
-# =====================
-def _indicators(df: pd.DataFrame, itv: str) -> pd.DataFrame:
-    x = df.copy()
-    x[f"ret1_{itv}"]  = x["Close"].pct_change()
-    x[f"ret3_{itv}"]  = x["Close"].pct_change(3)
-    x[f"ret12_{itv}"] = x["Close"].pct_change(12)
-    x[f"hlv_{itv}"]   = (x["High"] - x["Low"]) / x["Close"].replace(0, np.nan)
+def compute_heikin_ashi(df_ohlc: pd.DataFrame) -> pd.DataFrame:
+    if df_ohlc.empty: return pd.DataFrame(index=df_ohlc.index)
+    O, H, L, C = df_ohlc["Open"].values, df_ohlc["High"].values, df_ohlc["Low"].values, df_ohlc["Close"].values
+    n = len(df_ohlc)
+    HA_C = (O + H + L + C) / 4.0
+    HA_O = np.empty(n); HA_O[0] = (O[0] + C[0]) / 2.0
+    for i in range(1, n): HA_O[i] = (HA_O[i-1] + HA_C[i-1]) / 2.0
+    HA_H = np.maximum.reduce([H, HA_O, HA_C])
+    HA_L = np.minimum.reduce([L, HA_O, HA_C])
+    out = pd.DataFrame({"HA_O": HA_O, "HA_H": HA_H, "HA_L": HA_L, "HA_C": HA_C}, index=df_ohlc.index)
+    out["HA_TR"] = out["HA_H"] - out["HA_L"]
+    out["HA_BC"] = out["HA_C"] - out["HA_O"]
+    out["HA_R"]  = out["HA_C"].pct_change().fillna(0.0)
+    return out
 
-    d = x["Close"].diff()
-    up = d.clip(lower=0).rolling(14, min_periods=14).mean()
-    dn = (-d.clip(upper=0)).rolling(14, min_periods=14).mean()
-    rs = up / dn.replace(0, np.nan)
-    x[f"rsi14_{itv}"] = 100 - 100 / (1 + rs)
+def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
+    if win is None: mu, sd = s.mean(), s.std()
+    else: mu, sd = s.rolling(win).mean(), s.rolling(win).std()
+    return ((s - mu) / sd.replace(0, np.nan)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    ema12 = x["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = x["Close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    x[f"macd_{itv}"]      = macd
-    x[f"macd_sig_{itv}"]  = macd_sig
-    x[f"macd_hist_{itv}"] = macd - macd_sig
+def _funding_phase_features(idx: pd.DatetimeIndex) -> pd.DataFrame:
+    steps_since = (idx.hour % 8) * 12 + (idx.minute // 5)
+    phase = 2 * np.pi * (steps_since / 96)
+    out = pd.DataFrame(index=idx)
+    out["time_to_funding_5m"] = (96 - steps_since) % 96
+    out["funding_phase_sin"] = np.sin(phase)
+    out["funding_phase_cos"] = np.cos(phase)
+    return out
 
-    tr = np.maximum(
-        x["High"] - x["Low"],
-        np.maximum((x["High"] - x["Close"].shift()).abs(), (x["Low"] - x["Close"].shift()).abs())
-    )
-    x[f"atr14_{itv}"] = tr.rolling(14, min_periods=14).mean()
+def compute_features_for_tf(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    df = df.sort_index()
+    out = pd.DataFrame(index=df.index)
+    
+    if interval == "btc1h":
+        close = df["Close"].astype("float64")
+        out["ret_1h"] = close.pct_change()
+        out["ret_4h"] = close.pct_change(4)
+        out["atr14"]  = _atr(df, period=14)
+        ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
+        out = pd.concat([out, ha], axis=1)
+    else: # ETH Timeframes
+        close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+        out["ret_1"] = close.pct_change()
+        out["ret_3"] = close.pct_change(3)
+        out["z_close_48"] = zscore(close, win=48)
+        out["hl_spread"] = (high - low) / close
+        out["vol_z_48"] = zscore(volume, win=48)
+        ema_12 = close.ewm(span=12, adjust=False).mean()
+        ema_26 = close.ewm(span=26, adjust=False).mean()
+        out["macd"] = ema_12 - ema_26
+        out["macd_sig"] = out["macd"].ewm(span=9, adjust=False).mean()
+        out["macd_hist"] = out["macd"] - out["macd_sig"]
+        delta = close.diff()
+        up, down = delta.clip(lower=0), (-delta).clip(lower=0)
+        roll_up = up.ewm(alpha=1/14, adjust=False).mean()
+        roll_down = down.ewm(alpha=1/14, adjust=False).mean()
+        out["rsi_14"] = 100 - (100 / (1 + roll_up / roll_down.replace(0, np.nan))).fillna(50)
+        out["atr14"] = _atr(df, period=14)
+        ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
+        out = pd.concat([out, ha], axis=1)
+        if interval == "5m":
+            out['hour_sin'], out['hour_cos'] = np.sin(2*np.pi*df.index.hour/24), np.cos(2*np.pi*df.index.hour/24)
+            out['day_sin'], out['day_cos'] = np.sin(2*np.pi*df.index.dayofweek/7), np.cos(2*np.pi*df.index.dayofweek/7)
+            out = pd.concat([out, _funding_phase_features(out.index)], axis=1)
+            out["is_funding_settle"] = (((df.index.hour % 8 == 0) & (df.index.minute == 0))).astype("int8")
+            out["funding_z_48"] = zscore(df["FundingRate"], win=48)
 
-    ma20 = x["Close"].rolling(20, min_periods=20).mean()
-    sd20 = x["Close"].rolling(20, min_periods=20).std()
-    x[f"bb_mid_{itv}"] = ma20
-    x[f"bb_up_{itv}"]  = ma20 + 2 * sd20
-    x[f"bb_dn_{itv}"]  = ma20 - 2 * sd20
-    return x
-
-def _normalize(df_feat: pd.DataFrame, scaler, feature_cols: List[str]) -> pd.DataFrame:
-    X = df_feat.select_dtypes(include=["float64","float32","int64","int32"]).copy()
-    # 누락 컬럼 0으로 채우고 순서 정렬
-    for c in feature_cols:
-        if c not in X.columns:
-            X[c] = 0.0
-    X = X[feature_cols]
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    arr = scaler.transform(X.values)
-    return pd.DataFrame(arr, index=df_feat.index, columns=feature_cols)
-
-# =====================
-# 펀딩 8h → 5m 균등 분배
-# =====================
-def _distribute_funding_to_5m(index_5m: pd.DatetimeIndex, funding_df: pd.DataFrame) -> pd.Series:
-    """
-    funding_df: index=funding event time(UTC), column 'rate'
-    반환: per-bar funding rate share (rate / 96), index=index_5m
-    룰: 이벤트 시각 t_i 의 rate_i 는 구간 (t_{i-1}, t_i] 에 균등 분배.
-        마지막 이벤트 이후 구간은 마지막 rate로 유지.
-    """
-    s = pd.Series(0.0, index=index_5m, dtype=float)
-    if index_5m.empty:
-        return s
-    if funding_df is None or funding_df.empty:
-        return s
-
-    events = funding_df.sort_index()
-    events = events.loc[events.index <= index_5m[-1]]
-    if events.empty:
-        return s
-
-    prev_time = index_5m[0] - pd.Timedelta(minutes=5)  # 경계 보정
-    prev_rate = float(events.iloc[0]["rate"])
-    for t_event, row in events.iterrows():
-        rate = float(row["rate"])
-        mask = (index_5m > prev_time) & (index_5m <= t_event)
-        if mask.any():
-            s.loc[mask] = rate / FUNDING_SPLIT
-        prev_time = t_event
-        prev_rate = rate
-
-    # 마지막 이벤트 이후
-    tail_mask = (index_5m > prev_time)
-    if tail_mask.any():
-        s.loc[tail_mask] = prev_rate / FUNDING_SPLIT
-
-    return s
+    out.columns = [f"{c}_{interval}" for c in out.columns]
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 # =====================
 # Realtime Ingestor
 # =====================
 class RealtimeIngest:
-    """
-    run() 호출 시, 확정된 최신 5m 캔들이 생길 때마다 Queue로 패킷 푸시.
-
-    packet = {
-        "X": {
-            "5m":  DataFrame(normalized features; index=5m),
-            "15m": DataFrame(normalized features; index=5m, asof-aligned),
-            "1h":  DataFrame(normalized features; index=5m, asof-aligned),
-            "4h":  DataFrame(normalized features; index=5m, asof-aligned),
-        },
-        "close": close_series(5m 기준),
-        "funding": funding_series_5m,   # rate/96
-        "funding_rate": float,          # 최신 5m 바의 분배 단위
-        "ts": Timestamp(UTC)            # 최신 확정봉의 Open_time
-    }
-    """
-    TF_RULES = TF_RULES
-
     def __init__(self, out_queue: Queue, symbol: str = SYMBOL):
         self.q = out_queue
         self.symbol = symbol
-
-        # TF별 스케일러/피처 로드 (존재하는 TF만 사용)
-        self.scalers: Dict[str, object] = {}
         self.features: Dict[str, List[str]] = {}
-        self.tf_used: List[str] = []
-        for tf in self.TF_RULES.keys():
-            scaler_path = os.path.join(PROC_DIR, f"scaler_{tf}.joblib")
+        for tf in TF_RULES.keys():
             feats_path  = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
-            if os.path.exists(scaler_path) and os.path.exists(feats_path):
-                self.scalers[tf] = joblib.load(scaler_path)
-                with open(feats_path, "r", encoding="utf-8") as f:
-                    self.features[tf] = json.load(f)
-                self.tf_used.append(tf)
-
-        if "5m" not in self.tf_used:
-            raise FileNotFoundError(
-                f"[ingest] 최소 5m 아티팩트가 필요합니다: {os.path.join(PROC_DIR, 'scaler_5m.joblib')} & "
-                f"{os.path.join(PROC_DIR, 'fe_feature_list_5m.json')}"
-            )
-        if len(self.tf_used) < len(self.TF_RULES):
-            missing = [tf for tf in self.TF_RULES if tf not in self.tf_used]
-            print(f"[ingest] 경고: 다음 TF 아티팩트가 없어 제외됩니다 → {missing}")
-
-        # 초기 백필 (5m only → 상위 TF는 resample)
+            if os.path.exists(feats_path):
+                with open(feats_path, "r", encoding="utf-8") as f: self.features[tf] = json.load(f)
+            else: raise FileNotFoundError(f"[ingest] 피처 리스트 파일 누락: {feats_path}")
+        
         self.df5m = self._backfill_5m()
-        self.funding_df = self._backfill_funding()
+        self.df_btc1h = self._backfill_btc()
 
-    # ----- Backfill -----
     def _backfill_5m(self) -> pd.DataFrame:
-        rows = _fetch_klines(self.symbol, "5m", BACKFILL_LIMIT)
-        df = _klines_to_df(rows)
-        if df.empty:
-            raise RuntimeError("초기 5m 캔들 로드 실패")
-        return df
+        return _klines_to_df(_fetch_klines(self.symbol, "5m", BACKFILL_LIMIT))
+    def _backfill_btc(self) -> pd.DataFrame:
+        return _klines_to_df(_fetch_klines(SYMBOL_BTC, "1h", BACKFILL_LIMIT))
 
-    def _backfill_funding(self) -> pd.DataFrame:
-        try:
-            rows = _fetch_funding(self.symbol, limit=200)
-            return _funding_to_df(rows)
-        except Exception as e:
-            print(f"[ingest] funding backfill fail: {e}")
-            return pd.DataFrame(columns=["rate"])
-
-    def _refresh_funding(self) -> None:
-        try:
-            rows = _fetch_funding(self.symbol, limit=50)
-            df_new = _funding_to_df(rows)
-            if not df_new.empty:
-                self.funding_df = (
-                    pd.concat([self.funding_df, df_new])
-                    .sort_index()
-                    .drop_duplicates(keep="last")
-                ).iloc[-400:]
-        except Exception as e:
-            print(f"[ingest] funding refresh warn: {e}")
-
-    # ----- Feature Build -----
-    def _build_features(self, df5: pd.DataFrame) -> dict[str, pd.DataFrame]:
-        """
-        TF별 indicator 생성 + 정규화 + 5m 인덱스에 as-of 정렬(ffill).
-        반환 DataFrame들은 모두 index=df5.index(5m) 를 가짐.
-        """
+    def _build_features(self, df5: pd.DataFrame, df_btc1h: pd.DataFrame) -> dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
-
-        # 5m
-        feat_5m = _indicators(df5, "5m")
-        X_5m = _normalize(feat_5m, self.scalers["5m"], self.features["5m"])
-        out["5m"] = X_5m
-
         base_index = df5.index
+        
+        # ETH TFs
+        agg = {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
+        for tf, rule in TF_RULES.items():
+            df_tf = df5 if tf == "5m" else df5.resample(rule).agg(agg).dropna()
+            if df_tf.empty: continue
+            feat_tf = compute_features_for_tf(df_tf, tf)
+            out[tf] = feat_tf.reindex(base_index, method="ffill").fillna(0.0)
 
-        # 상위 TF
-        agg = {
-            'Open':'first','High':'max','Low':'min','Close':'last',
-            'Volume':'sum','Quote_asset_volume':'sum',
-            'Number_of_trades':'sum','Taker_buy_base':'sum','Taker_buy_quote':'sum'
-        }
-        for tf, rule in self.TF_RULES.items():
-            if tf == "5m" or tf not in self.tf_used:
-                continue
-            higher = df5.resample(rule).agg(agg).dropna()
-            if higher.empty:
-                # 상위 TF가 아직 시작되지 않은 경우(백필 짧음)
-                out[tf] = pd.DataFrame(0.0, index=base_index, columns=self.features[tf])
-                continue
-
-            feat_h = _indicators(higher, tf)
-            X_h = _normalize(feat_h, self.scalers[tf], self.features[tf])
-
-            # 5m 인덱스로 as-of 정렬: ffill
-            X_h_aligned = X_h.reindex(base_index, method="ffill").fillna(0.0)
-            out[tf] = X_h_aligned
-
+        # BTC 1h
+        if df_btc1h is not None and not df_btc1h.empty:
+            feat_btc = compute_features_for_tf(df_btc1h, "btc1h")
+            out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
+        
         return out
 
-    # ----- Emit -----
-    def _emit_if_closed(self) -> Optional[pd.Timestamp]:
-        if self.df5m.empty:
-            return None
+    def _emit(self) -> Optional[pd.Timestamp]:
         latest_open = self.df5m.index[-1]
-        close_ms = int(self.df5m.iloc[-1]["Close_time"].value // 10**6)  # ns→ms
-        if not _is_closed_bar(close_ms):
-            return None
+        if not _is_closed_bar(int(self.df5m.iloc[-1]["Close_time"] // 10**6)): return None
+        
+        X_dict = self._build_features(self.df5m, self.df_btc1h)
+        
+        # Select final features based on JSON lists
+        for tf, feat_list in self.features.items():
+            if tf in X_dict: X_dict[tf] = X_dict[tf][feat_list]
+        
+        # For btc1h, select the 10 features from fe.py
+        if "btc1h" in X_dict:
+            btc_cols = ['ret_1h_btc1h', 'ret_4h_btc1h', 'atr14_btc1h', 'HA_O_btc1h', 'HA_H_btc1h', 'HA_L_btc1h', 'HA_C_btc1h', 'HA_TR_btc1h', 'HA_BC_btc1h', 'HA_R_btc1h']
+            X_dict["btc1h"] = X_dict["btc1h"][btc_cols]
 
-        # TF별 피처(모두 5m 인덱스)
-        X_dict = self._build_features(self.df5m)
-        close = self.df5m["Close"].reindex(X_dict["5m"].index).ffill().bfill()
-
-        # 펀딩 per 5m
-        funding_series = _distribute_funding_to_5m(X_dict["5m"].index, self.funding_df)
-        funding_series = funding_series.reindex(X_dict["5m"].index).fillna(0.0)
-        current_funding = float(funding_series.iloc[-1]) if len(funding_series) else 0.0
-
-        packet = {
-            "X": X_dict,
-            "close": close,
-            "funding": funding_series,
-            "funding_rate": current_funding,
-            "ts": latest_open
-        }
-        # 비차단 push (가득 차 있으면 오래된 것 버림)
+        packet = {"X": X_dict, "close": self.df5m["Close"], "ts": latest_open}
         try:
-            if self.q.full():
-                self.q.get_nowait()
+            if self.q.full(): self.q.get_nowait()
             self.q.put_nowait(packet)
-        except Exception:
-            pass
+        except Exception: pass
         return latest_open
 
-    # ----- Tail fetch -----
-    def _fetch_tail(self) -> None:
-        rows = _fetch_klines(self.symbol, "5m", 200)
-        tail = _klines_to_df(rows)
-        if not tail.empty:
-            merged = pd.concat([self.df5m.iloc[:-200], tail]).sort_index()
-            merged = merged[~merged.index.duplicated(keep="last")]
-            self.df5m = merged
-        # 펀딩 갱신
-        self._refresh_funding()
+    def _fetch_tails(self):
+        # ETH tail
+        tail_eth = _klines_to_df(_fetch_klines(self.symbol, "5m", 200))
+        if not tail_eth.empty: self.df5m = pd.concat([self.df5m, tail_eth]).groupby(level=0).last()
+        # BTC tail
+        tail_btc = _klines_to_df(_fetch_klines(SYMBOL_BTC, "1h", 50))
+        if not tail_btc.empty: self.df_btc1h = pd.concat([self.df_btc1h, tail_btc]).groupby(level=0).last()
 
-    # ----- Run -----
     def run(self) -> None:
-        print(f"[ingest] symbol={self.symbol} base_tf=5m | backfill={len(self.df5m)}")
-        last_emitted = self._emit_if_closed()
-        if last_emitted is not None:
-            print(f"[ingest] initial closed bar emitted: {last_emitted}")
+        print(f"[ingest] symbol={self.symbol}, btc_symbol={SYMBOL_BTC} | backfill_eth={len(self.df5m)}, backfill_btc={len(self.df_btc1h)}")
+        last_emitted = self._emit()
+        if last_emitted: print(f"[ingest] initial closed bar emitted: {last_emitted}")
 
         while True:
             try:
-                self._fetch_tail()
-                latest_open = self.df5m.index[-1]
-                if last_emitted is None or latest_open > last_emitted:
-                    em = self._emit_if_closed()
-                    if em is not None:
-                        last_emitted = em
-                        print(f"[ingest] new closed bar emitted: {em}")
+                self._fetch_tails()
+                if last_emitted is None or self.df5m.index[-1] > last_emitted:
+                    emitted_ts = self._emit()
+                    if emitted_ts:
+                        last_emitted = emitted_ts
+                        print(f"[ingest] new closed bar emitted: {emitted_ts}")
                 time.sleep(POLL_SEC)
-            except KeyboardInterrupt:
-                print("[ingest] stopped by user")
-                break
-            except Exception as e:
-                print(f"[ingest] warn: {e}")
-                time.sleep(5.0)
+            except KeyboardInterrupt: print("[ingest] stopped by user"); break
+            except Exception as e: print(f"[ingest] warn: {e}"); time.sleep(5.0)
