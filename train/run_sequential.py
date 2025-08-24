@@ -13,17 +13,17 @@ from train.reinforce import worker
 def run_all_training_steps():
     print("모든 학습 단계를 순차적으로 실행합니다...")
     
-    print("\n1. 데이터 가져오기 (fetch)...")
-    fetch.main()
+    # print("\n1. 데이터 가져오기 (fetch)...")
+    # fetch.main()
     
     print("\n2. 특징 공학 (feature engineering) 실행 (fe)...")
-    fe.main_fe()
+    fe.main()
     
     print("\n3. 매니저 모델 학습 (manager)...")
-    manager.main_manager()
+    manager.train_manager_v2()
     
     print("\n4. 워커 모델 학습 (worker)...")
-    worker.main_worker()
+    worker.run_unified_training_pipeline()
     
     print("\n모든 학습 단계가 완료되었습니다.")
 
