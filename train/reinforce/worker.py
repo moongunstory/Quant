@@ -316,10 +316,11 @@ class _ModelGB(GoalBridge):
             chunk = np.concatenate([pad, chunk], axis=0)
         self._buf[...] = chunk
         
-        obs_seq = self._buf.ravel()
+        obs_seq = self._buf # .ravel()을 제거하여 2D 형태 유지
         
         # IMPORTANT: Normalize the observation before prediction
-        normalized_obs = self.vecnorm.normalize_obs(obs_seq.reshape(1, -1))
+        # 2D 형태에 맞게 reshape
+        normalized_obs = self.vecnorm.normalize_obs(obs_seq.reshape(1, *obs_seq.shape))
         
         # Get [long_conf, short_conf] from the manager and set it in the bridge
         actions, _ = self.model.predict(normalized_obs, deterministic=True)
@@ -406,13 +407,22 @@ def run_unified_training_pipeline():
     Example of how to run the new unified training pipeline.
     """
     import glob
+
+    # --- Absolute Path Search Logic ---
+    # This script's directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Project root is two levels up from .../train/reinforce
+    project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+    # Define the model directory based on the project root
+    model_dir_abs = os.path.join(project_root, 'data', 'model')
     
     print("[HRL] Finding latest manager model...")
-    search_pattern = os.path.join("ai_binance", "**", "manager*.zip")
-    manager_models = glob.glob(search_pattern, recursive=True)
+    # Search within the absolute path of the model directory
+    search_pattern = os.path.join(model_dir_abs, "manager*.zip")
+    manager_models = glob.glob(search_pattern)
     
     if not manager_models:
-        print("[ERROR] No manager model found. Cannot proceed.")
+        print(f"[ERROR] No manager model found in {model_dir_abs}. Cannot proceed.")
         return
 
     latest_manager_path = max(manager_models, key=os.path.getmtime)
