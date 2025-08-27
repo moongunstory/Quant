@@ -122,13 +122,18 @@ class Trader:
         self.manager_model: Optional[PPO] = None
         if os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH):
             try:
+                # For Transformer, obs_shape should be 2D
                 self.mgr_cols = sorted([c for c in self.feature_list if c.endswith("_1h") or c.endswith("_4h")])
-                obs_shape_mgr = (8 * len(self.mgr_cols),)
+                # SEQ_WINDOW from manager.py is 8
+                obs_shape_mgr = (8, len(self.mgr_cols))
                 act_space_mgr = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+                
                 tmp_mgr_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=obs_shape_mgr, action_space=act_space_mgr)])
                 self.manager_vecnorm = VecNormalize.load(MANAGER_VECNORM_PATH, tmp_mgr_env)
                 self.manager_vecnorm.training = False
                 self.manager_vecnorm.norm_reward = False
+
+                # PPO.load will automatically use the correct policy and feature extractor
                 self.manager_model = PPO.load(MANAGER_MODEL_PATH, device="cpu")
                 print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)}")
             except Exception as e:

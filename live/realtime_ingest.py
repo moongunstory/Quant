@@ -89,6 +89,7 @@ def _klines_to_df(rows: list) -> pd.DataFrame:
     df = df.set_index("Open_time").sort_index()
     for c in ["Open","High","Low","Close","Volume","Quote_asset_volume","Taker_buy_base","Taker_buy_quote", "Number_of_trades"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["Close_time"] = pd.to_numeric(df["Close_time"], errors="coerce").astype("Int64")
     df["FundingRate"] = 0.0 # Placeholder for compatibility with fe.py
     return df[~df.index.duplicated(keep="last")]
 
@@ -137,6 +138,10 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     
     if interval == "btc1h":
+        # Pass-through original columns for merging
+        out["Close"] = df["Close"].astype("float64")
+        out["Volume"] = df["Volume"].astype("float64")
+
         close = df["Close"].astype("float64")
         out["ret_1h"] = close.pct_change()
         out["ret_4h"] = close.pct_change(4)
@@ -211,12 +216,42 @@ class RealtimeIngest:
         if df_btc1h is not None and not df_btc1h.empty:
             feat_btc = compute_features_for_tf(df_btc1h, "btc1h")
             out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
-        
+
+            # --- BTC Lead-Lag Feature Integration (for 5m) ---
+            if '5m' in out and not out['5m'].empty:
+                merged_df = pd.merge_asof(
+                    out['5m'].sort_index(),
+                    feat_btc.sort_index(),
+                    left_index=True, right_index=True,
+                    direction="backward",
+                    allow_exact_matches=True,
+                    tolerance=pd.Timedelta("8H"),
+                )
+                
+                # Now, 'Close_btc1h' and 'Volume_btc1h' are available in merged_df
+                btc_close = merged_df["Close_btc1h"].astype(float)
+                btc_vol = merged_df["Volume_btc1h"].astype(float)
+                
+                btc_lead_features = pd.DataFrame(index=out['5m'].index)
+                btc_lead_features["btc_ret_1h"] = btc_close.pct_change()
+                btc_lead_features["btc_vol_z_24"] = zscore(btc_vol, win=24)
+                
+                btc_ema_12 = btc_close.ewm(span=12, adjust=False).mean()
+                btc_ema_26 = btc_close.ewm(span=26, adjust=False).mean()
+                btc_lead_features["btc_macd"] = btc_ema_12 - btc_ema_26
+
+                for lag in range(1, 7):
+                    lagged = btc_lead_features.shift(lag)
+                    lagged.columns = [f"{c}_lag{lag}_5m" for c in lagged.columns]
+                    out['5m'] = pd.concat([out['5m'], lagged], axis=1)
+                out['5m'].fillna(0.0, inplace=True)
+
         return out
 
     def _emit(self) -> Optional[pd.Timestamp]:
         latest_open = self.df5m.index[-1]
-        if not _is_closed_bar(int(self.df5m.iloc[-1]["Close_time"] // 10**6)): return None
+        close_time_ms = int(self.df5m["Close_time"].iloc[-1])
+        if not _is_closed_bar(close_time_ms): return None
         
         X_dict = self._build_features(self.df5m, self.df_btc1h)
         
