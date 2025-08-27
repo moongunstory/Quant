@@ -10,20 +10,22 @@ import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import torch
 import torch.nn as nn
 
 from ai_binance.train.reinforce.common import (
-    MODEL_DIR, build_manager_inputs, GoalBridge,
+    MODEL_DIR, build_manager_inputs,
     M_W1, M_W3, FLIP_PENALTY, TURN_PENALTY
 )
 
 # ===== Knobs =====
 # --- Major ---
 REWARD_SCALE = 5.0
-BRIER_WEIGHT = 1.5  # Weight for the calibration reward (Brier score)
-CONF_DEADZONE = 0.1 # Confidence threshold to determine a neutral direction
+BRIER_WEIGHT = 1.5
+CONF_DEADZONE = 0.1
 
 # --- Minor ---
 ENT_START = 0.01
@@ -32,23 +34,41 @@ ENT_DECAY_STEPS = 100_000
 MAX_EPISODE_STEPS = 4_096
 LOOKAHEAD_H = 3
 SEQ_WINDOW  = 8
-BP_REF = 0.0015 # Reference for future return magnitude
+BP_REF = 0.0015
 
 # === LR schedule ===
 LR_START = 1.5e-4
 LR_END   = 5e-5
 
+# ===== Transformer Feature Extractor =====
+class TransformerFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Feature extractor using a Transformer Encoder.
+    It processes a sequence of observations.
+    """
+    def __init__(self, observation_space: spaces.Box, d_model: int = 128, nhead: int = 4, num_layers: int = 2):
+        # The output dimension of the extractor is d_model
+        super().__init__(observation_space, features_dim=d_model)
+        
+        seq_len, n_features = observation_space.shape
+        
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.positional_encoding = nn.Parameter(torch.randn(1, seq_len, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*2, dropout=0.1, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # observations shape: (batch_size, seq_len, n_features)
+        x = self.input_proj(observations)
+        x = x + self.positional_encoding
+        x = self.transformer_encoder(x)
+        # We take the output of the last time step as the final feature representation
+        return x[:, -1, :]
 
+# ===== Environment =====
 class ManagerV2Env(gym.Env):
     """
-    Manager V2: Outputs separate confidences for long and short.
-    
-    Obs: [X_1h + 4h(ffill) scaled] sequence
-    Act: Box(2,) -> [long_confidence, short_confidence]
-    Reward:
-        - Directional PnL (main driver)
-        - Brier score for confidence calibration
-        - Penalties for flipping decisions or mismatching regime
+    Manager V2 with 2D observation space for Transformer.
     """
     metadata = {"render_modes": []}
 
@@ -65,12 +85,12 @@ class ManagerV2Env(gym.Env):
         self.prev_dir = 0
         self.steps_in_ep = 0
 
-        # ===== sequence buffer =====
         self.W = int(SEQ_WINDOW)
-        feat_dim = self.XH.shape[1]
-        self._buf = np.zeros((self.W, feat_dim), dtype=np.float32)
+        self.feat_dim = self.XH.shape[1]
+        self._buf = np.zeros((self.W, self.feat_dim), dtype=np.float32)
 
-        self.observation_space = spaces.Box(low=-10, high=10, shape=(feat_dim * self.W,), dtype=np.float32)
+        # Observation space is now 2D: (sequence_length, num_features)
+        self.observation_space = spaces.Box(low=-10, high=10, shape=(self.W, self.feat_dim), dtype=np.float32)
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
 
         self.max_ep_steps = MAX_EPISODE_STEPS
@@ -87,7 +107,8 @@ class ManagerV2Env(gym.Env):
         self._buf[...] = chunk
 
     def _obs(self):
-        return self._buf.ravel()
+        # Return the 2D buffer directly, without flattening
+        return self._buf
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -98,20 +119,16 @@ class ManagerV2Env(gym.Env):
         return self._obs(), {}
 
     def step(self, a):
-        # --- Action processing ---
         conf_long, conf_short = a[0], a[1]
 
-        # Determine effective direction with a deadzone
         if max(conf_long, conf_short) < CONF_DEADZONE:
             dir_eff = 0
         else:
             dir_eff = 1 if conf_long > conf_short else -1
         
-        weak = bool(self.regweak.iloc[self.t])
-        if weak: # No trading in weak regimes
+        if bool(self.regweak.iloc[self.t]):
             dir_eff = 0
 
-        # --- Future return for reward calculation ---
         cur  = float(self.price.iloc[self.t])
         nxt1 = float(self.price.iloc[min(self.t + 1, len(self.price) - 1)])
         nxt3 = float(self.price.iloc[min(self.t + 3, len(self.price) - 1)])
@@ -119,59 +136,47 @@ class ManagerV2Env(gym.Env):
         r3 = np.log(max(nxt3, 1e-12) / max(cur, 1e-12))
         r_w = M_W1 * r1 + M_W3 * r3
 
-        # --- Reward components ---
-        # 1. Directional reward
         R_dir  = dir_eff * r_w
-
-        # 2. Calibration reward (Brier Score)
-        #    Penalizes the model for being confident in the wrong direction.
         is_up = 1.0 if r_w > 0 else 0.0
         is_down = 1.0 if r_w < 0 else 0.0
         brier_long = (conf_long - is_up)**2
         brier_short = (conf_short - is_down)**2
         R_cal = -BRIER_WEIGHT * (brier_long + brier_short)
-
-        # 3. Transition penalties
         R_flip = -FLIP_PENALTY * int(dir_eff != self.prev_dir)
         R_mis  = -TURN_PENALTY * int((dir_eff != 0) and (np.sign(dir_eff) != int(self.regsign.iloc[self.t])))
-
-        # --- Total Reward ---
         R = (R_dir + R_cal + R_flip + R_mis) * REWARD_SCALE
 
-        # --- State update ---
         self.prev_dir = dir_eff
         self.t += 1
         self.steps_in_ep += 1
         self._fill_buf()
 
-        # --- Termination ---
-        time_over = (self.t >= len(self.XH) - self.end_guard)
-        horizon_over = (self.steps_in_ep >= MAX_EPISODE_STEPS)
-        terminated = bool(time_over)
-        truncated = bool(not terminated and horizon_over)
+        terminated = bool(self.t >= len(self.XH) - self.end_guard)
+        truncated = bool(not terminated and self.steps_in_ep >= MAX_EPISODE_STEPS)
 
         info = { "dir": dir_eff, "conf_long": conf_long, "conf_short": conf_short, "r_w": r_w, "R_cal": R_cal }
         return self._obs(), float(R), terminated, truncated, info
 
-
+# ===== Training =====
 def lr_schedule(progress_remaining: float) -> float:
     return float(LR_END + (LR_START - LR_END) * progress_remaining)
-
 
 def train_manager_v2(split: str = "train", steps: int = 600_000, seed: int = 42, save_path: str | None = None):
     def make_env():
         return Monitor(ManagerV2Env(split=split))
     env = DummyVecEnv([make_env])
-
     vec = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=0.98)
 
+    # Policy kwargs to use the custom Transformer feature extractor
     policy_kwargs = dict(
-        activation_fn=nn.Tanh,
-        net_arch=dict(pi=[128, 128], vf=[256, 256])  # 리스트 제거
+        features_extractor_class=TransformerFeatureExtractor,
+        features_extractor_kwargs=dict(d_model=128, nhead=4, num_layers=2),
+        net_arch=dict(pi=[128], vf=[128]) # Policy/Value network after feature extraction
     )
     
     model = PPO(
-        "MlpPolicy", vec,
+        "MlpPolicy", # Still MlpPolicy, but it uses our custom features_extractor
+        vec,
         n_steps=2048,
         batch_size=1024,
         n_epochs=10,
@@ -199,9 +204,8 @@ def train_manager_v2(split: str = "train", steps: int = 600_000, seed: int = 42,
     sp = save_path or os.path.join(MODEL_DIR, "manager_v2.zip")
     model.save(sp)
     vec.save(os.path.join(MODEL_DIR, "manager_v2_vecnorm.pkl"))
-    print(f"[OK] Manager V2 saved → {sp}")
+    print(f"[OK] Manager V2 (Transformer) saved → {sp}")
     return sp
-
 
 if __name__ == "__main__":
     train_manager_v2()

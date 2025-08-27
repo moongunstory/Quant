@@ -80,6 +80,7 @@ class TradeEnv(gym.Env):
         self.entry_price: float = 0.0
         self.holding_steps: int = 0
         self.current_dir: int = 0
+        self.step_returns: list[float] = [] # For Sharpe Ratio calculation
 
         # --- Spaces ---
         feat_dim = self.X.shape[1]
@@ -106,9 +107,9 @@ class TradeEnv(gym.Env):
         
         return direction, confidence, is_ambiguous
 
-    def _calculate_pnl(self, exit_time: int) -> Dict[str, float]:
+    def _calculate_metrics(self, exit_time: int) -> Dict[str, float]:
         if not self.in_position or self.entry_time >= exit_time:
-            return dict(pnl=0.0, gross=0.0, fee=0.0, fund=0.0, slip=0.0)
+            return dict(pnl=0.0, gross=0.0, fee=0.0, fund=0.0, slip=0.0, sharpe=0.0)
 
         px_e = self.entry_price                    # 슬립 적용된 진입가(이미)
         px_raw_e = float(self.price.iloc[self.entry_time])  # 원시 진입가
@@ -142,8 +143,17 @@ class TradeEnv(gym.Env):
 
         fee = 2 * self.fee
         pnl = gross - fee + fund
+
+        # Sharpe Ratio Calculation
+        if self.step_returns:
+            mean_return = np.mean(self.step_returns)
+            std_return = np.std(self.step_returns)
+            sharpe = mean_return / (std_return + 1e-9) # Add epsilon to avoid division by zero
+        else:
+            sharpe = 0.0
+
         return dict(pnl=float(pnl), gross=float(gross), fee=float(fee),
-                    fund=float(fund), slip=float(slip_total))
+                    fund=float(fund), slip=float(slip_total), sharpe=float(sharpe))
 
     def _obs(self) -> np.ndarray:
         i = self._cursor
@@ -185,6 +195,7 @@ class TradeEnv(gym.Env):
         self.entry_price = 0.0
         self.holding_steps = 0
         self.current_dir = 0
+        self.step_returns = []
         
         return self._obs(), {}
 
@@ -193,6 +204,9 @@ class TradeEnv(gym.Env):
         reward = 0.0
         info = {}
 
+        # Store previous price for return calculation
+        prev_price = self.price.iloc[self._cursor - 1] if self._cursor > 0 else self.price.iloc[0]
+
         action_is_enter = (a == 1)
         action_is_exit = (a == 2)
         
@@ -200,6 +214,7 @@ class TradeEnv(gym.Env):
             self.in_position = True
             self.entry_time = self._cursor
             self.current_dir, _, _ = self._get_derived_goal(self._cursor)
+            self.step_returns = [] # Reset returns on new entry
 
             # Block entry if manager is neutral
             if self.current_dir == 0:
@@ -216,21 +231,22 @@ class TradeEnv(gym.Env):
             reward = 0.0 # No reward until exit
 
         elif action_is_exit and self.in_position:
-            comps = self._calculate_pnl(self._cursor)
-            reward = comps["pnl"]
+            metrics = self._calculate_metrics(self._cursor)
+            reward = metrics["sharpe"] # Use Sharpe Ratio as reward
             # 메타
             i_start = self.entry_time
             i_end = self._cursor
             info = {
-                'pnl': reward,
+                'pnl': metrics['pnl'],
+                'sharpe': reward,
                 'holding_steps': self.holding_steps,
                 'dir': int(self.current_dir),
                 'entry_ts': str(self.idx[i_start]),
                 'exit_ts': str(self.idx[min(i_end, self.N-1)]),
-                'gross': comps['gross'],
-                'fee': comps['fee'],
-                'fund': comps['fund'],
-                'slip': comps['slip'],
+                'gross': metrics['gross'],
+                'fee': metrics['fee'],
+                'fund': metrics['fund'],
+                'slip': metrics['slip'],
             }
             self.in_position = False
             done = True
@@ -241,24 +257,30 @@ class TradeEnv(gym.Env):
         self._cursor += 1
         if self.in_position:
             self.holding_steps += 1
+            # Calculate and store step return
+            current_price = self.price.iloc[self._cursor -1]
+            step_return = (current_price / prev_price - 1) * self.current_dir
+            self.step_returns.append(step_return)
+
 
         if self._cursor >= self.N - 2:
             done = True
         
         if self.in_position and self.holding_steps >= MAX_HOLDING_STEPS:
-            comps = self._calculate_pnl(self._cursor)
-            reward = comps["pnl"]
+            metrics = self._calculate_metrics(self._cursor)
+            reward = metrics["sharpe"] # Use Sharpe Ratio as reward
             info = {
-                'pnl': reward,
+                'pnl': metrics['pnl'],
+                'sharpe': reward,
                 'holding_steps': self.holding_steps,
                 'forced_exit': True,
                 'dir': int(self.current_dir),
                 'entry_ts': str(self.idx[self.entry_time]),
                 'exit_ts': str(self.idx[min(self._cursor, self.N-1)]),
-                'gross': comps['gross'],
-                'fee': comps['fee'],
-                'fund': comps['fund'],
-                'slip': comps['slip'],
+                'gross': metrics['gross'],
+                'fee': metrics['fee'],
+                'fund': metrics['fund'],
+                'slip': metrics['slip'],
             }
             self.in_position = False
             done = True

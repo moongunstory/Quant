@@ -1,35 +1,30 @@
-# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-5 / TF-specific search & scaler)
+# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-6.4 / Final Fix)
 """
-- NEW (REV-5):
-  * 타임프레임별(5m/15m/1h/4h) 피처검색 + 스케일러 각각 생성/적용.
-  * BTCUSDT 1h 보조 시계열: 경량 지표 + HA, 스케일/피처선택 제외 그대로 저장.
-  * Heikin-Ashi(HA) ETH 전 TF + BTC1h 포함.
+- NEW (REV-6.4):
+  * CRITICAL FIX: f-string 내에 이중 중괄호({{}})가 사용된 치명적 버그 수정.
 
-- Raw in:
-    ./ai_binance/data/raw/fut_{train|val|test}_data_{5m|15m|1h|4h}.parquet
-    ./ai_binance/data/raw/fut_{train|val|test}_data_btc1h.parquet
-- Out:
-    ./ai_binance/data/processed/fe_{train|val|test}_{5m|15m|1h|4h|btc1h}.parquet
-    ./ai_binance/data/processed/fe_feature_list_{5m|15m|1h|4h}.json
-    ./ai_binance/data/processed/scaler_{5m|15m|1h|4h}.joblib
+- NEW (REV-6.3):
+  * WORKAROUND: f-string 포매팅을 .format() 방식으로 변경하여 이례적인 환경 문제에 대응.
+
+- NEW (REV-6.2):
+  * DEBUG: _load_raw 함수에 print 구문을 추가하여 파일 경로 생성 문제를 디버깅.
+
+- NEW (REV-6.1):
+  * BUGFIX: _load_raw 함수에서 val/test 데이터셋의 파일 경로를 잘못 생성하던 오류 수정.
+
+- NEW (REV-6):
+  * BTC 1h 리드-래그(Lead-Lag) 피처 추가.
 """
 
 from __future__ import annotations
 
 import os, json
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import mutual_info_classif
 import joblib
-
-# ===== Optional: LightGBM for model-based feature importance =====
-try:
-    import lightgbm as lgb
-    _HAS_LGB = True
-except Exception:
-    _HAS_LGB = False
 
 # ===== Paths / Constants =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,15 +33,14 @@ OUT_DIR  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "processed"))
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # MTF Setup
-TIMEFRAMES     = ["5m", "15m", "1h", "4h", "btc1h"]  # 처리 대상 전체
-BASE_INTERVAL  = "5m"  # 일부 시간/펀딩 위상 피처는 5m에서만 생성
+TIMEFRAMES     = ["5m", "15m", "1h", "4h", "btc1h"]
+ETH_TIMEFRAMES = ["5m", "15m", "1h", "4h"]
+BASE_INTERVAL  = "5m"
 
 # === TF별 피처검색/스케일 설정 ===
 FEATURE_SEARCH = True
 RANDOM_STATE = 72
-# TF별 TOP-K (필요시 조정)
 TOP_K_PER_TF = {"5m": 128, "15m": 128, "1h": 96, "4h": 64}
-# 검색/스케일 대상 TF (BTC 보조 제외)
 TF_FOR_SEARCH = ["5m", "15m", "1h", "4h"]
 
 # Output path formats
@@ -91,15 +85,14 @@ def _enforce_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _load_raw(split: str, interval: str) -> pd.DataFrame:
-    # btc1h 파일명 매핑
     if interval == "btc1h":
-        # BTC 데이터는 'btcusdt' 폴더의 '1h' 데이터를 사용
         p = os.path.join(RAW_DIR, "btcusdt", f"fut_{split}_data_1h.parquet")
     else:
-        # ETH 데이터는 'ethusdt' 폴더의 각 timeframe 데이터를 사용
         p = os.path.join(RAW_DIR, "ethusdt", f"fut_{split}_data_{interval}.parquet")
+
     if not os.path.exists(p):
-        raise FileNotFoundError(f"Raw split not found: {p}")
+        raise FileNotFoundError(f"Raw data file not found: {p}")
+
     df = pd.read_parquet(p)
 
     cols = {c.lower(): c for c in df.columns}
@@ -108,51 +101,40 @@ def _load_raw(split: str, interval: str) -> pd.DataFrame:
             real = cols[k]
             df[real] = pd.to_numeric(df[real], errors="coerce")
 
-    # FundingRate 표준화
-    if "FundingRate" in df.columns:
-        df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
-    elif "funding_rate" in df.columns:
-        df["FundingRate"] = pd.to_numeric(df["funding_rate"], errors="coerce").fillna(0.0)
-    else:
+    if "FundingRate" not in df.columns and "funding_rate" in df.columns:
+        df.rename(columns={"funding_rate": "FundingRate"}, inplace=True)
+    if "FundingRate" not in df.columns:
         df["FundingRate"] = 0.0
+    df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
 
-    # 로그-스케일 가능한 양수 컬럼들(선택)
     for k in ["Volume", "Quote_asset_volume", "Taker_buy_base", "Taker_buy_quote"]:
         if k in df.columns:
             df[k] = np.log1p(np.clip(pd.to_numeric(df[k], errors="coerce"), 0, None))
 
     df = _enforce_dt_index(df)
 
-    # 참조컬럼 보정
     for c in REF_COLS_CANON:
         if c not in df.columns:
             df[c] = 0.0
 
-    # FundingSettle (5m 기준만 강제 필요, 나머지는 선택)
     if interval == BASE_INTERVAL:
-        if "FundingSettle" in df.columns:
-            df["FundingSettle"] = df["FundingSettle"].astype("int8")
-        else:
+        if "FundingSettle" not in df.columns:
             df["FundingSettle"] = (((df.index.hour % 8 == 0) & (df.index.minute == 0))).astype("int8")
+        else:
+            df["FundingSettle"] = df["FundingSettle"].astype("int8")
 
     return df
 
 # ===== Indicators =====
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["High"].astype("float64")
-    low  = df["Low"].astype("float64")
-    close= df["Close"].astype("float64")
+    high, low, close = df["High"].astype(float), df["Low"].astype(float), df["Close"].astype(float)
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def _funding_phase_features(idx: pd.DatetimeIndex) -> pd.DataFrame:
-    steps_per_8h = 96  # 5m 기준
+    steps_per_8h = 96
     steps_since = (idx.hour % 8) * 12 + (idx.minute // 5)
     steps_to_next = (steps_per_8h - steps_since) % steps_per_8h
     phase = 2 * np.pi * (steps_since / steps_per_8h)
@@ -163,206 +145,175 @@ def _funding_phase_features(idx: pd.DatetimeIndex) -> pd.DataFrame:
     return out
 
 def compute_heikin_ashi(df_ohlc: pd.DataFrame, o="Open", h="High", l="Low", c="Close") -> pd.DataFrame:
-    if df_ohlc.empty:
-        return pd.DataFrame(index=df_ohlc.index)
-    O = df_ohlc[o].to_numpy(dtype=float)
-    H = df_ohlc[h].to_numpy(dtype=float)
-    L = df_ohlc[l].to_numpy(dtype=float)
-    C = df_ohlc[c].to_numpy(dtype=float)
+    if df_ohlc.empty: return pd.DataFrame(index=df_ohlc.index)
+    O, H, L, C = df_ohlc[o].values, df_ohlc[h].values, df_ohlc[l].values, df_ohlc[c].values
     n = len(df_ohlc)
     HA_C = (O + H + L + C) / 4.0
-    HA_O = np.empty(n, dtype=float)
-    HA_O[0] = (O[0] + C[0]) / 2.0
-    for i in range(1, n):
-        HA_O[i] = (HA_O[i-1] + HA_C[i-1]) / 2.0
-    HA_H = np.maximum.reduce([H, HA_O, HA_C])
-    HA_L = np.minimum.reduce([L, HA_O, HA_C])
-    out = pd.DataFrame({
-        "HA_O": HA_O, "HA_H": HA_H, "HA_L": HA_L, "HA_C": HA_C
-    }, index=df_ohlc.index)
-    out["HA_TR"] = out["HA_H"] - out["HA_L"]
-    out["HA_BC"] = out["HA_C"] - out["HA_O"]
+    HA_O = np.empty(n); HA_O[0] = (O[0] + C[0]) / 2.0
+    for i in range(1, n): HA_O[i] = (HA_O[i-1] + HA_C[i-1]) / 2.0
+    HA_H, HA_L = np.maximum.reduce([H, HA_O, HA_C]), np.minimum.reduce([L, HA_O, HA_C])
+    out = pd.DataFrame({"HA_O": HA_O, "HA_H": HA_H, "HA_L": HA_L, "HA_C": HA_C}, index=df_ohlc.index)
+    out["HA_TR"], out["HA_BC"] = out["HA_H"] - out["HA_L"], out["HA_C"] - out["HA_O"]
     out["HA_R"]  = out["HA_C"].pct_change().fillna(0.0)
     return out
 
 # ===== Feature Engines =====
 
-def compute_features_for_tf(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """
-    ETH TF: 리치 피처(리턴/변동성/MACD/RSI/ATR + 시간/펀딩 + HA)
-    BTC1h: 경량 피처(ret_1h, ret_4h, ATR14, HA) + 참조컬럼 동봉. 스케일 비적용.
-    """
+def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df = df.sort_index()
     out = pd.DataFrame(index=df.index)
 
-    # --- BTC 1h (경량) ---
     if interval == "btc1h":
-        close = df["Close"].astype("float64")
-
-        out["ret_1h"] = close.pct_change().replace([np.inf, -np.inf], 0.0)
-        out["ret_4h"] = close.pct_change(4).replace([np.inf, -np.inf], 0.0)
+        close = df["Close"].astype(float)
+        out["ret_1h"] = close.pct_change()
+        out["ret_4h"] = close.pct_change(4)
         out["atr14"]  = _atr(df, period=14)
-
         ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
         out = pd.concat([out, ha], axis=1)
-
-        # 접미사
         out.columns = [f"{c}_btc1h" for c in out.columns]
-
-        # 참조열 붙여 저장용으로 반환
         ref = df[REF_COLS_CANON].copy()
         return _sanitize(pd.concat([out, ref], axis=1))
 
-    # --- ETH 타임프레임 ---
-    close = df["Close"].astype("float64")
-    high  = df["High"].astype("float64")
-    low   = df["Low"].astype("float64")
-    volume= df["Volume"].astype("float64")
+    close, high, low, volume = df["Close"].astype(float), df["High"].astype(float), df["Low"].astype(float), df["Volume"].astype(float)
 
-    # Basic returns and volatility
-    out["ret_1"] = close.pct_change().replace([np.inf, -np.inf], 0.0)
-    out["ret_3"] = close.pct_change(3).replace([np.inf, -np.inf], 0.0)
+    out["ret_1"] = close.pct_change()
+    out["ret_3"] = close.pct_change(3)
     out["z_close_48"] = zscore(close, win=48)
-    out["hl_spread"] = (high - low) / close.replace(0, np.nan)
+    out["hl_spread"] = (high - low) / close
     out["vol_z_48"] = zscore(volume, win=48)
 
-    # MACD
-    ema_12 = close.ewm(span=12, adjust=False).mean()
-    ema_26 = close.ewm(span=26, adjust=False).mean()
-    out["macd"] = ema_12 - ema_26
-    out["macd_sig"] = out["macd"].ewm(span=9, adjust=False).mean()
+    ema_12, ema_26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
+    out["macd"], out["macd_sig"] = ema_12 - ema_26, (ema_12 - ema_26).ewm(span=9, adjust=False).mean()
     out["macd_hist"] = out["macd"] - out["macd_sig"]
 
-    # RSI
     delta = close.diff()
     up, down = delta.clip(lower=0), (-delta).clip(lower=0)
-    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
+    rs = up.ewm(alpha=1/14, adjust=False).mean() / down.ewm(alpha=1/14, adjust=False).mean()
     out["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50)
 
-    # ATR
     out["atr14"] = _atr(df, period=14)
 
-    # Heikin-Ashi
     ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
     out = pd.concat([out, ha], axis=1)
 
-    # Time/Funding (base interval만)
     if interval == BASE_INTERVAL:
-        out['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-        out['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-        out['day_sin']  = np.sin(2 * np.pi * df.index.dayofweek / 7)
-        out['day_cos']  = np.cos(2 * np.pi * df.index.dayofweek / 7)
-        fp = _funding_phase_features(out.index)
-        out = pd.concat([out, fp], axis=1)
-        out["is_funding_settle"] = df.get("FundingSettle", pd.Series(0, index=out.index)).astype("int8")
-        out["funding_z_48"] = zscore(df["FundingRate"].astype("float64"), win=48)
+        out['hour_sin'], out['hour_cos'] = np.sin(2*np.pi*df.index.hour/24), np.cos(2*np.pi*df.index.hour/24)
+        out['day_sin'], out['day_cos'] = np.sin(2*np.pi*df.index.dayofweek/7), np.cos(2*np.pi*df.index.dayofweek/7)
+        out = pd.concat([out, _funding_phase_features(out.index)], axis=1)
+        out["is_funding_settle"] = df.get("FundingSettle", 0).astype("int8")
+        out["funding_z_48"] = zscore(df["FundingRate"].astype(float), win=48)
 
-    # 접미사
+    if btc_df is not None:
+        btc_renamed = btc_df.rename(columns={c: f"{c}_btc1h" for c in btc_df.columns})
+        merged_df = pd.merge_asof(df, btc_renamed, on="time", direction="backward")
+        
+        btc_close = merged_df["Close_btc1h"].astype(float)
+        btc_vol = merged_df["Volume_btc1h"].astype(float)
+        
+        btc_lead_features = pd.DataFrame(index=df.index)
+        btc_lead_features["btc_ret_1h"] = btc_close.pct_change()
+        btc_lead_features["btc_vol_z_24"] = zscore(btc_vol, win=24)
+        
+        btc_ema_12 = btc_close.ewm(span=12, adjust=False).mean()
+        btc_ema_26 = btc_close.ewm(span=26, adjust=False).mean()
+        btc_lead_features["btc_macd"] = btc_ema_12 - btc_ema_26
+
+        for lag in range(1, 7):
+            lagged = btc_lead_features.shift(lag)
+            lagged.columns = [f"{c}_lag{lag}" for c in lagged.columns]
+            out = pd.concat([out, lagged], axis=1)
+
     out.columns = [f"{c}_{interval}" for c in out.columns]
-
-    # 참조컬럼 동봉
     final_out = pd.concat([out, df[REF_COLS_CANON]], axis=1)
     return _sanitize(final_out)
 
-# ===== Feature Search (per TF) & Scaler (per TF) =====
+# ===== Feature Search & Scaler =====
 
 def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
-    y = df["Close"].astype("float64").pct_change().shift(-1)
-    y = (y > 0).astype(int)
-    return y.fillna(0)
+    return (df["Close"].astype(float).pct_change().shift(-1) > 0).astype(int).fillna(0)
 
 def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
-    X_ = _sanitize(X).astype("float64")
-    y_ = y.astype(int).values
-    mi = mutual_info_classif(X_, y_, random_state=RANDOM_STATE, discrete_features=False)
+    X_ = _sanitize(X).astype(float)
+    mi = mutual_info_classif(X_, y.values, random_state=RANDOM_STATE)
     scores = pd.Series(mi, index=X_.columns).sort_values(ascending=False)
     return scores.head(top_k).index.tolist()
 
 def _feature_search_for_tf(train_df: pd.DataFrame, tf: str) -> List[str]:
     exclude = set(REF_COLS_CANON)
     feat_cols = [c for c in train_df.columns if c not in exclude]
-    if not FEATURE_SEARCH or len(feat_cols) == 0:
+    if not FEATURE_SEARCH or not feat_cols:
         keep = feat_cols
     else:
-        y_tr = _make_proxy_y(train_df)  # 해당 TF의 다음 스텝 방향
+        y_tr = _make_proxy_y(train_df)
         k = min(TOP_K_PER_TF.get(tf, len(feat_cols)), len(feat_cols))
         keep = _feature_search_mi(train_df[feat_cols], y_tr, k)
-    with open(FEATURE_LIST_PATH_FMT.format(tf=tf), "w", encoding="utf-8") as f:
+    
+    path = FEATURE_LIST_PATH_FMT.format(tf=tf)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(keep, f, ensure_ascii=False, indent=2)
-    print(f"[ok] feature_list[{tf}] = {len(keep)} → {FEATURE_LIST_PATH_FMT.format(tf=tf)}")
+    print(f"[ok] feature_list[{tf}] = {len(keep)} -> {path}")
     return keep
 
 def _fit_scaler_for_tf(train_df: pd.DataFrame, feat_list: List[str], tf: str) -> StandardScaler:
-    X = _sanitize(train_df.reindex(columns=feat_list, fill_value=0.0))[feat_list].to_numpy(dtype=np.float64, copy=False)
-    sc = StandardScaler(with_mean=True, with_std=True).fit(X)
-    joblib.dump(sc, SCALER_PATH_FMT.format(tf=tf))
-    print(f"[ok] scaler[{tf}] saved → {SCALER_PATH_FMT.format(tf=tf)}")
+    X = _sanitize(train_df[feat_list]).to_numpy(dtype=float)
+    sc = StandardScaler().fit(X)
+    path = SCALER_PATH_FMT.format(tf=tf)
+    joblib.dump(sc, path)
+    print(f"[ok] scaler[{tf}] saved -> {path}")
     return sc
 
 # ===== Main =====
 
 def main():
-    # 1) Load
     print("[1/4] Loading all raw data...")
-    raw_data: Dict[str, Dict[str, pd.DataFrame]] = {split: {} for split in ["train", "val", "test"]}
-    for split in ["train", "val", "test"]:
-        for tf in TIMEFRAMES:
-            print(f"  - Loading {split} / {tf}...")
-            raw_data[split][tf] = _load_raw(split, tf)
+    raw_data = {s: {tf: _load_raw(s, tf) for tf in TIMEFRAMES} for s in ["train", "val", "test"]}
 
-    # 2) Feature compute
-    print("\n[2/4] Computing features for each timeframe...")
-    feature_data: Dict[str, Dict[str, pd.DataFrame]] = {split: {} for split in ["train", "val", "test"]}
+    print("\n[2/4] Pre-computing BTC features...")
+    btc_features = {}
     for split in ["train", "val", "test"]:
-        for tf in TIMEFRAMES:
+        btc_df_raw = raw_data[split]["btc1h"]
+        btc_features[split] = compute_features_for_tf(btc_df_raw, "btc1h")
+        out_p = os.path.join(OUT_DIR, f"fe_{split}_btc1h.parquet")
+        btc_features[split].to_parquet(out_p)
+        print(f"  [ok] Saved standalone {split}/btc1h -> {out_p}")
+
+    print("\n[3/4] Computing ETH features with BTC lead-lag...")
+    feature_data = {s: {} for s in ["train", "val", "test"]}
+    for split in ["train", "val", "test"]:
+        for tf in ETH_TIMEFRAMES:
             print(f"  - Computing features for {split} / {tf}...")
-            feature_data[split][tf] = compute_features_for_tf(raw_data[split][tf], tf)
+            eth_df_raw = raw_data[split][tf]
+            feature_data[split][tf] = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_features[split])
 
-    # 3) TF-specific feature lists & scalers
-    print(f"\n[3/4] Building TF-specific feature lists & scalers...")
-    feature_list_per_tf: Dict[str, List[str]] = {}
-    scalers: Dict[str, StandardScaler] = {}
-
+    print(f"\n[4/4] Building TF-specific feature lists & scalers...")
+    feature_list_per_tf = {}
+    scalers = {}
     for tf in TF_FOR_SEARCH:
         tr_df = feature_data["train"][tf]
         feat_list = _feature_search_for_tf(tr_df, tf)
         feature_list_per_tf[tf] = feat_list
         scalers[tf] = _fit_scaler_for_tf(tr_df, feat_list, tf)
 
-    # 4) Process & save
-    print("\n[4/4] Processing and saving all timeframe data...")
+    print("\n[5/5] Processing and saving all ETH timeframe data...")
     for split in ["train", "val", "test"]:
-        for tf in TIMEFRAMES:
+        for tf in ETH_TIMEFRAMES:
             print(f"  - Processing {split} / {tf}...")
             df = feature_data[split][tf].copy()
-
-            if tf == "btc1h":
-                # 보조 시계열: 스케일/선택 없이 저장 (경량 지표 + REF)
-                out_btc = _sanitize(df)
-                out_p = os.path.join(OUT_DIR, f"fe_{split}_btc1h.parquet")
-                out_btc.to_parquet(out_p)
-                print(f"    [ok] Saved {split}/btc1h (no scaling): {len(out_btc):,} x {out_btc.shape[1]} -> {out_p}")
-                continue
-
-            # ETH TF: TF별 feature_list + TF별 scaler 적용
             feat_list = feature_list_per_tf[tf]
+            
             df_sel = df.reindex(columns=feat_list, fill_value=0.0)
-
-            X = _sanitize(df_sel[feat_list]).to_numpy(dtype=np.float64, copy=False)
+            X = _sanitize(df_sel).to_numpy(dtype=float)
             Xs = scalers[tf].transform(X)
             df_scaled = pd.DataFrame(Xs, index=df.index, columns=feat_list)
 
-            # 참조열 (비스케일)
             ref_cols = [c for c in REF_COLS_CANON if c in df.columns]
-            final_df = _sanitize(pd.concat([df_scaled, df[ref_cols]], axis=1))
+            final_df = pd.concat([df_scaled, df[ref_cols]], axis=1)
 
             out_p = os.path.join(OUT_DIR, f"fe_{split}_{tf}.parquet")
             final_df.to_parquet(out_p)
             print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
 
-    print("\n[+] MTF Multi-Input Feature Engineering complete.")
+    print("\n[+] MTF Multi-Input Feature Engineering complete (with BTC Lead-Lag).")
 
 if __name__ == "__main__":
     main()

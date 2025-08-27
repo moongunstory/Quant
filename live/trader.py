@@ -272,6 +272,12 @@ class Trader:
                 self.holding_steps += 1
             self.last_price = p1
 
+            # --- 최대 보유 시간 강제 청산 로직 ---
+            if self.pos != 0 and self.holding_steps >= MAX_HOLDING_STEPS:
+                print(f"[{ts.strftime('%H:%M:%S')}] WARN: 최대 보유 기간({MAX_HOLDING_STEPS} 스텝) 초과로 강제 청산.")
+                self._close(p1, ts)
+                desired = 0 # 이미 청산했으므로 추가 행동 방지
+
             if desired != self.pos:
                 if self.pos != 0: self._close(p1, ts)
                 if desired != 0: self._open(desired, p1, ts)
