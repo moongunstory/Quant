@@ -12,6 +12,10 @@ import time
 import threading
 import logging
 import warnings
+
+# ====== 로거 설정 ======
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 import csv
 import subprocess
 from queue import Queue
@@ -386,9 +390,9 @@ def main():
     if reloader:
         reloader.start()
 
-    # 텔레그램 봇 (live 모드에서는 비활성 권장)
+    # 텔레그램 봇
     tg_runner = None
-    if ENABLE_TELEGRAM_BOT and TRADING_MODE != "live" and TELEGRAM_BOT_PATH.exists():
+    if ENABLE_TELEGRAM_BOT and TELEGRAM_BOT_PATH.exists():
         if not os.getenv("TELEGRAM_BOT_TOKEN"):
             logger.warning("텔레그램 토큰(.env: TELEGRAM_BOT_TOKEN) 미설정 — 봇 미시작")
         else:
@@ -396,10 +400,7 @@ def main():
             tg_runner.start()
             logger.info(f"텔레그램 봇 시작: {TELEGRAM_BOT_PATH}")
     else:
-        if TRADING_MODE == "live":
-            logger.info("live 모드: 텔레그램/파일 로그 비활성화")
-        else:
-            logger.warning("텔레그램 봇 비활성 또는 파일 없음")
+        logger.warning("텔레그램 봇 비활성 또는 파일 없음")
 
     try:
         while True:

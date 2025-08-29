@@ -263,12 +263,19 @@ class RealtimeIngest:
         
         # Select final features based on JSON lists
         for tf, feat_list in self.features.items():
-            if tf in X_dict: X_dict[tf] = X_dict[tf][feat_list]
+            if tf in X_dict and X_dict[tf] is not None:
+                # Ensure all columns in feat_list exist before selecting
+                existing_cols = [col for col in feat_list if col in X_dict[tf].columns]
+                if len(existing_cols) != len(feat_list):
+                    missing = set(feat_list) - set(existing_cols)
+                    print(f"[ingest] warn: In {tf}, features {missing} not found in generated columns. Skipping them.")
+                X_dict[tf] = X_dict[tf][existing_cols]
         
         # For btc1h, select the 10 features from fe.py
-        if "btc1h" in X_dict:
+        if "btc1h" in X_dict and X_dict["btc1h"] is not None:
             btc_cols = ['ret_1h_btc1h', 'ret_4h_btc1h', 'atr14_btc1h', 'HA_O_btc1h', 'HA_H_btc1h', 'HA_L_btc1h', 'HA_C_btc1h', 'HA_TR_btc1h', 'HA_BC_btc1h', 'HA_R_btc1h']
-            X_dict["btc1h"] = X_dict["btc1h"][btc_cols]
+            existing_btc_cols = [col for col in btc_cols if col in X_dict["btc1h"].columns]
+            X_dict["btc1h"] = X_dict["btc1h"][existing_btc_cols]
 
         packet = {"X": X_dict, "close": self.df5m["Close"], "ts": latest_open}
         try:

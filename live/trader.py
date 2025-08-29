@@ -357,43 +357,57 @@ class Trader:
         # USDT 크기를 현재 가격으로 나누어 주문할 코인 수량을 계산
         return round(usdt_size / price, 6)
 
-    def _open(self, side: int, price: float, ts: pd.Timestamp):
-        px = price * (1 + SLIPPAGE if side == 1 else 1 - SLIPPAGE)
-        self.eq -= self.eq * COMMISSION_SIDE
-        self.pos, self.entry_price, self.entry_time, self.holding_steps = side, px, ts, 0
-        if self.mode == "live" and self.exec: self.exec.entry_with_stop(symbol=SYMBOL, side=("BUY" if side == 1 else "SELL"), quantity=self._calc_order_qty(px), last_price=px, sl_rate=0.03)
-
-        # 매매 로그 기록
-        log_path = os.path.join(LOG_DIR, "run_log.csv")
-        trade_info = {
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": "ENTER",
-            "position": "LONG" if side == 1 else "SHORT",
-            "price": f"{px:,.4f}",
-        }
-        update_trade_log(log_path, trade_info)
-
     def _close(self, price: float, ts: pd.Timestamp):
-        if self.pos == 0: return
+        if self.pos == 0:
+            return
+
         px = price * (1 - SLIPPAGE if self.pos == 1 else 1 + SLIPPAGE)
         pnl_pct = (px / self.entry_price - 1) if self.pos == 1 else (self.entry_price / px - 1)
+
+        # === 실제 청산 추가 (live 전용) ===
+        if self.mode == "live" and self.exec:
+            try:
+                # 1) 남은 주문 전량 취소 (잔여 SL/TP 제거)
+                self.exec.cancel_all_orders(SYMBOL)
+                # 2) reduceOnly 시장가로 반대 방향 청산
+                side = "SELL" if self.pos == 1 else "BUY"
+                qty  = self._calc_order_qty(px)  # reduceOnly라 포지션 초과 수량이어도 초과분은 무시됨
+                self.exec.place_market(SYMBOL, side, qty, reduce_only=True)
+
+                # (옵션) 완전 평단 확인을 1~2초만 대기
+                import time as _t
+                deadline = _t.time() + 2.0
+                while _t.time() < deadline:
+                    pr = self.exec._send_request("GET", "/fapi/v2/positionRisk", [("symbol", SYMBOL)])
+                    rows = pr if isinstance(pr, list) else [pr]
+                    amt = 0.0
+                    for r in rows:
+                        if r.get("symbol") == SYMBOL:
+                            amt = float(r.get("positionAmt", "0"))
+                            break
+                    if abs(amt) < 1e-12:
+                        break
+                    _t.sleep(0.1)
+            except Exception as e:
+                print(f"[{ts.strftime('%H:%M:%S')}] WARN: live close failed (ignored): {e}")
+
+        # === 로컬 회계/로그 (기존 그대로) ===
         self.eq += self.eq * pnl_pct - self.eq * COMMISSION_SIDE
-        self.total_trades += 1; self.winning_trades += 1 if pnl_pct > 0 else 0
-        
+        self.total_trades += 1
+        self.winning_trades += 1 if pnl_pct > 0 else 0
+
         duration_sec = (ts - self.entry_time).total_seconds() if self.entry_time else 0
-        
-        # 매매 로그 기록
         log_path = os.path.join(LOG_DIR, "run_log.csv")
-        trade_info = {
+        update_trade_log(log_path, {
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "type": "EXIT",
             "position": "LONG" if self.pos == 1 else "SHORT",
             "price": f"{px:,.4f}",
             "profit": f"{pnl_pct * 100:.2f}%",
             "duration": f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
-        }
-        update_trade_log(log_path, trade_info)
+        })
 
-        if self.pos == 1: self.long_trades+=1; self.long_wins += 1 if pnl_pct > 0 else 0
-        else: self.short_trades+=1; self.short_wins += 1 if pnl_pct > 0 else 0
+        if self.pos == 1: self.long_trades += 1; self.long_wins += 1 if pnl_pct > 0 else 0
+        else:              self.short_trades += 1; self.short_wins += 1 if pnl_pct > 0 else 0
         self.pos = 0
+

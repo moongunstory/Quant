@@ -20,9 +20,6 @@ REPORT_PATH = cfg.get("REPORT_PATH", "./data/logs/reports/trading_report.md")
 TRADELOG_PATH = cfg.get("TRADELOG_PATH", "./data/logs/run_log.csv")
 MAX_MSG = 4000  # 텔레그램 메시지 길이 한계 안전선
 
-# ====== 로거 설정 ======
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 logger.info(f"Loaded ALLOWED_IDS: {ALLOWED_IDS}")
