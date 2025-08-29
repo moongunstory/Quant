@@ -217,8 +217,8 @@ class RealtimeIngest:
             feat_btc = compute_features_for_tf(df_btc1h, "btc1h")
             out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
 
-            # --- BTC Lead-Lag Feature Integration (for 5m) ---
-            if '5m' in out and not out['5m'].empty:
+            # --- BTC Lead-Lag Feature Integration (for 15m) ---
+            if '15m' in out and not out['15m'].empty:
                 merged_df = pd.merge_asof(
                     out['5m'].sort_index(),
                     feat_btc.sort_index(),
@@ -228,7 +228,6 @@ class RealtimeIngest:
                     tolerance=pd.Timedelta("8H"),
                 )
                 
-                # Now, 'Close_btc1h' and 'Volume_btc1h' are available in merged_df
                 btc_close = merged_df["Close_btc1h"].astype(float)
                 btc_vol = merged_df["Volume_btc1h"].astype(float)
                 
@@ -242,9 +241,11 @@ class RealtimeIngest:
 
                 for lag in range(1, 7):
                     lagged = btc_lead_features.shift(lag)
-                    lagged.columns = [f"{c}_lag{lag}_5m" for c in lagged.columns]
-                    out['5m'] = pd.concat([out['5m'], lagged], axis=1)
+                    lagged.columns = [f"{c}_lag{lag}_15m" for c in lagged.columns]
+                    out['15m'] = pd.concat([out['15m'], lagged], axis=1)
+                
                 out['5m'].fillna(0.0, inplace=True)
+                out['15m'].fillna(0.0, inplace=True)
 
         return out
 
