@@ -87,29 +87,43 @@ class BinanceExecutor:
                     headers=self._headers(),
                     timeout=self.timeout
                 )
-                r.raise_for_status()
+                
+                # Check for Binance-specific error payload BEFORE raising for status
+                # A successful but empty response can be returned as an empty list
+                if not r.text: # Handle empty response
+                    r.raise_for_status()
+                    return None
+
                 data = r.json()
-                # 바이낸스는 200이어도 에러코드가 payload에 있을 수 있음
-                if isinstance(data, dict) and "code" in data and isinstance(data["code"], int) and data["code"] < 0:
+
+                if isinstance(data, dict) and "code" in data and data["code"] != 0:
                     code = data.get("code")
                     msg = data.get("msg", "")
-                    # 타임스탬프 범위 오류 → 오프셋 재계산 후 재시도
+                    
+                    # Handle timestamp error specifically for retry
                     if code == -1021 and attempt < self.max_retries:
+                        print(f"[EXECUTOR] Warn: Timestamp error ({code}) detected. Recalculating offset and retrying...")
                         self._time_offset_ms = self._calc_time_offset_ms()
                         attempt += 1
-                        continue
-                    raise requests.HTTPError(f"Binance API error {code}: {msg}")
+                        time.sleep(0.2)
+                        continue # Retry the request
+                    
+                    raise requests.HTTPError(f"Binance API error {code}: {msg}", response=r)
+
+                r.raise_for_status()
                 return data
+
             except requests.HTTPError as e:
-                # 레이트리밋 계열: 418/429, 코드 -1003/-1121 등 → 단순 백오프 재시도
                 status = getattr(e.response, "status_code", None)
-                if (status in (418, 429) or "API error -1003" in str(e)) and attempt < self.max_retries:
+                if (status in (418, 429)) and attempt < self.max_retries:
+                    print(f"[EXECUTOR] Warn: Rate limit detected ({status}). Retrying after backoff...")
                     time.sleep(0.5 * (attempt + 1))
                     attempt += 1
                     continue
                 raise
-            except Exception:
+            except requests.exceptions.RequestException as e:
                 if attempt < self.max_retries:
+                    print(f"[EXECUTOR] Warn: Request exception ({e}). Retrying after backoff...")
                     time.sleep(0.5 * (attempt + 1))
                     attempt += 1
                     continue
@@ -293,6 +307,17 @@ class BinanceExecutor:
             return abs(amt), "SHORT"
         else:
             return 0.0, "FLAT"
+
+    def get_usdt_balance(self) -> float:
+        """
+        선물 계정의 사용 가능한 USDT 잔액을 조회.
+        """
+        data = self._request("GET", "/fapi/v2/balance", signed=True)
+        if isinstance(data, list):
+            for asset_data in data:
+                if isinstance(asset_data, dict) and asset_data.get("asset") == "USDT":
+                    return float(asset_data.get("availableBalance", "0.0"))
+        return 0.0
 
     def close_position_market(self, symbol: str) -> dict:
         """

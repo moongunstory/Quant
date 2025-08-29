@@ -22,7 +22,7 @@ import sys
 import os
 
 # Ensure ai_binance is in sys.path for model loading
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
@@ -75,7 +75,15 @@ class Trader:
     def __init__(self, mode: str, q: Queue, api_key: Optional[str] = None, secret_key: Optional[str] = None, learn_q: Optional[Queue] = None):
         assert mode in ("live", "paper")
         self.mode, self.q, self.learn_q, self.api_key, self.secret_key = mode, q, learn_q, api_key, secret_key
-        if self.mode == "live" and (not api_key or not secret_key):
+        
+        self.exec = None
+        if self.mode == "live" and self.api_key and self.secret_key:
+            try:
+                self.exec = BinanceExecutor(self.api_key, self.secret_key)
+                print("[트레이더] 실행 어댑터 초기화 완료.")
+            except Exception as e:
+                print(f"[트레이더] 실행 어댑터 초기화 실패: {e}")
+        elif self.mode == "live":
             print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
 
         # Manager용 feature_list 로드
@@ -102,7 +110,6 @@ class Trader:
             feats_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
             with open(feats_path, "r") as f: self.worker_feature_list.extend(json.load(f))
         
-        # fe.py에서 확인된 정확한 BTC 피처 10개
         btc_features = [
             'ret_1h_btc1h', 'ret_4h_btc1h', 'atr14_btc1h', 'HA_O_btc1h', 'HA_H_btc1h',
             'HA_L_btc1h', 'HA_C_btc1h', 'HA_TR_btc1h', 'HA_BC_btc1h', 'HA_R_btc1h'
@@ -112,7 +119,7 @@ class Trader:
 
         # 관측 차원 정합성 검증
         vecnorm_dim = int(self.worker_vecnorm.obs_rms.mean.shape[0])
-        extra_dim = 5  # [mgr_dir, mgr_conf, mgr_regime, in_pos, holding_norm]
+        extra_dim = 5
         expected_dim = len(self.worker_feature_list) + extra_dim
         if expected_dim != vecnorm_dim:
             raise RuntimeError(f"[트레이더] 관측 차원 불일치: expected={expected_dim}, vecnorm={vecnorm_dim}")
@@ -122,9 +129,7 @@ class Trader:
         self.manager_model: Optional[PPO] = None
         if os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH):
             try:
-                # For Transformer, obs_shape should be 2D
                 self.mgr_cols = sorted([c for c in self.feature_list if c.endswith("_1h") or c.endswith("_4h")])
-                # SEQ_WINDOW from manager.py is 8
                 obs_shape_mgr = (8, len(self.mgr_cols))
                 act_space_mgr = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
                 
@@ -133,27 +138,36 @@ class Trader:
                 self.manager_vecnorm.training = False
                 self.manager_vecnorm.norm_reward = False
 
-                # PPO.load will automatically use the correct policy and feature extractor
                 self.manager_model = PPO.load(MANAGER_MODEL_PATH, device="cpu")
                 print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)}")
             except Exception as e:
                 print(f"[트레이더] Manager 로드 실패 → 휴리스틱 사용: {e}")
                 self.manager_model = None
 
-        # 상태 변수 초기화
-        self.eq, self.pos, self.entry_price, self.entry_time, self.last_price, self.holding_steps, self.global_steps = INITIAL_CAPITAL, 0, None, None, None, 0, 0
+        # 상태 변수 초기화 (실제 잔액 조회)
+        start_capital = INITIAL_CAPITAL
+        if self.exec:
+            try:
+                balance = self.exec.get_usdt_balance()
+                if balance > 0:
+                    start_capital = balance
+                    print(f"[트레이더] 실제 계좌 잔액 ${balance:,.2f}을 초기 자본금으로 설정합니다.")
+                else:
+                    print("[트레이더] 경고: 실제 계좌 잔액이 0이거나 가져올 수 없어, 기본값으로 시작합니다.")
+            except Exception as e:
+                print(f"[트레이더] 경고: 실제 계좌 잔액 조회 실패({e}), 기본값으로 시작합니다.")
+        
+        self.initial_capital = start_capital
+        self.eq, self.pos, self.entry_price, self.entry_time, self.last_price, self.holding_steps, self.global_steps = self.initial_capital, 0, None, None, None, 0, 0
         self.total_trades, self.winning_trades, self.long_trades, self.long_wins, self.short_trades, self.short_wins = 0,0,0,0,0,0
         self.start_time = datetime.now(timezone.utc)
         self._roll_obs, self._roll_actions, self._roll_rewards, self._roll_dones, self._roll_values, self._roll_logps = [],[],[],[],[],[]
-        if self.mode == "live" and self.api_key and self.secret_key:
-            try: self.exec = BinanceExecutor(self.api_key, self.secret_key)
-            except Exception as e: print(f"[트레이더] 실행 어댑터 초기화 실패: {e}")
 
         # 초기 리포트 생성
         report_path = os.path.join(REPORT_DIR, "trading_report.md")
         initial_report_data = {
             'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            'initial_capital': INITIAL_CAPITAL,
+            'initial_capital': self.initial_capital,
             'total_equity': self.eq,
             'position': "STANDBY",
             'unrealized_pnl_amount': 0,
@@ -231,10 +245,10 @@ class Trader:
 
         report_data = {
             'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            'initial_capital': INITIAL_CAPITAL,
+            'initial_capital': self.initial_capital,
             'total_equity': self.eq,
             'position': current_pos_str,
-            'unrealized_pnl_amount': self.eq - INITIAL_CAPITAL, # 총 실현/미실현 손익 표시
+            'unrealized_pnl_amount': self.eq - self.initial_capital,
             'unrealized_pnl_percent': unrealized_pnl_percent,
             'total_trades': self.total_trades,
             'win_rate': win_rate,
@@ -338,7 +352,7 @@ class Trader:
             leverage_to_use = LEVERAGE
 
         # 현재 총 자산(equity)을 기반으로 주문 USDT 크기를 결정
-        usdt_size = self.eq * leverage_to_use
+        usdt_size = self.eq * 0.99 * leverage_to_use
         
         # USDT 크기를 현재 가격으로 나누어 주문할 코인 수량을 계산
         return round(usdt_size / price, 6)
