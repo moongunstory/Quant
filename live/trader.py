@@ -178,7 +178,7 @@ class Trader:
         ret3_h1, ret12_h1 = _latest(X1, "ret3_1h"), _latest(X1, "ret12_1h")
         score = (1.8*macd_h1 + 1.2*macd_h4 + 0.6*(rsi_h1/50.0) + 1.0*ret3_h1 + 0.7*ret12_h1)
         direction = np.sign(score).astype(int)
-        conf = float(1 - math.exp(-min(5.0, abs(score)) * 1.2))
+        conf = float(1 - math.exp(-min(5.0, abs(score)) * 0.5))
         return direction, conf, 1 if conf < 0.15 else 0
 
     def _build_worker_obs(self, X_dict: Dict[str, pd.DataFrame], t_idx: pd.Timestamp, mgr_dir: int, mgr_conf: float, mgr_regime: int) -> Optional[np.ndarray]:
