@@ -57,7 +57,7 @@ def get_phase_config(global_steps: int) -> Dict[str, float]:
     else:                          return {"k_sigma": 0.1, "phase": 4}
 
 INITIAL_CAPITAL  = 100_000.0
-ROLLOUT_STEPS = 4096
+ROLLOUT_STEPS = 288
 
 MANAGER_MODEL_PATH   = os.path.join(MODEL_DIR, "manager_v2.zip")
 MANAGER_VECNORM_PATH = os.path.join(MODEL_DIR, "manager_v2_vecnorm.pkl")
@@ -260,37 +260,71 @@ class Trader:
             
             t_idx = close_series.index[-1]
             p1 = close_series.iloc[-1]
-            self.last_price = p1 if self.last_price is None else self.last_price
+            
+            if self.last_price is None:
+                self.last_price = p1
 
             mgr_dir, mgr_conf, mgr_regime = self._manager_goal_dict(X_dict)
             obs_raw = self._build_worker_obs(X_dict, t_idx, mgr_dir, mgr_conf, mgr_regime)
             if obs_raw is None: continue
 
             obs_norm = self.worker_vecnorm.normalize_obs(obs_raw.reshape(1, -1))
-            action, _ = self.worker_model.predict(obs_norm, deterministic=True, action_masks=self._mask(self.pos))
+            action_array, _ = self.worker_model.predict(obs_norm, deterministic=True, action_masks=self._mask(self.pos))
+            action = int(action_array[0]) if isinstance(action_array, np.ndarray) else int(action_array)
 
             lr = np.log(p1 / self.last_price) if self.last_price else 0.0
-            desired, why = self._interpret(int(action), mgr_dir)
+            desired, why = self._interpret(action, mgr_dir)
             
             if self.pos != 0:
                 self.eq *= np.exp(self.pos * lr)
                 self.holding_steps += 1
-            self.last_price = p1
 
-            # --- 최대 보유 시간 강제 청산 로직 ---
+            # --- Handle trade execution & done signal ---
+            done = (desired != self.pos)
+
             if self.pos != 0 and self.holding_steps >= MAX_HOLDING_STEPS:
                 print(f"[{ts.strftime('%H:%M:%S')}] WARN: 최대 보유 기간({MAX_HOLDING_STEPS} 스텝) 초과로 강제 청산.")
                 self._close(p1, ts)
                 desired = 0 # 이미 청산했으므로 추가 행동 방지
+                done = True
 
             if desired != self.pos:
                 if self.pos != 0: self._close(p1, ts)
                 if desired != 0: self._open(desired, p1, ts)
 
+            # --- Online Learning: Append to rollout buffer ---
+            if self.learn_q is not None:
+                reward = float(self.pos * lr)
+                
+                self._roll_obs.append(obs_raw)
+                self._roll_actions.append(action_array) # Send the array
+                self._roll_rewards.append(reward)
+                self._roll_dones.append(done)
+                self._roll_values.append(0.0) # Placeholder
+                self._roll_logps.append(0.0)  # Placeholder
+
+                if len(self._roll_obs) >= ROLLOUT_STEPS:
+                    try:
+                        rollout_data = {
+                            "obs": np.array(self._roll_obs, dtype=np.float32),
+                            "actions": np.array(self._roll_actions),
+                            "rewards": np.array(self._roll_rewards, dtype=np.float32),
+                            "dones": np.array(self._roll_dones, dtype=np.bool_),
+                            "values": np.array(self._roll_values, dtype=np.float32),
+                            "log_probs": np.array(self._roll_logps, dtype=np.float32)
+                        }
+                        self.learn_q.put_nowait(rollout_data)
+                        print(f"[{ts.strftime('%H:%M:%S')}] INFO: Rollout buffer sent to learner ({len(self._roll_obs)} steps).")
+                        self._roll_obs, self._roll_actions, self._roll_rewards, self._roll_dones, self._roll_values, self._roll_logps = [],[],[],[],[],[]
+                    except Exception as e:
+                        print(f"[{ts.strftime('%H:%M:%S')}] WARN: Failed to send rollout to learner: {e}")
+                        self._roll_obs, self._roll_actions, self._roll_rewards, self._roll_dones, self._roll_values, self._roll_logps = [],[],[],[],[],[]
+
+            self.last_price = p1
             self.global_steps += 1
-            # 5분마다 로그 및 리포트 생성
+            
             pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-            print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {int(action)}->{why}")
+            print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {action}->{why}")
             self._generate_current_report()
 
     def _calc_order_qty(self, price: float) -> float:
