@@ -46,7 +46,7 @@ def manual_load_dotenv(dotenv_path):
     except Exception as e:
         print(f"[dotenv] Manual .env loading failed: {e}")
 
-# ===== SB3 안전 로더 (PPO 커스텀 스케줄 역직렬화 가드) =====
+# ===== SB3 안전 로더 (PPO/MaskablePPO 커스텀 스케줄 역직렬화 가드) =====
 from stable_baselines3 import PPO
 def _const_schedule(v: float):
     return lambda _progress_remaining: v
@@ -61,6 +61,20 @@ def _ppo_load_safe(path, *args, **kwargs):
         kwargs["custom_objects"] = co
         return __ORIG_PPO_LOAD(path, *args, **kwargs)
 PPO.load = _ppo_load_safe  # 전역 패치
+
+# ➕ MaskablePPO도 동일 가드 적용
+from sb3_contrib import MaskablePPO as _MaskablePPO
+__ORIG_MLOAD = _MaskablePPO.load
+def _mppo_load_safe(path, *args, **kwargs):
+    try:
+        return __ORIG_MLOAD(path, *args, **kwargs)
+    except Exception:
+        co = dict(kwargs.get("custom_objects", {}))
+        co.setdefault("lr_schedule", _const_schedule(3e-4))
+        co.setdefault("clip_range", _const_schedule(0.2))
+        kwargs["custom_objects"] = co
+        return __ORIG_MLOAD(path, *args, **kwargs)
+_MaskablePPO.load = _mppo_load_safe  # 전역 패치
 
 # --- 내부 모듈 경로 ---
 import sys
@@ -237,9 +251,13 @@ class TraderReloader(threading.Thread):
             if mt > self._last_mtime:
                 self._last_mtime = mt
                 try:
-                    loader = getattr(self.trader.model.__class__, "load", None) or PPO.load
-                    new_model = loader(self.target_path, device="cpu")
-                    self.trader.model = new_model
+                    # Trader는 worker_model(MaskablePPO)을 사용함
+                    model_cls = getattr(self.trader.worker_model, "__class__", None)
+                    if model_cls is None:
+                        from sb3_contrib import MaskablePPO
+                        model_cls = MaskablePPO
+                    new_model = model_cls.load(self.target_path, device="cpu")
+                    self.trader.worker_model = new_model
                     logger.info(f"모델 리로드 완료: {self.target_path}")
                 except Exception as e:
                     logger.error(f"리로드 실패: {e}", exc_info=True)

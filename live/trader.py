@@ -215,6 +215,35 @@ class Trader:
         extra_obs = np.array([mgr_dir, mgr_conf, mgr_regime, float(self.pos != 0), holding_norm], dtype=np.float32)
         return np.concatenate([x_raw, extra_obs])
 
+    def _build_manager_obs_live(self, X_dict, t_idx) -> Optional[np.ndarray]:
+        import numpy as np
+        import pandas as pd
+        base = X_dict.get("1h")
+        if base is None or base.empty: return None
+
+        pos = base.index.get_indexer([t_idx], method="pad")[0]
+        if pos < 0: return None
+
+        start = max(0, pos - 7)
+        idx_win = base.index[start:pos+1]
+        rows = []
+        for ts in idx_win:
+            vals = []
+            for c in self.mgr_cols:
+                tf = "1h" if c.endswith("_1h") else "4h"
+                df = X_dict.get(tf)
+                if df is None or df.empty or c not in df.columns:
+                    vals.append(0.0); continue
+                j = df.index.get_indexer([ts], method="pad")[0]
+                vals.append(float(df[c].iloc[0 if j < 0 else j]))
+            rows.append(vals)
+
+        seq = np.asarray(rows, dtype=np.float32)
+        if seq.shape[0] < 8:  # 앞쪽 패딩
+            pad = np.repeat(seq[:1, :], 8 - seq.shape[0], axis=0)
+            seq = np.concatenate([pad, seq], axis=0)
+        return seq.astype(np.float32, copy=False)
+
     @staticmethod
     def _mask(pos: int) -> np.ndarray: return np.array([True, pos==0, pos!=0], dtype=bool)
 
@@ -278,7 +307,33 @@ class Trader:
             if self.last_price is None:
                 self.last_price = p1
 
-            mgr_dir, mgr_conf, mgr_regime = self._manager_goal_dict(X_dict)
+            # === Manager: RL 모델 우선, 실패 시 휴리스틱 ===
+            mgr_src = "heur"
+            use_mgr = False
+            if self.manager_model is not None:
+                obs_mgr = self._build_manager_obs_live(X_dict, t_idx)
+                if obs_mgr is not None:
+                    try:
+                        # (1, 8, F) 배치로 정규화 → 예측
+                        obs_mgr_norm = self.manager_vecnorm.normalize_obs(obs_mgr.reshape(1, *obs_mgr.shape))
+                        act, _ = self.manager_model.predict(obs_mgr_norm, deterministic=True)
+                        conf_long, conf_short = float(act[0]), float(act[1])
+
+                        # 데드존(학습값과 동일한 0.1) 처리
+                        if max(conf_long, conf_short) < 0.1:
+                            mgr_dir = 0
+                        else:
+                            mgr_dir = 1 if conf_long > conf_short else -1
+                        mgr_conf = max(conf_long, conf_short)
+                        mgr_regime = 0  # 필요하면 레짐 로직 별도 도입
+                        use_mgr = True
+                        mgr_src = "model"
+                    except Exception as e:
+                        print(f"[매니저] predict 실패 → 휴리스틱 대체: {e}")
+
+            if not use_mgr:
+                mgr_dir, mgr_conf, mgr_regime = self._manager_goal_dict(X_dict)
+
             obs_raw = self._build_worker_obs(X_dict, t_idx, mgr_dir, mgr_conf, mgr_regime)
             if obs_raw is None: continue
 
@@ -338,7 +393,8 @@ class Trader:
             self.global_steps += 1
             
             pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-            print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr: {mgr_dir},{mgr_conf:.2f} | Act: {action}->{why}")
+            print(f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f} | Mgr({mgr_src}): {mgr_dir},{mgr_conf:.2f} | Act: {action}->{why}")
+
             self._generate_current_report()
 
     def _calc_order_qty(self, price: float) -> float:
