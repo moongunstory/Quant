@@ -28,7 +28,7 @@ from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from gymnasium import spaces, Env
-
+from ai_binance.train.reinforce.manager import TransformerFeatureExtractor
 from ai_binance.live.reporting import update_trade_log, generate_report
 from ai_binance.live.execution import BinanceExecutor
 
@@ -132,13 +132,28 @@ class Trader:
                 self.mgr_cols = sorted([c for c in self.feature_list if c.endswith("_1h") or c.endswith("_4h")])
                 obs_shape_mgr = (8, len(self.mgr_cols))
                 act_space_mgr = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
-                
+
                 tmp_mgr_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=obs_shape_mgr, action_space=act_space_mgr)])
                 self.manager_vecnorm = VecNormalize.load(MANAGER_VECNORM_PATH, tmp_mgr_env)
                 self.manager_vecnorm.training = False
                 self.manager_vecnorm.norm_reward = False
 
-                self.manager_model = PPO.load(MANAGER_MODEL_PATH, device="cpu")
+                # ▼ 핵심: 학습시 설정을 강제로 주입해 사이즈 미스매치 방지
+                policy_kwargs = dict(
+                    features_extractor_class=TransformerFeatureExtractor,
+                    features_extractor_kwargs=dict(d_model=128, nhead=4, num_layers=2),
+                    net_arch=dict(pi=[128], vf=[128]),
+                )
+                self.manager_model = PPO.load(
+                    MANAGER_MODEL_PATH,
+                    device="cpu",
+                    custom_objects={
+                        "policy_kwargs": policy_kwargs,
+                        # 커스텀 스케줄 역직렬화 실패 대비 기본값 주입
+                        "lr_schedule": (lambda _pr: 3e-4),
+                        "learning_rate": 3e-4,
+                    },
+                )
                 print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)}")
             except Exception as e:
                 print(f"[트레이더] Manager 로드 실패 → 휴리스틱 사용: {e}")
