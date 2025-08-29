@@ -20,7 +20,27 @@ from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
-from dotenv import load_dotenv
+# from dotenv import load_dotenv # Replaced with manual parser
+
+def manual_load_dotenv(dotenv_path):
+    """A simple, robust .env parser to replace python-dotenv."""
+    try:
+        with open(dotenv_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Handle quoted values
+                    if len(value) > 1 and value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif len(value) > 1 and value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    os.environ[key] = value
+        print("[dotenv] Manual .env load successful.")
+    except Exception as e:
+        print(f"[dotenv] Manual .env loading failed: {e}")
 
 # ===== SB3 안전 로더 (PPO 커스텀 스케줄 역직렬화 가드) =====
 from stable_baselines3 import PPO
@@ -49,7 +69,7 @@ from ai_binance.live.learner import OnlineLearner     # 모듈명 수정(learner
 
 # .env 로드 (프로젝트 루트 기준)
 dotenv_path = Path(__file__).resolve().parent.parent.parent / '.env'
-load_dotenv(dotenv_path=dotenv_path)
+manual_load_dotenv(dotenv_path)
 
 # =========================
 # 설정
@@ -80,8 +100,8 @@ INGEST_QUEUE_MAX = 2
 TRADER_QUEUE_MAX = 2
 LEARN_QUEUE_MAX  = 2
 
-BINANCE_API_KEY   = os.getenv('BINANCE_API_KEY')
-BINANCE_SECRET_KEY= os.getenv('BINANCE_SECRET_KEY')
+BINANCE_API_KEY   = os.getenv('BINANCE_API_KEY', '').strip()
+BINANCE_SECRET_KEY= os.getenv('BINANCE_SECRET_KEY', '').strip()
 
 # =========================
 # CSV/콘솔 로거 설정

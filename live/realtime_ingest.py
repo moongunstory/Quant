@@ -225,7 +225,7 @@ class RealtimeIngest:
                     left_index=True, right_index=True,
                     direction="backward",
                     allow_exact_matches=True,
-                                                            tolerance=pd.Timedelta("8h"),
+                                                                                tolerance=pd.Timedelta("8h"),
                 )
                 
                 btc_close = merged_df["Close_btc1h"].astype(float)
