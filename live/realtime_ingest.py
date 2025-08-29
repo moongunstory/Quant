@@ -217,8 +217,8 @@ class RealtimeIngest:
             feat_btc = compute_features_for_tf(df_btc1h, "btc1h")
             out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
 
-            # --- BTC Lead-Lag Feature Integration (for 15m) ---
-            if '15m' in out and not out['15m'].empty:
+            # --- BTC Lead-Lag Feature Integration (for all TFs) ---
+            if ('5m' in out and not out['5m'].empty):
                 merged_df = pd.merge_asof(
                     out['5m'].sort_index(),
                     feat_btc.sort_index(),
@@ -239,13 +239,18 @@ class RealtimeIngest:
                 btc_ema_26 = btc_close.ewm(span=26, adjust=False).mean()
                 btc_lead_features["btc_macd"] = btc_ema_12 - btc_ema_26
 
+                # Generate lagged features and add them to ALL available ETH TF feature sets
                 for lag in range(1, 7):
                     lagged = btc_lead_features.shift(lag)
-                    lagged.columns = [f"{c}_lag{lag}_15m" for c in lagged.columns]
-                    out['15m'] = pd.concat([out['15m'], lagged], axis=1)
-                
-                out['5m'].fillna(0.0, inplace=True)
-                out['15m'].fillna(0.0, inplace=True)
+                    for tf in ['5m', '15m', '1h', '4h']:
+                        if tf in out:
+                            lagged_tf = lagged.copy()
+                            lagged_tf.columns = [f"{c}_lag{lag}_{tf}" for c in lagged_tf.columns]
+                            out[tf] = pd.concat([out[tf], lagged_tf], axis=1)
+
+                # Fill NA for all affected dataframes
+                for tf in ['5m', '15m', '1h', '4h']:
+                    if tf in out: out[tf].fillna(0.0, inplace=True)
 
         return out
 
