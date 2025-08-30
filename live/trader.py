@@ -332,7 +332,18 @@ class Trader:
                         # (1, 8, F) 배치로 정규화 → 예측
                         obs_mgr_norm = self.manager_vecnorm.normalize_obs(obs_mgr.reshape(1, *obs_mgr.shape))
                         act, _ = self.manager_model.predict(obs_mgr_norm, deterministic=True)
-                        conf_long, conf_short = float(act[0]), float(act[1])
+                        act = np.asarray(act)
+
+                        # SB3는 n_envs=1일 때 (1, action_dim)로 나올 수 있음
+                        if act.ndim == 2:
+                            action_vec = act[0]
+                        else:
+                            action_vec = act.reshape(-1)
+
+                        if action_vec.shape[0] < 2:
+                            raise RuntimeError(f"manager action shape unexpected: {act.shape}")
+
+                        conf_long, conf_short = float(action_vec[0]), float(action_vec[1])
 
                         # 데드존(학습값과 동일한 0.1) 처리
                         if max(conf_long, conf_short) < 0.1:
@@ -427,6 +438,50 @@ class Trader:
         
         # USDT 크기를 현재 가격으로 나누어 주문할 코인 수량을 계산
         return round(usdt_size / price, 6)
+
+    def _open(self, desired: int, price: float, ts: pd.Timestamp):
+        """
+        포지션 진입 처리.
+        desired:  1=LONG, -1=SHORT
+        """
+        if desired not in (-1, 1):
+            return
+        if self.pos != 0:
+            # 이미 포지션이 있으면 무시
+            return
+
+        # 체결가에 슬리피지 반영
+        px = price * (1 + SLIPPAGE) if desired == 1 else price * (1 - SLIPPAGE)
+
+        # === 실거래 진입 (live 전용) ===
+        if self.mode == "live" and self.exec:
+            try:
+                # 안전하게 기존 주문 삭제
+                self.exec.cancel_all_orders(SYMBOL)
+                side = "BUY" if desired == 1 else "SELL"
+                qty = self._calc_order_qty(px)
+                self.exec.place_market(SYMBOL, side, qty, reduce_only=False)
+            except Exception as e:
+                print(f"[{ts.strftime('%H:%M:%S')}] WARN: live open failed (ignored): {e}")
+
+        # === 로컬 상태 갱신 ===
+        self.pos = desired
+        self.entry_price = px
+        self.entry_time = ts
+        self.holding_steps = 0
+
+        # 진입 수수료 차감
+        self.eq -= self.eq * COMMISSION_SIDE
+
+        # 로그
+        log_path = os.path.join(LOG_DIR, "run_log.csv")
+        update_trade_log(log_path, {
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "ENTRY",
+            "position": "LONG" if desired == 1 else "SHORT",
+            "price": f"{px:,.4f}",
+            "profit": "-"
+        })
 
     def _close(self, price: float, ts: pd.Timestamp):
         if self.pos == 0:
