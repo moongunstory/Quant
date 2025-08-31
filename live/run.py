@@ -98,7 +98,7 @@ LOGS_DIR  = BASE_DIR / "data" / "logs"
 REPORT_DIR = BASE_DIR / "data" / "logs" / "reports"
 
 ENABLE_TRADING          = True
-TRADING_MODE            = os.getenv("TRADING_MODE", "live")  # live / paper 
+TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper 
 ENABLE_ONLINE_LEARNING  = True
 
 # === 텔레그램 봇 실행 옵션 ===

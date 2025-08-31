@@ -86,13 +86,12 @@ class Trader:
         elif self.mode == "live":
             print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
 
-        # Manager용 feature_list 로드
-        self.feature_list = []
-        for tf in ["5m", "15m", "1h", "4h"]:
-            feats_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
-            if os.path.exists(feats_path):
-                with open(feats_path, "r") as f: self.feature_list.extend(json.load(f))
-        self.feature_list = sorted(list(set(self.feature_list)))
+        # Manager용 feature_list 로드 (훈련 순서와 동일하게)
+        mgr_feats_1h, mgr_feats_4h = [], []
+        with open(os.path.join(PROC_DIR, "fe_feature_list_1h.json"), "r") as f: mgr_feats_1h = json.load(f)
+        with open(os.path.join(PROC_DIR, "fe_feature_list_4h.json"), "r") as f: mgr_feats_4h = json.load(f)
+        self.mgr_cols = mgr_feats_1h + mgr_feats_4h
+        print(f"[트레이더] Manager 피처 로드 완료: {len(self.mgr_cols)}개 (훈련 순서 반영)")
 
         # Worker 모델/VecNorm 로드
         self.worker_model: MaskablePPO = MaskablePPO.load(WORKER_MODEL_PATH, device="cpu")
@@ -103,18 +102,19 @@ class Trader:
         self.worker_vecnorm.norm_reward = False
         print(f"[트레이더] Worker 로드 완료: {os.path.basename(WORKER_MODEL_PATH)} | obs_shape={obs_shape_w}")
 
-        # Worker 피처 리스트 재구성 (fe.py 기준)
+        # Worker 피처 리스트 재구성 (fe.py 기준, 훈련 순서와 동일하게)
         print("[트레이더] Worker 피처 리스트를 훈련 과정에 맞춰 재구성합니다...")
-        self.worker_feature_list = []
-        for tf in ["5m", "15m", "1h", "4h"]:
-            feats_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
-            with open(feats_path, "r") as f: self.worker_feature_list.extend(json.load(f))
+        w_feats_5m, w_feats_15m, w_feats_1h, w_feats_4h = [], [], [], []
+        with open(os.path.join(PROC_DIR, "fe_feature_list_5m.json"), "r") as f: w_feats_5m = json.load(f)
+        with open(os.path.join(PROC_DIR, "fe_feature_list_15m.json"), "r") as f: w_feats_15m = json.load(f)
+        with open(os.path.join(PROC_DIR, "fe_feature_list_1h.json"), "r") as f: w_feats_1h = json.load(f)
+        with open(os.path.join(PROC_DIR, "fe_feature_list_4h.json"), "r") as f: w_feats_4h = json.load(f)
         
         btc_features = [
             'ret_1h_btc1h', 'ret_4h_btc1h', 'atr14_btc1h', 'HA_O_btc1h', 'HA_H_btc1h',
             'HA_L_btc1h', 'HA_C_btc1h', 'HA_TR_btc1h', 'HA_BC_btc1h', 'HA_R_btc1h'
         ]
-        self.worker_feature_list.extend(btc_features)
+        self.worker_feature_list = w_feats_5m + w_feats_15m + w_feats_1h + w_feats_4h + btc_features
         print(f"[트레이더] Worker 피처 리스트 재구성 완료: {len(self.worker_feature_list)}개 피처")
 
         # 관측 차원 정합성 검증
@@ -129,7 +129,7 @@ class Trader:
         self.manager_model: Optional[PPO] = None
         if os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH):
             try:
-                self.mgr_cols = sorted([c for c in self.feature_list if c.endswith("_1h") or c.endswith("_4h")])
+                                # self.mgr_cols는 이미 위에서 훈련 순서에 맞춰 생성되었으므로 이 라인은 제거합니다.
                 obs_shape_mgr = (8, len(self.mgr_cols))
                 act_space_mgr = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -329,9 +329,10 @@ class Trader:
                 obs_mgr = self._build_manager_obs_live(X_dict, t_idx)
                 if obs_mgr is not None:
                     try:
-                        # (1, 8, F) 배치로 정규화 → 예측
-                        obs_mgr_norm = self.manager_vecnorm.normalize_obs(obs_mgr.reshape(1, *obs_mgr.shape))
-                        act, _ = self.manager_model.predict(obs_mgr_norm, deterministic=True)
+                        # (8, F) 2D 데이터 정규화 후 (1, 8, F) 3D 배치로 변환
+                        obs_mgr_2d_norm = self.manager_vecnorm.normalize_obs(obs_mgr)
+                        obs_mgr_3d_for_predict = obs_mgr_2d_norm.reshape(1, *obs_mgr_2d_norm.shape)
+                        act, _ = self.manager_model.predict(obs_mgr_3d_for_predict, deterministic=True)
                         act = np.asarray(act)
 
                         # SB3는 n_envs=1일 때 (1, action_dim)로 나올 수 있음
