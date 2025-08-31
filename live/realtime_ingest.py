@@ -203,56 +203,74 @@ class RealtimeIngest:
     def _build_features(self, df5: pd.DataFrame, df_btc1h: pd.DataFrame) -> dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
         base_index = df5.index
-        
+
         # ETH TFs
         agg = {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
         for tf, rule in TF_RULES.items():
-            df_tf = df5 if tf == "5m" else df5.resample(rule).agg(agg).dropna()
+            df_tf = df5 if tf == "5m" else (
+                df5.resample(rule, label="left", closed="left", origin="start_day")
+                   .agg(agg).dropna()
+            )
             if df_tf.empty: continue
             feat_tf = compute_features_for_tf(df_tf, tf)
             out[tf] = feat_tf.reindex(base_index, method="ffill").fillna(0.0)
 
-        # BTC 1h
+        # --- BTC 1h ---
         if df_btc1h is not None and not df_btc1h.empty:
-            feat_btc = compute_features_for_tf(df_btc1h, "btc1h")
-            out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
+            df_btc1h = df_btc1h.sort_index()
+            assert df_btc1h.index.tz is not None, "btc1h index must be tz-aware (UTC)"
+            assert df5.index.tz is not None, "5m index must be tz-aware (UTC)"
 
-            # --- BTC Lead-Lag Feature Integration (for all TFs) ---
-            if ('5m' in out and not out['5m'].empty):
-                merged_df = pd.merge_asof(
-                    out['5m'].sort_index(),
-                    feat_btc.sort_index(),
-                    left_index=True, right_index=True,
+            feat_btc = compute_features_for_tf(df_btc1h, "btc1h").sort_index()
+
+            if '5m' in out and not out['5m'].empty:
+                # 1. 5m 기준 DF와 1h BTC 피처를 as-of 병합
+                merged = pd.merge_asof(
+                    out["5m"].sort_index(),
+                    feat_btc,
+                    left_index=True,
+                    right_index=True,
                     direction="backward",
                     allow_exact_matches=True,
-                                                                                tolerance=pd.Timedelta("8h"),
+                    tolerance=pd.Timedelta("8h"),
                 )
                 
-                btc_close = merged_df["Close_btc1h"].astype(float)
-                btc_vol = merged_df["Volume_btc1h"].astype(float)
-                
-                btc_lead_features = pd.DataFrame(index=out['5m'].index)
-                btc_lead_features["btc_ret_1h"] = btc_close.pct_change()
-                btc_lead_features["btc_vol_z_24"] = zscore(btc_vol, win=24)
-                
-                btc_ema_12 = btc_close.ewm(span=12, adjust=False).mean()
-                btc_ema_26 = btc_close.ewm(span=26, adjust=False).mean()
-                btc_lead_features["btc_macd"] = btc_ema_12 - btc_ema_26
+                # 2. (중요) 병합 후 생긴 NaN을 ffill로 채워 시계열 연속성 유지
+                merged.ffill(inplace=True)
 
-                # Generate lagged features and add them to ALL available ETH TF feature sets
+                # 3. ffill 후에도 남은 NaN은 0으로 (주로 맨 앞 구간)
+                merged.fillna(0.0, inplace=True)
+
+                # 4. 연속성이 보장된 데이터로 피처 계산
+                btc_close = merged["Close_btc1h"].astype(float)
+                btc_vol   = merged["Volume_btc1h"].astype(float)
+
+                lead = pd.DataFrame(index=merged.index)
+                lead["btc_ret_1h"]   = btc_close.pct_change()
+                lead["btc_vol_z_24"] = zscore(btc_vol, win=24)
+                ema12, ema26 = btc_close.ewm(span=12, adjust=False).mean(), btc_close.ewm(span=26, adjust=False).mean()
+                lead["btc_macd"] = ema12 - ema26
+
+                # 5. Lag 피처 생성 후 모든 TF에 추가
                 for lag in range(1, 7):
-                    lagged = btc_lead_features.shift(lag)
-                    for tf in ['5m', '15m', '1h', '4h']:
-                        if tf in out:
-                            lagged_tf = lagged.copy()
-                            lagged_tf.columns = [f"{c}_lag{lag}_{tf}" for c in lagged_tf.columns]
-                            out[tf] = pd.concat([out[tf], lagged_tf], axis=1)
+                    lagged = lead.shift(lag)
+                    for tf_key in ["5m", "15m", "1h", "4h"]:
+                        if tf_key in out:
+                            tmp = lagged.copy()
+                            tmp.columns = [f"{c}_lag{lag}_{tf_key}" for c in tmp.columns]
+                            out[tf_key] = pd.concat([out[tf_key], tmp], axis=1)
 
-                # Fill NA for all affected dataframes
-                for tf in ['5m', '15m', '1h', '4h']:
-                    if tf in out: out[tf].fillna(0.0, inplace=True)
+            # 6. 모든 TF에 대해 최종적으로 결측값 처리
+            for tf_key in ["5m", "15m", "1h", "4h"]:
+                if tf_key in out:
+                    out[tf_key].replace([np.inf, -np.inf], np.nan, inplace=True)
+                    out[tf_key].fillna(0.0, inplace=True)
+
+            # 7. btc1h 원본 피처도 5m 인덱스에 맞춰 저장
+            out["btc1h"] = feat_btc.reindex(base_index, method="ffill").fillna(0.0)
 
         return out
+
 
     def _emit(self) -> Optional[pd.Timestamp]:
         latest_open = self.df5m.index[-1]

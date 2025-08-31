@@ -2,7 +2,8 @@
 """
 Main Runner for Live Trading Stack (HRL/MTF compatible)
 - RealtimeIngestMTF(5m 확정봉 + 15m/1h/4h 피처) → Dispatcher → Trader / OnlineLearner
-- 온라인 업데이트(KL 가드) + 모델 자동 리로드(Worker/MaskablePPO 대응)
+- ✅ 온라인 학습은 오직 여기(run.py)에서만 수행 (Trader와 완전 분리)
+- 모델 자동 리로드(Worker/MaskablePPO 대응)
 """
 
 from __future__ import annotations
@@ -12,10 +13,6 @@ import time
 import threading
 import logging
 import warnings
-
-# ====== 로거 설정 ======
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)
 import csv
 import subprocess
 from queue import Queue
@@ -24,7 +21,10 @@ from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
-# from dotenv import load_dotenv # Replaced with manual parser
+
+# ====== 로거 설정 ======
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def manual_load_dotenv(dotenv_path):
     """A simple, robust .env parser to replace python-dotenv."""
@@ -36,7 +36,6 @@ def manual_load_dotenv(dotenv_path):
                     key, value = line.split('=', 1)
                     key = key.strip()
                     value = value.strip()
-                    # Handle quoted values
                     if len(value) > 1 and value.startswith('"') and value.endswith('"'):
                         value = value[1:-1]
                     elif len(value) > 1 and value.startswith("'") and value.endswith("'"):
@@ -60,9 +59,8 @@ def _ppo_load_safe(path, *args, **kwargs):
         co.setdefault("clip_range", _const_schedule(0.2))
         kwargs["custom_objects"] = co
         return __ORIG_PPO_LOAD(path, *args, **kwargs)
-PPO.load = _ppo_load_safe  # 전역 패치
+PPO.load = _ppo_load_safe
 
-# ➕ MaskablePPO도 동일 가드 적용
 from sb3_contrib import MaskablePPO as _MaskablePPO
 __ORIG_MLOAD = _MaskablePPO.load
 def _mppo_load_safe(path, *args, **kwargs):
@@ -74,7 +72,7 @@ def _mppo_load_safe(path, *args, **kwargs):
         co.setdefault("clip_range", _const_schedule(0.2))
         kwargs["custom_objects"] = co
         return __ORIG_MLOAD(path, *args, **kwargs)
-_MaskablePPO.load = _mppo_load_safe  # 전역 패치
+_MaskablePPO.load = _mppo_load_safe
 
 # --- 내부 모듈 경로 ---
 import sys
@@ -82,8 +80,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 # ⚠️ MTF 인제스터로 교체
 from ai_binance.live.realtime_ingest import RealtimeIngest as RealtimeIngest
-from ai_binance.live.trader import Trader                    # HRL/MaskablePPO 대응 리팩터
-from ai_binance.live.learner import OnlineLearner     # 모듈명 수정(learner → online_learner)
+from ai_binance.live.trader import Trader                    # HRL/MaskablePPO 대응
+from ai_binance.live.learner import OnlineLearner            # 온라인 학습은 run에서만
 
 # .env 로드 (프로젝트 루트 기준)
 dotenv_path = Path(__file__).resolve().parent.parent.parent / '.env'
@@ -98,14 +96,14 @@ LOGS_DIR  = BASE_DIR / "data" / "logs"
 REPORT_DIR = BASE_DIR / "data" / "logs" / "reports"
 
 ENABLE_TRADING          = True
-TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper 
+TRADING_MODE            = os.getenv("TRADING_MODE", "paper")  # live / paper
 ENABLE_ONLINE_LEARNING  = True
 
 # === 텔레그램 봇 실행 옵션 ===
 ENABLE_TELEGRAM_BOT = True
 TELEGRAM_BOT_PATH   = BASE_DIR / "telegram_bot.py"  # .env는 bot 내부에서 로드
 
-# === 온라인 학습 트리거(보수형) ===
+# === 온라인 학습 트리거(보수형, ingest 꼬리 기반) ===
 MIN_BUFFER_BARS     = 15_000   # ~52d @5m
 TRIGGER_EVERY_BARS  = 5_000    # ~17.4d @5m
 PROMO_COOLDOWN_BARS = 576      # 48h @5m
@@ -215,20 +213,29 @@ def _mtime(path: str) -> float:
 # =========================
 class Dispatcher(threading.Thread):
     daemon = True
-    def __init__(self, ingest_q: Queue, trader_q: Queue, learn_q: Queue):
+    def __init__(self, ingest_q: Queue, trader_q: Queue, learn_q: Queue, enable_learn: bool):
         super().__init__(name="Dispatcher")
         self.ingest_q = ingest_q
         self.trader_q = trader_q
         self.learn_q = learn_q
+        self.enable_learn = enable_learn
     def run(self):
         logger.info("디스패처 시작됨")
         while True:
             pkt = self.ingest_q.get()
-            for q in (self.trader_q, self.learn_q):
+            # Trader로 전달
+            try:
+                if self.trader_q.full():
+                    self.trader_q.get_nowait()
+                self.trader_q.put_nowait(pkt)
+            except Exception:
+                pass
+            # Learner로 전달(옵션)
+            if self.enable_learn:
                 try:
-                    if q.full():
-                        q.get_nowait()
-                    q.put_nowait(pkt)
+                    if self.learn_q.full():
+                        self.learn_q.get_nowait()
+                    self.learn_q.put_nowait(pkt)
                 except Exception:
                     pass
 
@@ -251,7 +258,6 @@ class TraderReloader(threading.Thread):
             if mt > self._last_mtime:
                 self._last_mtime = mt
                 try:
-                    # Trader는 worker_model(MaskablePPO)을 사용함
                     model_cls = getattr(self.trader.worker_model, "__class__", None)
                     if model_cls is None:
                         from sb3_contrib import MaskablePPO
@@ -263,7 +269,7 @@ class TraderReloader(threading.Thread):
                     logger.error(f"리로드 실패: {e}", exc_info=True)
 
 # =========================
-# 온라인 학습 워커
+# 온라인 학습 워커 (ingest 꼬리 기반만)
 # =========================
 class OnlineLearnWorker(threading.Thread):
     daemon = True
@@ -282,34 +288,24 @@ class OnlineLearnWorker(threading.Thread):
         while True:
             pkt = self.learn_q.get()
 
-            # ---- (A) Trader → rollout 온라인 업데이트 ----
-            if isinstance(pkt, dict) and {"obs", "actions", "rewards", "dones", "values", "log_probs"} <= set(pkt.keys()):
-                try:
-                    improved = self.ol.update_from_rollout(
-                        pkt,
-                        max_kl=0.02, epochs=1, batch_size=1024, lr=5e-5,
-                        X_val=self.X_tail.iloc[-3000:] if isinstance(self.X_tail, pd.DataFrame) and len(self.X_tail) >= 3000 else None,
-                        close_val=self.close_tail.iloc[-3000:] if isinstance(self.close_tail, pd.Series) and len(self.close_tail) >= 3000 else None,
-                        funding_val=self.funding_tail.iloc[-3000:] if isinstance(self.funding_tail, pd.Series) and len(self.funding_tail) >= 3000 else None,
-                        save_if_improved=True
-                    )
-                    if improved:
-                        logger.info("✅ 온라인 업데이트 저장 완료")
-                    else:
-                        logger.info("ℹ️ 온라인 업데이트 미적용(KL 초과/조건 미충족)")
-                except Exception as e:
-                    logger.error(f"온라인 업데이트 실패: {e}", exc_info=True)
+            # (B) Ingest → 최근 꼬리 적재 및 주기적 미세조정
+            try:
+                X_5m: pd.DataFrame = pkt.get("X_5m") or pkt.get("X")  # 호환
+                close: pd.Series = pkt["close"]
+            except Exception as e:
+                logger.error(f"학습 패킷 해석 실패: {e}", exc_info=True)
                 continue
-
-            # ---- (B) Ingest → 최근 꼬리 적재 및 주기적 미세조정 ----
-            X_5m: pd.DataFrame = pkt.get("X_5m") or pkt.get("X")  # 호환
-            close: pd.Series = pkt["close"]
-            funding: Optional[pd.Series] = pkt.get("funding")
 
             # 5m 기준 꼬리만 보관(학습 분포 안정)
             want_tail = max(MIN_BUFFER_BARS + TRIGGER_EVERY_BARS + 5000, 30000)
-            X_5m = (X_5m.get("X") or X_5m.get("5m")).iloc[-want_tail:].copy()
+            try:
+                X_5m = (X_5m.get("X") or X_5m.get("5m")).iloc[-want_tail:].copy()
+            except Exception:
+                # pkt["X"]가 dict 형태인 최신 스키마를 가정
+                X_5m = X_5m.get("5m").iloc[-want_tail:].copy()
+
             close = close.reindex(X_5m.index).ffill().bfill()
+            funding = pkt.get("funding")
             if funding is not None:
                 funding = funding.reindex(X_5m.index).ffill().bfill()
 
@@ -380,6 +376,7 @@ def main():
     learn_q  = Queue(maxsize=LEARN_QUEUE_MAX)
 
     ingest = RealtimeIngest(ingest_q)  # MTF 인제스터(5m 확정+MTF 피처)
+
     trader = None
     if ENABLE_TRADING:
         trader = Trader(
@@ -388,13 +385,13 @@ def main():
             api_key=os.getenv('BINANCE_API_KEY'),
             secret_key=os.getenv('BINANCE_SECRET_KEY')
         )
-        try:
-            setattr(trader, "learn_q", learn_q)  # Trader → Learner rollout 전달
-        except Exception:
-            pass
 
-    disp = Dispatcher(ingest_q, trader_q if ENABLE_TRADING else Queue(1),
-                      learn_q if ENABLE_ONLINE_LEARNING else Queue(1))
+    disp = Dispatcher(
+        ingest_q,
+        trader_q if ENABLE_TRADING else Queue(1),
+        learn_q if ENABLE_ONLINE_LEARNING else Queue(1),
+        enable_learn=ENABLE_ONLINE_LEARNING
+    )
 
     learn_worker = OnlineLearnWorker(learn_q) if ENABLE_ONLINE_LEARNING else None
     reloader = TraderReloader(trader, str(LIVE_OUT_PATH)) if (ENABLE_TRADING and ENABLE_ONLINE_LEARNING) else None
