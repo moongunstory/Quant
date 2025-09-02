@@ -1,25 +1,8 @@
-# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-6.4 / Final Fix)
-"""
-- NEW (REV-6.4):
-  * CRITICAL FIX: f-string 내에 이중 중괄호({{}})가 사용된 치명적 버그 수정.
-
-- NEW (REV-6.3):
-  * WORKAROUND: f-string 포매팅을 .format() 방식으로 변경하여 이례적인 환경 문제에 대응.
-
-- NEW (REV-6.2):
-  * DEBUG: _load_raw 함수에 print 구문을 추가하여 파일 경로 생성 문제를 디버깅.
-
-- NEW (REV-6.1):
-  * BUGFIX: _load_raw 함수에서 val/test 데이터셋의 파일 경로를 잘못 생성하던 오류 수정.
-
-- NEW (REV-6):
-  * BTC 1h 리드-래그(Lead-Lag) 피처 추가.
-"""
-
+# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-7.0b / Role-Tuned, VWAP Series guard)
 from __future__ import annotations
 
 import os, json
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -51,7 +34,6 @@ SCALER_PATH_FMT       = os.path.join(OUT_DIR, "scaler_{tf}.joblib")
 REF_COLS_CANON = ["Open", "High", "Low", "Close", "Volume", "FundingRate"]
 
 # ===== Utilities =====
-
 def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
     df = df.replace([np.inf, -np.inf], np.nan)
     std = df.std(numeric_only=True)
@@ -59,6 +41,14 @@ def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
     if len(zero_std_cols) > 0:
         df[zero_std_cols] = 0.0
     return df.fillna(0.0)
+
+def _as_series(x):
+    import pandas as pd
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] == 1:
+            return x.iloc[:, 0]
+        return x.mean(axis=1)
+    return x
 
 def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
     if win is None:
@@ -70,6 +60,9 @@ def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
         sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
         out = (s - mu) / sd
     return out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+def pct_slope(x: pd.Series, win: int) -> pd.Series:
+    return x.pct_change().rolling(win, min_periods=win).mean().fillna(0.0)
 
 def _enforce_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -89,7 +82,6 @@ def _load_raw(split: str, interval: str) -> pd.DataFrame:
         p = os.path.join(RAW_DIR, "btcusdt", f"fut_{split}_data_1h.parquet")
     else:
         p = os.path.join(RAW_DIR, "ethusdt", f"fut_{split}_data_{interval}.parquet")
-
     if not os.path.exists(p):
         raise FileNotFoundError(f"Raw data file not found: {p}")
 
@@ -122,11 +114,9 @@ def _load_raw(split: str, interval: str) -> pd.DataFrame:
             df["FundingSettle"] = (((df.index.hour % 8 == 0) & (df.index.minute == 0))).astype("int8")
         else:
             df["FundingSettle"] = df["FundingSettle"].astype("int8")
-
     return df
 
-# ===== Indicators =====
-
+# ===== Core Indicators & Blocks =====
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df["High"].astype(float), df["Low"].astype(float), df["Close"].astype(float)
     prev_close = close.shift(1)
@@ -157,12 +147,106 @@ def compute_heikin_ashi(df_ohlc: pd.DataFrame, o="Open", h="High", l="Low", c="C
     out["HA_R"]  = out["HA_C"].pct_change().fillna(0.0)
     return out
 
-# ===== Feature Engines =====
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
 
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up, down = delta.clip(lower=0), (-delta).clip(lower=0)
+    rs = up.ewm(alpha=1/period, adjust=False).mean() / down.ewm(alpha=1/period, adjust=False).mean()
+    return (100 - (100 / (1 + rs))).fillna(50)
+
+def bollinger(series: pd.Series, win: int = 20, k: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    m = series.rolling(win, min_periods=win).mean()
+    s = series.rolling(win, min_periods=win).std()
+    upper, lower = m + k*s, m - k*s
+    return m, upper, lower
+
+def keltner(df: pd.DataFrame, ema_win: int = 20, atr_win: int = 20, mult: float = 1.5) -> Tuple[pd.Series, pd.Series]:
+    mid = ema(df["Close"].astype(float), ema_win)
+    rng = _atr(df, period=atr_win) * mult
+    upper, lower = mid + rng, mid - rng
+    return upper, lower
+
+def stoch_rsi(series: pd.Series, rsi_win: int = 14, stoch_win: int = 14) -> Tuple[pd.Series, pd.Series]:
+    r = rsi(series, rsi_win)
+    low = r.rolling(stoch_win, min_periods=stoch_win).min()
+    high = r.rolling(stoch_win, min_periods=stoch_win).max()
+    k = (r - low) / (high - low + 1e-9)
+    d = k.rolling(3, min_periods=3).mean()
+    return k.fillna(0.5), d.fillna(0.5)
+
+def supertrend(df: pd.DataFrame, atr_period: int = 10, multiplier: float = 3.0) -> pd.Series:
+    atr = _atr(df, period=atr_period)
+    hl2 = (df["High"] + df["Low"]) / 2.0
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
+    dir_ = pd.Series(1, index=df.index, dtype="int8")
+    st = pd.Series(index=df.index, dtype="float64")
+    for i in range(len(df)):
+        if i == 0:
+            st.iloc[i] = lower.iloc[i]
+            dir_.iloc[i] = 1
+        else:
+            if df["Close"].iloc[i] > st.iloc[i-1]:
+                dir_.iloc[i] = 1
+            elif df["Close"].iloc[i] < st.iloc[i-1]:
+                dir_.iloc[i] = -1
+            else:
+                dir_.iloc[i] = dir_.iloc[i-1]
+            st.iloc[i] = upper.iloc[i] if dir_.iloc[i] == 1 else lower.iloc[i]
+    return dir_
+
+def donchian(df: pd.DataFrame, win: int = 20) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    hi = df["High"].rolling(win, min_periods=win).max()
+    lo = df["Low"].rolling(win, min_periods=win).min()
+    mid = (hi + lo) / 2.0
+    return hi, mid, lo
+
+def kama(series: pd.Series, n: int = 30, fast: int = 2, slow: int = 30) -> pd.Series:
+    change = series.diff(n).abs()
+    volatility = series.diff().abs().rolling(n, min_periods=n).sum()
+    er = (change / (volatility + 1e-9)).fillna(0.0)
+    fast_sc = 2/(fast+1); slow_sc = 2/(slow+1)
+    sc = (er*(fast_sc - slow_sc) + slow_sc)**2
+    kama = series.copy()
+    for i in range(1, len(series)):
+        kama.iloc[i] = kama.iloc[i-1] + sc.iloc[i]*(series.iloc[i] - kama.iloc[i-1])
+    return kama
+
+def anchored_vwap(df: pd.DataFrame, anchor: str = "W") -> pd.Series:
+    price = df["Close"].astype(float)
+    vol = np.clip(pd.to_numeric(df["Volume"], errors="coerce"), 0, None)
+    if anchor == "M":
+        anchor = "ME"
+    key = pd.Grouper(freq=anchor, label="left", closed="left")
+    g = df.groupby(key, group_keys=False)
+    pv_cum = g.apply(lambda x: (x["Close"]*np.clip(pd.to_numeric(x["Volume"], errors="coerce"),0,None)).cumsum())
+    v_cum  = g.apply(lambda x: np.clip(pd.to_numeric(x["Volume"], errors="coerce"),0,None).cumsum())
+    vwap = (pv_cum / (v_cum + 1e-9)).reindex(df.index).ffill().fillna(price)
+    return vwap
+
+def tails_ratio(df: pd.DataFrame, win: int = 20) -> pd.Series:
+    up_tail = (df["High"] - df[["Open","Close"]].max(axis=1)).clip(lower=0)
+    dn_tail = (df[["Open","Close"]].min(axis=1) - df["Low"]).clip(lower=0)
+    up_m = up_tail.rolling(win, min_periods=win).mean()
+    dn_m = dn_tail.rolling(win, min_periods=win).mean()
+    return (up_m / (dn_m + 1e-9)).fillna(1.0)
+
+def realized_variance(ret: pd.Series, win: int = 12) -> pd.Series:
+    return (ret.fillna(0.0)**2).rolling(win, min_periods=win).sum()
+
+def cmf_proxy(df: pd.DataFrame, win: int = 20) -> pd.Series:
+    mfm = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"] + 1e-9)
+    mfv = mfm * np.clip(pd.to_numeric(df["Volume"], errors="coerce"), 0, None)
+    return mfv.rolling(win, min_periods=win).sum()
+
+# ===== Feature Engines (Role-Tuned) =====
 def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df = df.sort_index()
     out = pd.DataFrame(index=df.index)
 
+    # ===== BTC 1h (standalone) =====
     if interval == "btc1h":
         close = df["Close"].astype(float)
         out["ret_1h"] = close.pct_change()
@@ -174,61 +258,161 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         ref = df[REF_COLS_CANON].copy()
         return _sanitize(pd.concat([out, ref], axis=1))
 
-    close, high, low, volume = df["Close"].astype(float), df["High"].astype(float), df["Low"].astype(float), df["Volume"].astype(float)
-
-    out["ret_1"] = close.pct_change()
+    # ===== 공통 기본 =====
+    close, high, low, volume = (
+        df["Close"].astype(float),
+        df["High"].astype(float),
+        df["Low"].astype(float),
+        df["Volume"].astype(float),
+    )
+    ret1 = close.pct_change().fillna(0.0)
+    out["ret_1"] = ret1
     out["ret_3"] = close.pct_change(3)
-    out["z_close_48"] = zscore(close, win=48)
-    out["hl_spread"] = (high - low) / close
+    out["hl_spread"] = (high - low) / (close + 1e-9)
     out["vol_z_48"] = zscore(volume, win=48)
-
-    ema_12, ema_26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
-    out["macd"], out["macd_sig"] = ema_12 - ema_26, (ema_12 - ema_26).ewm(span=9, adjust=False).mean()
-    out["macd_hist"] = out["macd"] - out["macd_sig"]
-
-    delta = close.diff()
-    up, down = delta.clip(lower=0), (-delta).clip(lower=0)
-    rs = up.ewm(alpha=1/14, adjust=False).mean() / down.ewm(alpha=1/14, adjust=False).mean()
-    out["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50)
-
     out["atr14"] = _atr(df, period=14)
-
     ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
     out = pd.concat([out, ha], axis=1)
 
-    if interval == BASE_INTERVAL:
+    # ===== 역할 맞춤 추가 =====
+    if interval == "4h":
+        ema50, ema100, ema200 = ema(close,50), ema(close,100), ema(close,200)
+        out["ema50_slope"]  = pct_slope(ema50, 5)
+        out["ema100_slope"] = pct_slope(ema100, 5)
+        out["ema200_slope"] = pct_slope(ema200, 5)
+        out["ema50_200_spread"] = (ema50 - ema200) / (ema200 + 1e-9)
+
+        cross_up = ((ema50.shift(1) < ema200.shift(1)) & (ema50 >= ema200)).astype(int)
+        cross_dn = ((ema50.shift(1) > ema200.shift(1)) & (ema50 <= ema200)).astype(int)
+        cross = (cross_up - cross_dn).replace({-1: -1, 0: 0, 1: 1})
+        out["bars_since_cross"] = (cross != 0).cumsum()
+        out["bars_since_cross"] = out["bars_since_cross"].where(cross==0, 0).cumsum()
+
+        di_win = 14
+        dm_plus  = (high - high.shift(1)).clip(lower=0)
+        dm_minus = (low.shift(1) - low).clip(lower=0)
+        tr = (pd.concat([(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1)).max(axis=1)
+        di_plus = 100 * (dm_plus.ewm(alpha=1/di_win, adjust=False).mean() / (tr.ewm(alpha=1/di_win, adjust=False).mean() + 1e-9))
+        di_minus= 100 * (dm_minus.ewm(alpha=1/di_win, adjust=False).mean() / (tr.ewm(alpha=1/di_win, adjust=False).mean() + 1e-9))
+        out["adx_14"] = 100 * ( (di_plus - di_minus).abs() / (di_plus + di_minus + 1e-9) )
+
+        out["supertrend_dir"] = supertrend(df, atr_period=10, multiplier=3.0)
+
+        hi, mid, lo = donchian(df, win=20)
+        width = (hi - lo).replace(0, np.nan)
+        out["donch_mid_dist"] = (close - mid) / (width + 1e-9)
+        out["donch_pos"] = (close - lo) / (width + 1e-9)
+
+        out["kama_slope"] = pct_slope(kama(close, 30), 5)
+
+        macd = ema(close,12) - ema(close,26)
+        sig  = ema(macd,9)
+        out["macd_hist"] = macd - sig
+
+    elif interval == "1h":
+        ema20, ema50 = ema(close,20), ema(close,50)
+        out["ema20_slope"] = pct_slope(ema20, 5)
+        out["ema50_slope"] = pct_slope(ema50, 5)
+        out["price_ema20_z"] = zscore((close - ema20) / (ema20 + 1e-9), win=48)
+
+        m, up, lo = bollinger(close, win=20, k=2.0)
+        out["bb_width_pct"] = (up - lo) / (m + 1e-9)
+
+        r = rsi(close, 14)
+        out["rsi_14"] = r
+        out["rsi_neutral_stay"] = ((r.between(40,60)).astype(int).rolling(24, min_periods=1).mean())
+
+        vwap_w = _as_series(anchored_vwap(df, "W"))
+        vwap_m = _as_series(anchored_vwap(df, "M"))
+        out["dist_vwap_w"] = (close - vwap_w) / (vwap_w + 1e-9)
+        out["dist_vwap_m"] = (close - vwap_m) / (vwap_m + 1e-9)
+
+        atr = _atr(df, 14)
+        q = pd.qcut(atr.replace(0, np.nan).ffill(), 3, labels=False, duplicates="drop").fillna(1).astype(int)
+        out["atr_regime_low"]  = (q==0).astype(int)
+        out["atr_regime_mid"]  = (q==1).astype(int)
+        out["atr_regime_high"] = (q>=2).astype(int)
+
+    elif interval == "15m":
+        m, up, lo = bollinger(close, win=20, k=2.0)
+        ku, kl = keltner(df, ema_win=20, atr_win=20, mult=1.5)
+        bb_w = (up - lo); kc_w = (ku - kl)
+        out["squeeze_ratio"] = (bb_w / (kc_w + 1e-9)) - 1.0
+
+        k, d_ = stoch_rsi(close, 14, 14)
+        out["stochrsi_k"], out["stochrsi_d"] = k, d_
+
+        out["tails_ratio_20"] = tails_ratio(df, win=20)
+        comp = (bb_w.pct_change().rolling(10, min_periods=1).mean() < 0).astype(int)
+        out["compress_run"] = comp.groupby((comp != comp.shift()).cumsum()).cumsum()
+
+        out["ret_5"]  = close.pct_change(5)
+        out["ret_10"] = close.pct_change(10)
+
+    elif interval == "5m":
+        out["atr3"] = _atr(df, period=3)
+        out["rv_12"] = realized_variance(ret1, win=12)
+
+        vwap_d = _as_series(anchored_vwap(df, "D"))
+        vwap_w = _as_series(anchored_vwap(df, "W"))
+        out["dist_vwap_d"] = (close - vwap_d) / (vwap_d + 1e-9)
+        out["dist_vwap_w"] = (close - vwap_w) / (vwap_w + 1e-9)
+        out["vwap_d_slope"] = pct_slope(vwap_d, 12)
+
+        out["momo_1"] = ret1
+        out["momo_3"] = close.pct_change(3)
+        out["momo_5"] = close.pct_change(5)
+        n_break = 36
+        out["break_up"]   = (close > close.rolling(n_break, min_periods=n_break).max().shift(1)).astype(int)
+        out["break_down"] = (close < close.rolling(n_break, min_periods=n_break).min().shift(1)).astype(int)
+
+        out["obv_like"] = (np.sign(close.diff().fillna(0.0)) * volume).cumsum()
+        out["cmf_proxy"] = cmf_proxy(df, win=20)
+
         out['hour_sin'], out['hour_cos'] = np.sin(2*np.pi*df.index.hour/24), np.cos(2*np.pi*df.index.hour/24)
-        out['day_sin'], out['day_cos'] = np.sin(2*np.pi*df.index.dayofweek/7), np.cos(2*np.pi*df.index.dayofweek/7)
+        out['day_sin'],  out['day_cos']  = np.sin(2*np.pi*df.index.dayofweek/7), np.cos(2*np.pi*df.index.dayofweek/7)
         out = pd.concat([out, _funding_phase_features(out.index)], axis=1)
-        out["is_funding_settle"] = df.get("FundingSettle", 0).astype("int8")
+        # >>> fixed: 기본값을 index 정렬된 Series(0)로 만들어서 astype 가능하게
+        settle_series = df["FundingSettle"] if "FundingSettle" in df.columns else pd.Series(0, index=df.index)
+        out["is_funding_settle"] = settle_series.astype("int8")
         out["funding_z_48"] = zscore(df["FundingRate"].astype(float), win=48)
 
+    # ===== BTC 리드/래그 & 상관/베타 =====
     if btc_df is not None:
         btc_renamed = btc_df.rename(columns={c: f"{c}_btc1h" for c in btc_df.columns})
-        merged_df = pd.merge_asof(df, btc_renamed, on="time", direction="backward")
-        
-        btc_close = merged_df["Close_btc1h"].astype(float)
-        btc_vol = merged_df["Volume_btc1h"].astype(float)
-        
-        btc_lead_features = pd.DataFrame(index=df.index)
-        btc_lead_features["btc_ret_1h"] = btc_close.pct_change()
-        btc_lead_features["btc_vol_z_24"] = zscore(btc_vol, win=24)
-        
-        btc_ema_12 = btc_close.ewm(span=12, adjust=False).mean()
-        btc_ema_26 = btc_close.ewm(span=26, adjust=False).mean()
-        btc_lead_features["btc_macd"] = btc_ema_12 - btc_ema_26
+        merged = pd.merge_asof(df.reset_index(), btc_renamed.reset_index(), on="time", direction="backward").set_index("time")
+        btc_close = merged["Close_btc1h"].astype(float)
+        btc_vol   = merged.get("Volume_btc1h", pd.Series(0, index=merged.index)).astype(float)
 
-        for lag in range(1, 7):
-            lagged = btc_lead_features.shift(lag)
-            lagged.columns = [f"{c}_lag{lag}" for c in lagged.columns]
-            out = pd.concat([out, lagged], axis=1)
+        out["btc_ret_1h"]    = btc_close.pct_change()
+        out["btc_vol_z_24"]  = zscore(btc_vol, win=24)
+        btc_macd = ema(btc_close,12) - ema(btc_close,26)
+        out["btc_macd"] = btc_macd
+        for lag in range(1, 3):
+            out[f"btc_ret_1h_lag{lag}"] = out["btc_ret_1h"].shift(lag)
+            out[f"btc_ret_1h_lead{lag}"] = out["btc_ret_1h"].shift(-lag)
+
+        if interval in ("1h","4h"):
+            w = 24 if interval=="1h" else 6
+        elif interval=="15m":
+            w = 96
+        else:
+            w = 288
+        e_ret = close.pct_change()
+        b_ret = btc_close.pct_change()
+        cov = e_ret.rolling(w).cov(b_ret)
+        var_b = b_ret.rolling(w).var()
+        beta = (cov / (var_b + 1e-9)).fillna(0.0)
+        out["btc_beta"] = beta
+        spread = e_ret - beta*b_ret
+        out["btc_spread_z"] = zscore(spread, win=w)
+        out["btc_corr_win"] = e_ret.rolling(w).corr(b_ret).fillna(0.0)
 
     out.columns = [f"{c}_{interval}" for c in out.columns]
     final_out = pd.concat([out, df[REF_COLS_CANON]], axis=1)
     return _sanitize(final_out)
 
 # ===== Feature Search & Scaler =====
-
 def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
     return (df["Close"].astype(float).pct_change().shift(-1) > 0).astype(int).fillna(0)
 
@@ -247,7 +431,6 @@ def _feature_search_for_tf(train_df: pd.DataFrame, tf: str) -> List[str]:
         y_tr = _make_proxy_y(train_df)
         k = min(TOP_K_PER_TF.get(tf, len(feat_cols)), len(feat_cols))
         keep = _feature_search_mi(train_df[feat_cols], y_tr, k)
-    
     path = FEATURE_LIST_PATH_FMT.format(tf=tf)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(keep, f, ensure_ascii=False, indent=2)
@@ -263,12 +446,11 @@ def _fit_scaler_for_tf(train_df: pd.DataFrame, feat_list: List[str], tf: str) ->
     return sc
 
 # ===== Main =====
-
 def main():
-    print("[1/4] Loading all raw data...")
+    print("[1/5] Loading all raw data...")
     raw_data = {s: {tf: _load_raw(s, tf) for tf in TIMEFRAMES} for s in ["train", "val", "test"]}
 
-    print("\n[2/4] Pre-computing BTC features...")
+    print("\n[2/5] Pre-computing BTC features...")
     btc_features = {}
     for split in ["train", "val", "test"]:
         btc_df_raw = raw_data[split]["btc1h"]
@@ -277,7 +459,7 @@ def main():
         btc_features[split].to_parquet(out_p)
         print(f"  [ok] Saved standalone {split}/btc1h -> {out_p}")
 
-    print("\n[3/4] Computing ETH features with BTC lead-lag...")
+    print("\n[3/5] Computing ETH features with BTC lead-lag/corr...")
     feature_data = {s: {} for s in ["train", "val", "test"]}
     for split in ["train", "val", "test"]:
         for tf in ETH_TIMEFRAMES:
@@ -285,7 +467,7 @@ def main():
             eth_df_raw = raw_data[split][tf]
             feature_data[split][tf] = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_features[split])
 
-    print(f"\n[4/4] Building TF-specific feature lists & scalers...")
+    print(f"\n[4/5] Building TF-specific feature lists & scalers...")
     feature_list_per_tf = {}
     scalers = {}
     for tf in TF_FOR_SEARCH:
@@ -300,7 +482,7 @@ def main():
             print(f"  - Processing {split} / {tf}...")
             df = feature_data[split][tf].copy()
             feat_list = feature_list_per_tf[tf]
-            
+
             df_sel = df.reindex(columns=feat_list, fill_value=0.0)
             X = _sanitize(df_sel).to_numpy(dtype=float)
             Xs = scalers[tf].transform(X)
@@ -313,7 +495,7 @@ def main():
             final_df.to_parquet(out_p)
             print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
 
-    print("\n[+] MTF Multi-Input Feature Engineering complete (with BTC Lead-Lag).")
+    print("\n[+] MTF Role-Tuned Feature Engineering complete (BTC lead/lag + corr/beta).")
 
 if __name__ == "__main__":
     main()

@@ -1,579 +1,422 @@
 # ai_binance/live/trader.py
-"""
-Trader (HRL-Ready, SLIM) — Manager(방향/확신) + Worker(타이밍)
-- 불필요 기능 제거: 휴리스틱 매니저, 온라인 학습, 과도한 리포팅.
-- 매니저 입력 계약 강제: (W, columns) = meta/VecNorm 기준으로만 구성.
-- Worker 관측: 훈련과 동일한 원시 피처 조합 + 추가 관측 5개.
-"""
-
 from __future__ import annotations
-
-import os, json
-from datetime import datetime, timezone
-from typing import Dict, Optional, List, Tuple
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
 import numpy as np
-import pandas as pd
-import torch
-from queue import Queue, Empty
 
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+import gymnasium as gym
+from gymnasium import spaces
 
-from stable_baselines3 import PPO
+import pickle, io, gzip
+import cloudpickle
+import importlib.util
+
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from gymnasium import spaces, Env
+from binance.client import Client
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 
-from ai_binance.train.reinforce.manager import TransformerFeatureExtractor
-from ai_binance.live.reporting import update_trade_log, generate_report
-from ai_binance.live.execution import BinanceExecutor
+# ===== 공통 인터페이스 =====
+class ExchangeClient:
+    def fetch_klines(self, symbol: str, interval: str, limit: int): ...
 
-# =====================
-# 경로/설정
-# =====================
-BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR  = os.path.join(BASE_DIR, "data", "model")
-REPORT_DIR = os.path.join(BASE_DIR, "data", "logs", "reports")
-LOG_DIR    = os.path.join(BASE_DIR, "data", "logs")
-PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
+class ExecClient:
+    def position(self) -> int: ...
+    def market_long(self, qty: float): ...
+    def market_short(self, qty: float): ...
+    def market_close(self): ...
 
-for _d in (MODEL_DIR, REPORT_DIR, LOG_DIR, PROC_DIR):
-    os.makedirs(_d, exist_ok=True)
-
-SYMBOL = "ETHUSDT"
-COMMISSION_SIDE   = 0.0005   # 각 사이드 수수료 비율
-SLIPPAGE          = 0.0001   # 체결 슬리피지 가정(비율)
-LEVERAGE          = 5        # 실전 모드 레버리지
-
-INITIAL_CAPITAL  = 100_000.0
-
-MANAGER_MODEL_PATH   = os.path.join(MODEL_DIR, "manager_v2.zip")
-MANAGER_VECNORM_PATH = os.path.join(MODEL_DIR, "manager_v2_vecnorm.pkl")
-MANAGER_META_PATH    = os.path.join(MODEL_DIR, "manager_v2_meta.json")
-
-WORKER_MODEL_PATH    = os.path.join(MODEL_DIR, "worker_unified_final.zip")
-WORKER_VECNORM_PATH  = os.path.join(MODEL_DIR, "worker_unified_vecnorm.pkl")
-
-# === Slim toggles ===
-STRICT_MANAGER = True          # 매니저 세트 불일치 시 즉시 중단
-ENABLE_REPORT_ON_TRADE = False # 틱마다 리포트(거래시 중복 방지)
-REPORT_EVERY_N = 1             # >0이면 N틱마다 리포트, 1이면 매 틱
-ENFORCE_MAX_HOLDING = False    # 최대 보유기간 강제 청산 비활성(기본)
-MAX_HOLDING_STEPS = 72
-DEBUG = False                  # 디버그 로그 토글
-
-# =====================
-# 유틸 Env (VecNormalize 로드용)
-# =====================
-class _ObsOnlyEnv(Env):
-    def __init__(self, obs_shape: Tuple[int, ...], action_space: spaces.Space):
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=obs_shape, dtype=np.float32)
-        self.action_space = action_space
-    def reset(self, *, seed=None, options=None):
-        return np.zeros(self.observation_space.shape, np.float32), {}
+# ===== Gym(dummy env) 유지 =====
+class _ObsEnv(gym.Env):
+    metadata = {}
+    def __init__(self, obs_dim: int):
+        super().__init__()
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Discrete(4)
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if hasattr(super(), "reset"):
+            super().reset(seed=seed)
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        return obs, {}
     def step(self, action):
-        obs, _ = self.reset()
-        return obs, 0.0, True, False, {}
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        reward = 0.0
+        terminated, truncated = True, False
+        return obs, reward, terminated, truncated, {}
 
-# =====================
-# Trader
-# =====================
-class Trader:
-    def __init__(
-        self,
-        mode: str,
-        q: Queue,
-        api_key: Optional[str] = None,
-        secret_key: Optional[str] = None,
-        learn_q: Optional[Queue] = None,   # 유지(호환)하되 미사용
-    ):
-        assert mode in ("live", "paper")
-        self.mode, self.q, self.api_key, self.secret_key = mode, q, api_key, secret_key
+# ===== cloudpickle가 참조하는 'policy' 모듈 강제 로드 =====
+def _import_policy_for_cloudpickle() -> None:
+    """
+    학습 시 `from policy import MultiHeadPolicy`로 저장되었기 때문에
+    로드시에도 'policy'라는 모듈명이 import 가능해야 한다.
+    없으면 경로 후보에서 policy.py를 찾아 sys.modules['policy']에 등록한다.
+    """
+    try:
+        import policy  # noqa: F401
+        return
+    except Exception:
+        pass
 
-        # 실행 어댑터
-        self.exec = None
-        if self.mode == "live" and self.api_key and self.secret_key:
-            try:
-                self.exec = BinanceExecutor(self.api_key, self.secret_key)
-                print("[트레이더] 실행 어댑터 초기화 완료.")
-            except Exception as e:
-                print(f"[트레이더] 실행 어댑터 초기화 실패: {e}")
-        elif self.mode == "live":
-            print(f"[트레이더] 경고: 'live' 모드지만 API 키가 없어 'paper' 모드로 동작합니다.")
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.abspath(os.path.join(here, "..", "train", "reinforce", "policy.py")),
+        os.path.abspath(os.path.join(here, "..", "reinforce", "policy.py")),
+        os.path.abspath(os.path.join(here, "policy.py")),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            spec = importlib.util.spec_from_file_location("policy", p)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["policy"] = mod
+                spec.loader.exec_module(mod)
+                return
+    raise ModuleNotFoundError(
+        "Unable to import 'policy'. 학습에 사용한 policy.py를 다음 중 한 경로에 두세요:\n"
+        + "\n".join(f" - {c}" for c in candidates)
+    )
 
-        # Manager용 feature_list 로드(라이브 전체 후보 목록 보관)
-        with open(os.path.join(PROC_DIR, "fe_feature_list_1h.json"), "r") as f:
-            mgr_feats_1h = json.load(f)
-        with open(os.path.join(PROC_DIR, "fe_feature_list_4h.json"), "r") as f:
-            mgr_feats_4h = json.load(f)
-        self.mgr_cols_live = mgr_feats_1h + mgr_feats_4h   # 라이브가 제공 가능한 전체 후보
-        self.mgr_cols: List[str] = self.mgr_cols_live[:]   # 실제 사용 목록(메타에 의해 재설정됨)
-        self.mgr_W: int = 8                                # 실제 사용 길이(메타에 의해 재설정됨)
-        print(f"[트레이더] Manager 피처 로드 완료(라이브 후보): {len(self.mgr_cols_live)}개")
+# ===== Binance 라이브 어댑터 =====
+_INTERVAL = {
+    "5m": Client.KLINE_INTERVAL_5MINUTE,
+    "15m": Client.KLINE_INTERVAL_15MINUTE,
+    "1h": Client.KLINE_INTERVAL_1HOUR,
+    "4h": Client.KLINE_INTERVAL_4HOUR,
+}
 
-        # Worker 모델/VecNorm 로드
-        self.worker_model: MaskablePPO = MaskablePPO.load(WORKER_MODEL_PATH, device="cpu")
-        obs_shape_w = self.worker_model.observation_space.shape
-        tmp_w_env = DummyVecEnv([lambda: _ObsOnlyEnv(obs_shape=obs_shape_w, action_space=self.worker_model.action_space)])
-        self.worker_vecnorm: VecNormalize = VecNormalize.load(WORKER_VECNORM_PATH, tmp_w_env)
-        self.worker_vecnorm.training = False
-        self.worker_vecnorm.norm_reward = False
-        print(f"[트레이더] Worker 로드 완료: {os.path.basename(WORKER_MODEL_PATH)} | obs_shape={obs_shape_w}")
+class BinanceExchange(ExchangeClient, ExecClient):
+    def __init__(self,
+                 symbol_eth: str = "ETHUSDT",
+                 symbol_btc: str = "BTCUSDT",
+                 api_key: str = "",
+                 api_secret: str = "",
+                 use_testnet: bool = False,
+                 recv_window: int = 5_000):
+        if not api_key or not api_secret:
+            raise RuntimeError("BinanceExchange: api_key/api_secret must be provided (no env read).")
 
-        # Worker 피처 리스트 재구성 (훈련 순서와 동일)
-        print("[트레이더] Worker 피처 리스트 재구성 중...")
-        with open(os.path.join(PROC_DIR, "fe_feature_list_5m.json"), "r") as f:
-            w_feats_5m = json.load(f)
-        with open(os.path.join(PROC_DIR, "fe_feature_list_15m.json"), "r") as f:
-            w_feats_15m = json.load(f)
-        with open(os.path.join(PROC_DIR, "fe_feature_list_1h.json"), "r") as f:
-            w_feats_1h = json.load(f)
-        with open(os.path.join(PROC_DIR, "fe_feature_list_4h.json"), "r") as f:
-            w_feats_4h = json.load(f)
-        btc_features = [
-            'ret_1h_btc1h', 'ret_4h_btc1h', 'atr14_btc1h',
-            'HA_O_btc1h', 'HA_H_btc1h', 'HA_L_btc1h', 'HA_C_btc1h',
-            'HA_TR_btc1h', 'HA_BC_btc1h', 'HA_R_btc1h'
-        ]
-        self.worker_feature_list = w_feats_5m + w_feats_15m + w_feats_1h + w_feats_4h + btc_features
-        print(f"[트레이더] Worker 피처 리스트 재구성 완료: {len(self.worker_feature_list)}개")
+        self.client = Client(api_key=api_key, api_secret=api_secret)
+        if use_testnet:
+            self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+        self.recv_window = recv_window
+        self.symbol_eth = symbol_eth
+        self.symbol_btc = symbol_btc
 
-        # 관측 차원 정합성 검증 (추가 관측 5개: mgr_dir, mgr_conf, mgr_regime, has_pos, holding_norm)
-        vecnorm_dim = int(self.worker_vecnorm.obs_rms.mean.shape[0])
-        extra_dim = 5
-        expected_dim = len(self.worker_feature_list) + extra_dim
-        if expected_dim != vecnorm_dim:
-            raise RuntimeError(f"[트레이더] Worker VecNorm 차원 불일치: expected={expected_dim}, vecnorm={vecnorm_dim}")
-        flat_model_obs_dim = int(np.prod(obs_shape_w))
-        if flat_model_obs_dim != expected_dim:
-            raise RuntimeError(f"[트레이더] Worker 모델 관측 차원 불일치: model={flat_model_obs_dim}, built={expected_dim}")
-        print(f"[트레이더] Worker 관측 정합 확인 완료: obs_dim={expected_dim}")
+        self._filters: Dict[str, Dict[str, float]] = {}
+        self._load_filters()
 
-        # Manager 세트 로드(메타/VecNorm 기반 정합 강제)
-        self.manager_model: Optional[PPO] = None
-        self._load_manager_or_fail()
-
-        # 상태 변수
-        start_capital = INITIAL_CAPITAL
-        if self.exec:
-            try:
-                balance = self.exec.get_usdt_balance()
-                if balance > 0:
-                    start_capital = balance
-                    print(f"[트레이더] 실제 계좌 잔액 ${balance:,.2f}으로 시작")
-                else:
-                    print("[트레이더] 경고: 실제 계좌 잔액이 0 또는 조회 실패 → 기본값으로 시작")
-            except Exception as e:
-                print(f"[트레이더] 경고: 계좌 잔액 조회 실패({e}) → 기본값으로 시작")
-
-        self.initial_capital = start_capital
-        self.eq = self.initial_capital
-        self.pos = 0
-        self.entry_price: Optional[float] = None
-        self.entry_time: Optional[pd.Timestamp] = None
-        self.entry_notional: float = 0.0
-        self.last_price: Optional[float] = None
-        self.holding_steps = 0
-        self.global_steps = 0
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.long_trades = 0
-        self.long_wins = 0
-        self.short_trades = 0
-        self.short_wins = 0
-        self.start_time = datetime.now(timezone.utc)
-
-        # 초기 리포트 1회
-        report_path = os.path.join(REPORT_DIR, "trading_report.md")
-        generate_report(report_path, {
-            'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            'initial_capital': self.initial_capital,
-            'total_equity': self.eq,
-            'position': "STANDBY",
-            'unrealized_pnl_amount': 0,
-            'unrealized_pnl_percent': 0,
-            'total_trades': 0,
-            'win_rate': 0,
-            'long_trades': 0,
-            'long_win_rate': 0,
-            'short_trades': 0,
-            'short_win_rate': 0,
-            'hold_trades': 0
-        }, is_new_session=True)
-
-    # ---------- Manager 세트 로드 ----------
-    def _load_manager_or_fail(self):
-        if not (os.path.exists(MANAGER_MODEL_PATH) and os.path.exists(MANAGER_VECNORM_PATH)):
-            msg = "[트레이더] Manager 세트 미존재(manager_v2.zip / vecnorm.pkl)"
-            if STRICT_MANAGER: raise RuntimeError(msg)
-            print(msg); return
-
+    def set_leverage(self, lev: int):
         try:
-            # 0) 메타 먼저 로드해 W,F 확보
-            if not os.path.isfile(MANAGER_META_PATH):
-                raise RuntimeError("[Manager] metadata 파일(manager_v2_meta.json)이 필요합니다.")
-            with open(MANAGER_META_PATH, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            W_tr = int(meta.get("seq_window", 8))
-            F_tr = int(meta["feat_dim"])
-            trained_cols: Optional[List[str]] = meta.get("columns")
-
-            # 1) (W*F,) 관측으로 맞춘 더미 venv 생성 후 VecNorm 로드
-            tmp_mgr_env = DummyVecEnv([lambda: _ObsOnlyEnv(
-                obs_shape=(W_tr * F_tr,),
-                action_space=spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
-            )])
-            self.manager_vecnorm: VecNormalize = VecNormalize.load(MANAGER_VECNORM_PATH, tmp_mgr_env)
-            self.manager_vecnorm.training = False
-            self.manager_vecnorm.norm_reward = False
-            mgr_vec_dim = int(self.manager_vecnorm.obs_rms.mean.shape[0])
-            if mgr_vec_dim != W_tr * F_tr:
-                raise RuntimeError(f"[Manager] VecNorm 차원 불일치: vecnorm={mgr_vec_dim}, expected={W_tr*F_tr}")
-
-            # 2) 라이브 피처를 훈련 스펙에 맞춤(순서/개수 강제)
-            if trained_cols:
-                missing = [c for c in trained_cols if c not in self.mgr_cols_live]
-                if missing:
-                    raise RuntimeError(f"[Manager] 라이브에 없는 훈련 피처 존재: {missing[:8]} ...")
-                self.mgr_cols = trained_cols
-            else:
-                self.mgr_cols = self.mgr_cols_live[:F_tr]
-
-            self.mgr_W = W_tr
-
-            # 2) 라이브 피처를 훈련 스펙에 맞춤(순서/개수 강제)
-            if trained_cols:
-                missing = [c for c in trained_cols if c not in self.mgr_cols_live]
-                if missing:
-                    raise RuntimeError(f"[Manager] 라이브에 없는 훈련 피처 존재: {missing[:8]} ...")
-                self.mgr_cols = trained_cols
-            else:
-                # 메타가 없으면 응급조치: 앞에서 F_tr개만 사용
-                self.mgr_cols = self.mgr_cols_live[:F_tr]
-                print(f"[Manager/Live] Hotfix: live features truncated {len(self.mgr_cols_live)} → {len(self.mgr_cols)}")
-
-            self.mgr_W = W_tr
-            expected_mgr_dim = self.mgr_W * len(self.mgr_cols)
-            if expected_mgr_dim != mgr_vec_dim:
-                raise RuntimeError(f"[Manager] VecNorm 차원 불일치: vecnorm={mgr_vec_dim}, expected={expected_mgr_dim} (W={self.mgr_W}, F={len(self.mgr_cols)})")
-
-            # 3) 모델 로드(Transformer 경로 해석을 위해 클래스 import 필요)
-            policy_kwargs = dict(
-                features_extractor_class=TransformerFeatureExtractor,
-                features_extractor_kwargs=dict(
-                    d_model=128, nhead=4, num_layers=2,
-                    seq_len=W_tr, n_features=F_tr,   # ✅ 추가
-                ),
-                net_arch=dict(pi=[128], vf=[128]),
+            self.client.futures_change_leverage(
+                symbol=self.symbol_eth, leverage=int(lev), recvWindow=self.recv_window
             )
-            self.manager_model = PPO.load(
-                MANAGER_MODEL_PATH,
-                device="cpu",
-                custom_objects={
-                    "policy_kwargs": policy_kwargs,   # 저장된 값과 동일/호환
-                    "lr_schedule": (lambda _pr: 3e-4),
-                    "learning_rate": 3e-4,
-                },
-            )
+        except Exception:
+            pass
 
-            print(f"[트레이더] Manager 로드 완료: {os.path.basename(MANAGER_MODEL_PATH)} | W={self.mgr_W}, F={len(self.mgr_cols)} (vecnorm={mgr_vec_dim})")
-        except Exception as e:
-            msg = f"[트레이더] Manager 로드 실패: {e}"
-            if STRICT_MANAGER: raise RuntimeError(msg)
-            print(msg)
-            self.manager_model = None
+    # --- 시세 (닫힌 캔들만) ---
+    def fetch_klines(self, symbol: str, interval: str, limit: int):
+        bi = _INTERVAL[interval]
+        raw = self.client.futures_klines(symbol=symbol, interval=bi, limit=limit)
+        import pandas as pd, time as _t
+        cols = ["open_time","Open","High","Low","Close","Volume","close_time",
+                "quote_asset_volume","number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(raw, columns=cols)
+        now_ms = int(_t.time() * 1000)
+        df = df[df["close_time"] <= now_ms - 1000]  # 미확정 봉 제거
+        for c in ["Open","High","Low","Close","Volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        idx = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df = df.set_index(idx).drop(columns=["open_time","close_time","ignore"])
+        df.index.name = "time"
+        df["FundingRate"] = 0.0
+        return df
 
-    # ---------- 관측 구성 ----------
-    def _build_worker_obs(
-        self,
-        X_dict: Dict[str, pd.DataFrame],
-        t_idx: pd.Timestamp,
-        mgr_dir: int,
-        mgr_conf: float,
-        mgr_regime: int
-    ) -> Optional[np.ndarray]:
-        ordered_tfs = ["5m", "15m", "1h", "4h", "btc1h"]
-        series_list = []
-        for tf in ordered_tfs:
-            df = X_dict.get(tf)
-            if df is None or df.empty:
-                print(f"[트레이더] 경고: {tf} 데이터 누락"); return None
-            try:
-                pos = df.index.get_indexer([t_idx], method="pad")[0]
-                if pos == -1:
-                    print(f"[트레이더] 경고: {tf}에서 {t_idx} 타임스탬프 없음"); return None
-                series_list.append(df.iloc[pos])
-            except Exception as e:
-                print(f"[트레이더] 경고: {tf} 데이터 처리 오류: {e}"); return None
+    # --- 주문/포지션 ---
+    def _load_filters(self):
+        info = self.client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            sym = s["symbol"]
+            lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
+            self._filters[sym] = {"stepSize": float(lot["stepSize"]), "minQty": float(lot["minQty"])}
 
-        x_combined = pd.concat(series_list)
-        x_reordered = x_combined.reindex(self.worker_feature_list).fillna(0.0)
-        x_raw = x_reordered.to_numpy(dtype=np.float32)
+    def _round_qty(self, symbol: str, qty: float) -> float:
+        f = self._filters.get(symbol)
+        if not f:
+            return float(qty)
+        step, minq = f["stepSize"], f["minQty"]
+        q = np.floor(float(qty) / step) * step
+        if q < minq:
+            q = 0.0
+        return float(np.round(q, 8))
 
-        holding_norm = min(self.holding_steps, MAX_HOLDING_STEPS) / MAX_HOLDING_STEPS if MAX_HOLDING_STEPS > 0 else 0.0
-        extra_obs = np.array([mgr_dir, mgr_conf, mgr_regime, float(self.pos != 0), holding_norm], dtype=np.float32)
-        return np.concatenate([x_raw, extra_obs])
+    def position(self) -> int:
+        arr = self.client.futures_position_information(symbol=self.symbol_eth, recvWindow=self.recv_window)
+        if not arr:
+            return 0
+        amt = float(arr[0]["positionAmt"])
+        return 1 if amt > 0 else (-1 if amt < 0 else 0)
 
-    def _build_manager_obs_live(self, X_dict: Dict[str, pd.DataFrame], t_idx: pd.Timestamp,
-                                cols: List[str], W: int) -> Optional[np.ndarray]:
-        base = X_dict.get("1h")
-        if base is None or base.empty:
-            return None
+    def _abs_position_qty(self) -> float:
+        arr = self.client.futures_position_information(symbol=self.symbol_eth, recvWindow=self.recv_window)
+        if not arr:
+            return 0.0
+        return abs(float(arr[0]["positionAmt"]))
 
-        pos = base.index.get_indexer([t_idx], method="pad")[0]
-        if pos < 0:
-            return None
+    def market_long(self, qty: float):
+        q = self._round_qty(self.symbol_eth, qty)
+        if q <= 0:
+            return
+        self.client.futures_create_order(
+            symbol=self.symbol_eth, side=SIDE_BUY, type=ORDER_TYPE_MARKET,
+            quantity=q, recvWindow=self.recv_window
+        )
 
-        start = max(0, pos - (W - 1))
-        idx_win = base.index[start:pos+1]
-        rows = []
-        for ts in idx_win:
-            vals = []
-            for c in cols:
-                tf = "1h" if c.endswith("_1h") else "4h"
-                df = X_dict.get(tf)
-                if df is None or df.empty or c not in df.columns:
-                    vals.append(0.0); continue
-                j = df.index.get_indexer([ts], method="pad")[0]
-                vals.append(0.0 if j < 0 else float(df[c].iloc[j]))
-            rows.append(vals)
+    def market_short(self, qty: float):
+        q = self._round_qty(self.symbol_eth, qty)
+        if q <= 0:
+            return
+        self.client.futures_create_order(
+            symbol=self.symbol_eth, side=SIDE_SELL, type=ORDER_TYPE_MARKET,
+            quantity=q, recvWindow=self.recv_window
+        )
 
-        seq = np.asarray(rows, dtype=np.float32)
-        if seq.shape[0] < W:  # 앞쪽 패딩
-            pad = np.repeat(seq[:1, :], W - seq.shape[0], axis=0)
-            seq = np.concatenate([pad, seq], axis=0)
-        return seq.astype(np.float32, copy=False)
+    def market_close(self):
+        pos = self.position()
+        if pos == 0:
+            return
+        q = self._abs_position_qty()
+        if q <= 0:
+            return
+        side = SIDE_SELL if pos > 0 else SIDE_BUY
+        self.client.futures_create_order(
+            symbol=self.symbol_eth, side=side, type=ORDER_TYPE_MARKET,
+            quantity=self._round_qty(self.symbol_eth, q),
+            reduceOnly=True, recvWindow=self.recv_window
+        )
+
+# ===== Paper 모드 =====
+class PublicBinanceData(ExchangeClient):
+    def __init__(self, testnet: bool = False):
+        self.client = Client(None, None)
+        if testnet:
+            self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+    def fetch_klines(self, symbol: str, interval: str, limit: int):
+        bi = _INTERVAL[interval]
+        raw = self.client.futures_klines(symbol=symbol, interval=bi, limit=limit)
+        import pandas as pd, time as _t
+        cols = ["open_time","Open","High","Low","Close","Volume","close_time",
+                "quote_asset_volume","number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(raw, columns=cols)
+        now_ms = int(_t.time() * 1000)
+        df = df[df["close_time"] <= now_ms - 1000]
+        for c in ["Open","High","Low","Close","Volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        idx = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df = df.set_index(idx).drop(columns=["open_time","close_time","ignore"])
+        df.index.name = "time"
+        df["FundingRate"] = 0.0
+        return df
+
+class PaperBroker(ExecClient):
+    def __init__(self): self._pos = 0
+    def position(self) -> int: return self._pos
+    def market_long(self, qty: float):  self._pos = 1
+    def market_short(self, qty: float): self._pos = -1
+    def market_close(self):             self._pos = 0
+
+# ===== Step 결과 컨테이너 =====
+@dataclass
+class StepResult:
+    logs: List[Dict[str, Any]]
+    report_snapshot: Dict[str, Any]
+    summary: Dict[str, Any]
+
+# ===== 공통 트레이더 베이스 =====
+class BaseTrader:
+    def __init__(self,
+                 exec_client: ExecClient,
+                 data_client: ExchangeClient,
+                 model_path: Optional[str],
+                 vec_path: Optional[str],
+                 norm_reward_at_train: bool,
+                 symbol_eth: str,
+                 leverage: float,
+                 risk_fraction: float,
+                 init_equity: float):
+
+        self.exec = exec_client
+        self.data = data_client
+        self.symbol_eth = symbol_eth
+        self.leverage = float(leverage)
+        self.risk_fraction = float(risk_fraction)
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "model"))
+        self.model_path = model_path or os.path.join(base, "best_model.zip")
+        self.vec_path   = vec_path   or os.path.join(base, "unified_vecnorm.pkl")
+
+        # 1) cloudpickle이 'policy' 찾도록
+        _import_policy_for_cloudpickle()
+
+        # 2) env 없이 모델 먼저 로드 → obs_dim 취득
+        model = MaskablePPO.load(self.model_path, env=None)
+        # SB3/Contrib는 policy에 obs_space 보관
+        obs_space = getattr(model.policy, "observation_space", None) or getattr(model, "observation_space", None)
+        if obs_space is None:
+            raise RuntimeError("Loaded model has no observation_space; re-check saved model.")
+        obs_dim = int(np.prod(obs_space.shape))
+
+        # 3) 같은 차원의 더미 VecEnv 만들고 VecNormalize 통계 로드
+        venv = DummyVecEnv([lambda: _ObsEnv(obs_dim)])
+        venv = VecNormalize(venv, training=False, norm_obs=True, norm_reward=norm_reward_at_train)
+        venv = VecNormalize.load(self.vec_path, venv)
+        venv.training = False
+        venv.norm_reward = False
+
+        # 4) 모델에 VecNormalize env 장착
+        model.set_env(venv)
+
+        self.venv = venv
+        self.model = model
+        self.initial_equity = float(init_equity)
 
     @staticmethod
-    def _mask(pos: int) -> np.ndarray:
-        # [wait, enter, exit]
-        return np.array([True, pos == 0, pos != 0], dtype=np.bool_)
+    def _mask_from_pos(pos: int) -> np.ndarray:
+        # 액션: 0 WAIT, 1 LONG, 2 SHORT, 3 CLOSE
+        m = np.ones(4, dtype=np.int8)
+        if pos == 0: m[3] = 0
+        if pos > 0:  m[1] = 0
+        if pos < 0:  m[2] = 0
+        return m
 
-    def _interpret(self, raw_action: int, mgr_dir: int) -> Tuple[int, str]:
-        if self.pos == 0:
-            return (int(np.sign(mgr_dir)), "enter") if raw_action == 1 and mgr_dir != 0 else (0, "wait")
-        else:
-            return (0, "exit") if raw_action == 2 else (self.pos, "hold")
+    def _predict_action(self, obs_vec: np.ndarray) -> int:
+        o = np.asarray(obs_vec, dtype=np.float32).reshape(1, -1)
+        o = self.venv.normalize_obs(o)  # 외부에서 주입한 obs → VecNormalize로 정규화
+        mask = self._mask_from_pos(self.exec.position())
+        a, _ = self.model.predict(o, deterministic=True, action_masks=mask)  # type: ignore
+        return int(a)
 
-    def _generate_current_report(self):
-        report_path = os.path.join(REPORT_DIR, "trading_report.md")
+    def _last_close(self) -> float:
+        df = self.data.fetch_klines(self.symbol_eth, "5m", limit=2)
+        return float(df["Close"].iloc[-1])
 
-        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        long_win_rate = (self.long_wins / self.long_trades * 100) if self.long_trades > 0 else 0
-        short_win_rate = (self.short_wins / self.short_trades * 100) if self.short_trades > 0 else 0
+    # 포지션 사이징: 전액 * 레버리지 / 가격 * 비율
+    def _size_full(self, equity: float, price: float) -> float:
+        qty = (float(equity) * self.leverage * self.risk_fraction) / max(price, 1e-9)
+        return float(max(qty, 0.0))
 
-        unrealized_pnl_percent = 0.0
-        if self.pos != 0 and self.entry_price and self.last_price:
-            leverage = LEVERAGE if self.mode == 'live' else 1.0
-            if self.pos == 1:
-                unrealized_pnl_percent = (self.last_price / self.entry_price - 1.0) * 100.0 * leverage
+    def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
+        raise NotImplementedError
+
+# ===== 라이브 트레이더 =====
+class LiveTrader(BaseTrader):
+    def __init__(self, exec_client: BinanceExchange,
+                 model_path: Optional[str] = None, vec_path: Optional[str] = None,
+                 norm_reward_at_train: bool = False, symbol_eth: str = "ETHUSDT",
+                 leverage: float = 5.0, risk_fraction: float = 1.0):
+        acc = exec_client.client.futures_account()
+        total_eq = float(acc.get("totalMarginBalance", "0"))
+        super().__init__(exec_client, exec_client, model_path, vec_path, norm_reward_at_train,
+                         symbol_eth, leverage, risk_fraction, init_equity=total_eq)
+
+    def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
+        action = self._predict_action(obs_vec)
+        price = self._last_close()
+        before_pos = self.exec.position()
+
+        logs: List[Dict[str, Any]] = []
+
+        def _account_equity() -> float:
+            a = self.exec.client.futures_account()
+            return float(a.get("totalMarginBalance", "0"))
+
+        if action == 3:
+            self.exec.market_close()
+            logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT", "price": f"{price:.2f}"})
+        elif action in (1, 2):
+            if (action == 1 and before_pos < 0) or (action == 2 and before_pos > 0):
+                self.exec.market_close()
+                logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT", "price": f"{price:.2f}"})
+            equity = _account_equity()
+            qty = self._size_full(equity, price)
+            if action == 1:
+                self.exec.market_long(qty)
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_LONG", "position": "LONG", "price": f"{price:.2f}"})
             else:
-                unrealized_pnl_percent = (self.entry_price / self.last_price - 1.0) * 100.0 * leverage
+                self.exec.market_short(qty)
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_SHORT", "position": "SHORT", "price": f"{price:.2f}"})
+        acc = self.exec.client.futures_account()
+        total_eq = float(acc.get("totalMarginBalance", "0"))
+        unrl    = float(acc.get("totalUnrealizedProfit", "0"))
+        pos_str = "LONG" if self.exec.position() > 0 else ("SHORT" if self.exec.position() < 0 else "FLAT")
+        report = {
+            "total_equity": total_eq,
+            "unrealized_pnl_amount": unrl,
+            "unrealized_pnl_percent": (unrl / total_eq * 100.0) if total_eq > 0 else 0.0,
+            "position": pos_str,
+        }
+        summary = {"action": action, "price": price, "pos": pos_str, "equity": f"{total_eq:.2f}"}
+        return StepResult(logs=logs, report_snapshot=report, summary=summary)
 
-        current_pos_str = "STANDBY" if self.pos == 0 else ("LONG" if self.pos == 1 else "SHORT")
-        generate_report(report_path, {
-            'session_start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            'initial_capital': self.initial_capital,
-            'total_equity': self.eq,
-            'position': current_pos_str,
-            'unrealized_pnl_amount': self.eq - self.initial_capital,
-            'unrealized_pnl_percent': unrealized_pnl_percent,
-            'total_trades': self.total_trades,
-            'win_rate': win_rate,
-            'long_trades': self.long_trades,
-            'long_win_rate': long_win_rate,
-            'short_trades': self.short_trades,
-            'short_win_rate': short_win_rate,
-            'hold_trades': 0
-        }, is_new_session=False)
+# ===== 페이퍼 트레이더 =====
+class PaperTrader(BaseTrader):
+    def __init__(self, data_client: PublicBinanceData, exec_client: PaperBroker,
+                 model_path: Optional[str] = None, vec_path: Optional[str] = None,
+                 norm_reward_at_train: bool = False, symbol_eth: str = "ETHUSDT",
+                 leverage: float = 5.0, risk_fraction: float = 1.0, init_equity: float = 10_000.0):
+        super().__init__(exec_client, data_client, model_path, vec_path, norm_reward_at_train,
+                         symbol_eth, leverage, risk_fraction, init_equity)
+        self.realized = 0.0
+        self.entry_side = 0
+        self.entry_price: Optional[float] = None
+        self.entry_qty: float = 0.0
 
-    @torch.no_grad()
-    def run(self):
-        print("[트레이더] HRL 모드 실행 중... (큐 수신 대기)")
-        while True:
-            try:
-                pkt = self.q.get(timeout=300)
-            except Empty:
-                continue
+    def _unrealized(self, price: float) -> float:
+        if self.entry_side == 0 or self.entry_price is None:
+            return 0.0
+        sign = 1.0 if self.entry_side > 0 else -1.0
+        return (price - self.entry_price) * sign * self.entry_qty
 
-            X_dict, ts = pkt["X"], pkt["ts"]
-            close_series = pkt["close"]
-            if close_series.empty:
-                continue
+    def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
+        action = self._predict_action(obs_vec)
+        price = self._last_close()
 
-            t_idx = close_series.index[-1]
-            p1 = close_series.iloc[-1]
+        logs: List[Dict[str, Any]] = []
 
-            if self.last_price is None:
-                self.last_price = p1
-
-            # === Manager: 반드시 RL 사용(STRICT) ===
-            if self.manager_model is None:
-                raise RuntimeError("[트레이더] Manager 미로딩 상태. STRICT_MANAGER=True에서 허용되지 않습니다.")
-
-            obs_mgr = self._build_manager_obs_live(X_dict, t_idx, self.mgr_cols, self.mgr_W)
-            if obs_mgr is None:
-                self.last_price = p1
-                continue
-
-            obs_mgr_flat = obs_mgr.reshape(1, -1).astype(np.float32)   # ✅ (1, W*F)
-            obs_mgr_norm = self.manager_vecnorm.normalize_obs(obs_mgr_flat)
-
-            act, _ = self.manager_model.predict(obs_mgr_norm, deterministic=True)
-
-            # SB3는 n_env=1일 때 (1, action_dim)로 나올 수 있음
-            aL = float(act[0,0] if act.ndim == 2 else act[0])
-            aS = float(act[0,1] if act.ndim == 2 else act[1])
-            margin = abs(aL - aS)
-            mgr_dir = 0 if margin < 0.15 else (1 if aL > aS else -1)
-            mgr_conf = margin
-            mgr_regime = 0
-
-            # === Worker ===
-            obs_raw = self._build_worker_obs(X_dict, t_idx, mgr_dir, mgr_conf, mgr_regime)
-            if obs_raw is None:
-                self.last_price = p1
-                continue
-
-            obs_norm = self.worker_vecnorm.normalize_obs(obs_raw.reshape(1, -1))
-            action_array, _ = self.worker_model.predict(
-                obs_norm,
-                deterministic=True,
-                action_masks=self._mask(self.pos)
-            )
-            action = int(action_array[0]) if isinstance(action_array, np.ndarray) else int(action_array)
-
-            # 보유 중 PnL 반영
-            if self.pos != 0:
-                lr = np.log(p1 / self.last_price)
-                lr_eff = lr * (LEVERAGE if self.mode == "live" else 1.0)
-                self.eq *= np.exp(self.pos * lr_eff)
-                self.holding_steps += 1
-
-            desired, why = self._interpret(action, mgr_dir)
-            done = (desired != self.pos)
-
-            # 최대 보유 기간 강제 청산(옵션)
-            if ENFORCE_MAX_HOLDING and self.pos != 0 and self.holding_steps >= MAX_HOLDING_STEPS:
-                print(f"[{ts.strftime('%H:%M:%S')}] WARN: 최대 보유 기간({MAX_HOLDING_STEPS}) 초과로 강제 청산.")
-                self._close(p1, ts)
-                desired = 0
-                done = True
-
-            # 상태 변경
-            traded = False
-            if desired != self.pos:
-                if self.pos != 0:
-                    self._close(p1, ts); traded = True
-                if desired != 0:
-                    self._open(desired, p1, ts); traded = True
-
-            # 리포트(거래 발생 시 또는 주기)
-            self.global_steps += 1
-            if (ENABLE_REPORT_ON_TRADE and traded) or (REPORT_EVERY_N > 0 and self.global_steps % REPORT_EVERY_N == 0):
-                self._generate_current_report()
-
-            self.last_price = p1
-
-            pos_str = "LONG" if self.pos == 1 else ("SHORT" if self.pos == -1 else "STANDBY")
-            log_msg = f"[{ts.strftime('%H:%M:%S')}] Pos: {pos_str} | Eq: ${self.eq:,.2f}"
-            if self.pos != 0 and self.entry_price is not None:
-                log_msg += f" | Entry: ${self.entry_price:,.4f}"
-            log_msg += f" | Mgr(model): {mgr_dir},{mgr_conf:.2f} | Act: {action}->{why}"
-            print(log_msg)
-
-    # ---------- 체결/회계 ----------
-    def _calc_order_qty(self, price: float) -> float:
-        """
-        주문 수량 계산
-        - live 모드: 전체 자산의 99%에 레버리지 적용
-        - paper 모드: 레버리지 없이 99%
-        """
-        leverage_to_use = LEVERAGE if self.mode == "live" else 1.0
-        usdt_size = self.eq * 0.99 * leverage_to_use
-        return round(usdt_size / price, 6)
-
-    def _open(self, desired: int, price: float, ts: pd.Timestamp):
-        if desired not in (-1, 1) or self.pos != 0:
-            return
-
-        px = price * (1 + SLIPPAGE) if desired == 1 else price * (1 - SLIPPAGE)
-
-        if self.mode == "live" and self.exec:
-            try:
-                self.exec.cancel_all_orders(SYMBOL)
-                side = "BUY" if desired == 1 else "SELL"
-                qty = self._calc_order_qty(px)
-                self.exec.place_market(SYMBOL, side, qty, reduce_only=False)
-            except Exception as e:
-                print(f"[{ts.strftime('%H:%M:%S')}] WARN: live open failed (ignored): {e}")
-
-        self.pos = desired
-        self.entry_price = px
-        self.entry_time = ts
-        self.holding_steps = 0
-
-        notional = self.eq * 0.99 * (LEVERAGE if self.mode == "live" else 1.0)
-        self.entry_notional = notional
-
-        # 진입 비용: 수수료 + 슬리피지
-        self.eq -= notional * (COMMISSION_SIDE + SLIPPAGE)
-
-        log_path = os.path.join(LOG_DIR, "run_log.csv")
-        update_trade_log(log_path, {
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": "ENTRY",
-            "position": "LONG" if desired == 1 else "SHORT",
-            "price": f"{px:,.4f}",
-            "profit": "-"
-        })
-
-    def _close(self, price: float, ts: pd.Timestamp):
-        if self.pos == 0:
-            return
-
-        px = price * (1 - SLIPPAGE if self.pos == 1 else 1 + SLIPPAGE)
-        pnl_pct = (px / self.entry_price - 1) if self.pos == 1 else (self.entry_price / px - 1)
-
-        if self.mode == "live" and self.exec:
-            try:
-                self.exec.cancel_all_orders(SYMBOL)
-                side = "SELL" if self.pos == 1 else "BUY"
-                qty  = self._calc_order_qty(px)
-                self.exec.place_market(SYMBOL, side, qty, reduce_only=True)
-                # (선택) 완전 평단 확인 루프는 제거(슬림)
-            except Exception as e:
-                print(f"[{ts.strftime('%H:%M:%S')}] WARN: live close failed (ignored): {e}")
-
-        # 비용 차감(보유 중 PnL은 틱마다 반영함)
-        exit_notional = float(getattr(self, "entry_notional", 0.0))
-        self.eq -= exit_notional * (COMMISSION_SIDE + SLIPPAGE)
-
-        self.total_trades += 1
-        if pnl_pct > 0:
-            self.winning_trades += 1
-
-        if self.pos == 1:
-            self.long_trades += 1
-            if pnl_pct > 0: self.long_wins += 1
-        else:
-            self.short_trades += 1
-            if pnl_pct > 0: self.short_wins += 1
-
-        log_path = os.path.join(LOG_DIR, "run_log.csv")
-        duration_sec = (ts - self.entry_time).total_seconds() if self.entry_time else 0
-        update_trade_log(log_path, {
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": "EXIT",
-            "position": "LONG" if self.pos == 1 else "SHORT",
-            "price": f"{px:,.4f}",
-            "profit": f"{pnl_pct * 100:.2f}%",
-            "duration": f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
-        })
-
-        # 포지션 리셋
-        self.pos = 0
-        self.entry_price = None
-        self.entry_time = None
-        self.entry_notional = 0.0
+        if action == 3:
+            if self.entry_side != 0:
+                pnl = self._unrealized(price)
+                self.realized += pnl
+                logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT",
+                             "price": f"{price:.2f}", "profit": f"{pnl:.2f}"})
+                self.entry_side, self.entry_price, self.entry_qty = 0, None, 0.0
+            self.exec.market_close()
+        elif action in (1, 2):
+            if self.entry_side != 0 and ((action == 1 and self.entry_side < 0) or (action == 2 and self.entry_side > 0)):
+                pnl = self._unrealized(price)
+                self.realized += pnl
+                logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT",
+                             "price": f"{price:.2f}", "profit": f"{pnl:.2f}"})
+            equity_now = self.initial_equity + self.realized + self._unrealized(price)
+            qty = self._size_full(equity_now, price)
+            if action == 1:
+                self.exec.market_long(qty);  self.entry_side, self.entry_price, self.entry_qty = +1, price, qty
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_LONG", "position": "LONG", "price": f"{price:.2f}"})
+            else:
+                self.exec.market_short(qty); self.entry_side, self.entry_price, self.entry_qty = -1, price, qty
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_SHORT", "position": "SHORT", "price": f"{price:.2f}"})
+        unrl = self._unrealized(price)
+        total_eq = self.initial_equity + self.realized + unrl
+        pos_str = "LONG" if self.exec.position() > 0 else ("SHORT" if self.exec.position() < 0 else "FLAT")
+        report = {
+            "total_equity": total_eq,
+            "unrealized_pnl_amount": unrl,
+            "unrealized_pnl_percent": (unrl / total_eq * 100.0) if total_eq > 0 else 0.0,
+            "position": pos_str,
+        }
+        summary = {"action": action, "price": price, "pos": pos_str, "equity": f"{total_eq:.2f}"}
+        return StepResult(logs=logs, report_snapshot=report, summary=summary)
