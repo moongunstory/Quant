@@ -46,15 +46,12 @@ class _ObsEnv(gym.Env):
 # ===== cloudpickle가 참조하는 'policy' 모듈 강제 로드 =====
 def _import_policy_for_cloudpickle() -> None:
     """
-    학습 시 `from policy import MultiHeadPolicy`로 저장되었기 때문에
-    로드시에도 'policy'라는 모듈명이 import 가능해야 한다.
-    없으면 경로 후보에서 policy.py를 찾아 sys.modules['policy']에 등록한다.
+    cloudpickle로 저장된 모델을 로드하기 위해 'policy' 모듈을 sys.modules에 등록합니다.
+    학습 시점의 `from policy import ...` 구문을 재현하기 위함입니다.
     """
-    try:
-        import policy  # noqa: F401
+    # 이미 로드되었다면 아무것도 하지 않음
+    if "policy" in sys.modules:
         return
-    except Exception:
-        pass
 
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
