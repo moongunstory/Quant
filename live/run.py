@@ -31,9 +31,8 @@ PAPER_INITIAL_CAPITAL = 10_000.0
 # 경로
 DATA_DIR   = os.path.join(_AI_DIR, "data")
 LOG_DIR    = os.path.join(DATA_DIR, "logs")
-REPORT_DIR = os.path.join(LOG_DIR, "reports")
 LOG_PATH   = os.path.join(LOG_DIR, "run_log.csv")
-REPORT_MD  = os.path.join(REPORT_DIR, "trading_report.md")
+REPORT_MD  = os.path.join(LOG_DIR, "trading_report.md")
 
 _ko_map = {
     'BULL': '상승', 'BEAR': '하락', 'SIDE': '횡보',
@@ -64,7 +63,6 @@ def _load_api_keys() -> tuple[str, str]:
     return key, sec
 
 def _init_report(initial_equity: float) -> None:
-    os.makedirs(REPORT_DIR, exist_ok=True)
     generate_report(
         REPORT_MD,
         {

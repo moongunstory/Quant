@@ -2,13 +2,13 @@
 """
 Reporting + Telegram (merged)
 - 파일: update_trade_log(), generate_report()
-- 텔레그램 명령: /start /whoami /reports /reportfile /log /logfile
+- 텔레그램 명령: /report, /log
 - 푸시 유틸: notify_trade(), notify_snapshot()
 .env:
   TELEGRAM_BOT_TOKEN=...
   TELEGRAM_ALLOWED_USER_IDS=123,456
   TELEGRAM_PUSH_CHAT_ID=123                # optional
-  REPORT_PATH=./data/logs/reports/trading_report.md
+  REPORT_PATH=./data/logs/trading_report.md
   TRADELOG_PATH=./data/logs/run_log.csv
 """
 from __future__ import annotations
