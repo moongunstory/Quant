@@ -188,7 +188,7 @@ def start_bot() -> None:
     app.add_handler(CommandHandler("report",    reports))
     app.add_handler(CommandHandler("log",       log))
     # 409 예방: 대기 업데이트 드랍 + 폴링 단일화
-    app.run_polling(drop_pending_updates=True, signal_handler=None)
+    app.run_polling(drop_pending_updates=True, handle_signals=False)
 
 
 if __name__ == "__main__":
