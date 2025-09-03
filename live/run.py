@@ -19,7 +19,7 @@ from trader import (
 )
 
 # ===== 설정 =====
-MODE = "live"                 # "live" 또는 "paper"
+MODE = "paper"                 # "live" 또는 "paper"
 SYMBOL_ETH = "ETHUSDT"
 SYMBOL_BTC = "BTCUSDT"
 USE_TESTNET = False
@@ -128,7 +128,48 @@ def main():
         generate_report(REPORT_MD, step.report_snapshot, is_new_session=False)
 
         s = step.summary
-        print(f"{ts.isoformat()} | mode={MODE} | action={s['action']} | pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')}")
+
+        # --- 판단 근거 문자열 생성 ---
+        btc_state, h4_state, h1_state, m15_state, m5_state = 'SIDE', 'FLAT', 'FLAT', '----', '----'
+
+        # 1. BTC 시장 (BULL/BEAR/SIDE)
+        btc_ret = obs_s.get('f_btc1h_ret_1h_btc1h', 0)
+        if btc_ret > 0.0005: btc_state = 'BULL'
+        elif btc_ret < -0.0005: btc_state = 'BEAR'
+
+        # 2. 4H 장기 추세 (UP/DOWN/FLAT)
+        h4_supertrend = obs_s.get('f_4h_supertrend_dir_4h', 0)
+        if h4_supertrend > 0: h4_state = 'UP'
+        elif h4_supertrend < 0: h4_state = 'DOWN'
+
+        # 3. 1H 중기 추세 (UP/DOWN/FLAT)
+        h1_slope = obs_s.get('f_1h_ema50_slope_1h', 0)
+        if h1_slope > 0.0002: h1_state = 'UP'
+        elif h1_slope < -0.0002: h1_state = 'DOWN'
+
+        # 4. 15M 변동성 (SQZ/----)
+        m15_squeeze = obs_s.get('f_15m_squeeze_ratio_15m', 0)
+        if m15_squeeze < -0.2: m15_state = 'SQZ'
+
+        # 5. 5M 진입 신호 (TRIG/----)
+        break_up = obs_s.get('f_5m_break_up_5m', 0)
+        break_down = obs_s.get('f_5m_break_down_5m', 0)
+        if break_up > 0 or break_down > 0: m5_state = 'TRIG'
+
+        # 영문 키워드를 한글로 변환
+        ko_map = {
+            'BULL': '상승', 'BEAR': '하락', 'SIDE': '횡보',
+            'UP':   '상승', 'DOWN': '하락', 'FLAT': '보합',
+            'SQZ':  '응축', '----': ' -- ',
+            'TRIG': '신호'
+        }
+        reason_str = (
+            f"reason=[ {ko_map[btc_state]} | {ko_map[h4_state]} | {ko_map[h1_state]} | "
+            f"{ko_map[m15_state]} | {ko_map[m5_state]} ]"
+        )
+        # --- 생성 끝 ---
+
+        print(f"{ts.isoformat()} | mode={MODE} | action={s['action']} | pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')} | {reason_str}")
 
 if __name__ == "__main__":
     main()

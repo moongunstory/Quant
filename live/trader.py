@@ -5,16 +5,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-
 import numpy as np
-
 import gymnasium as gym
+import time
 from gymnasium import spaces
-
-import pickle, io, gzip
-import cloudpickle
 import importlib.util
-
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from binance.client import Client
@@ -99,13 +94,27 @@ class BinanceExchange(ExchangeClient, ExecClient):
         if not api_key or not api_secret:
             raise RuntimeError("BinanceExchange: api_key/api_secret must be provided (no env read).")
 
+        # --- Binance 클라이언트 ---
         self.client = Client(api_key=api_key, api_secret=api_secret)
         if use_testnet:
             self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+
         self.recv_window = recv_window
         self.symbol_eth = symbol_eth
         self.symbol_btc = symbol_btc
 
+        # --- 서버 시간 동기화 (−1021 방지) ---
+        try:
+            srv_ms = int(self.client.get_server_time()["serverTime"])
+            loc_ms = int(time.time() * 1000)
+            offset = srv_ms - loc_ms
+            # python-binance는 `timestamp_offset`를 사용합니다.
+            self.client.timestamp_offset = offset
+        except Exception:
+            # 실패해도 치명적이지 않으니 그냥 진행
+            self.client.timestamp_offset = 0
+
+        # --- 심볼 필터 로드(수량 스텝/최소수량) ---
         self._filters: Dict[str, Dict[str, float]] = {}
         self._load_filters()
 
