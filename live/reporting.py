@@ -269,9 +269,12 @@ async def logfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_document(InputFile(TRADELOG_PATH, filename=os.path.basename(TRADELOG_PATH)))
 
-def main() -> None:
+def start_bot() -> None:
+    """텔레그램 봇을 시작합니다. run.py에서 스레드로 호출됩니다."""
     if not TOKEN:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
+        # raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
+        logger.error("TELEGRAM_BOT_TOKEN is not set in .env. Bot not starting.")
+        return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("whoami", whoami))
@@ -282,4 +285,5 @@ def main() -> None:
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    # 단독 테스트 실행용
+    start_bot()

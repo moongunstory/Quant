@@ -1,6 +1,6 @@
 # ai_binance/live/run.py
 from __future__ import annotations
-import os, sys
+import os, sys, threading
 from datetime import datetime, timezone
 
 # --- path shim ---
@@ -12,7 +12,7 @@ for p in (_THIS_DIR, _AI_DIR, _ROOT_DIR):
         sys.path.insert(0, p)
 
 from realtime_ingest import LiveIngest
-from reporting import update_trade_log, generate_report
+from reporting import update_trade_log, generate_report, start_bot
 from trader import (
     BinanceExchange, PublicBinanceData, PaperBroker,
     LiveTrader, PaperTrader, StepResult
@@ -64,12 +64,17 @@ def _load_api_keys() -> tuple[str, str]:
     return key, sec
 
 def main():
+    # 텔레그램 봇 스레드 시작
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+
     if MODE == "live":
         api_key, api_secret = _load_api_keys()
         if not api_key or not api_secret:
             raise SystemExit(
                 "MODE='live'인데 키 없음. OS 환경변수 또는 ai_binance/.env에 설정하세요.\n"
-                "예)\n  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
+                "예)\
+  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
             )
         ex = BinanceExchange(
             symbol_eth=SYMBOL_ETH, symbol_btc=SYMBOL_BTC,
