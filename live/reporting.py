@@ -34,8 +34,8 @@ ALLOWED_IDS = {
     for x in (_cfg.get("TELEGRAM_ALLOWED_USER_IDS") or "").split(",")
     if x.strip()
 }
-REPORT_PATH = _cfg.get("REPORT_PATH", os.path.join(BASE_DIR, "data", "logs", "reports", "trading_report.md"))
-TRADELOG_PATH = _cfg.get("TRADELOG_PATH", os.path.join(BASE_DIR, "data", "logs", "run_log.csv"))
+REPORT_PATH = os.path.join(BASE_DIR, "data", "logs", "reports", "trading_report.md")
+TRADELOG_PATH = os.path.join(BASE_DIR, "data", "logs", "run_log.csv")
 PUSH_CHAT_ID = int((_cfg.get("TELEGRAM_PUSH_CHAT_ID") or "0") or 0)
 
 MAX_MSG = 4000  # Telegram 안전 길이
