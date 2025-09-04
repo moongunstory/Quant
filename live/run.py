@@ -1,6 +1,6 @@
 # ai_binance/live/run.py
 from __future__ import annotations
-import os, sys, threading
+import os, sys, threading, csv
 from datetime import datetime, timezone
 
 # --- path shim ---
@@ -62,23 +62,63 @@ def _load_api_keys() -> tuple[str, str]:
         sec = (kv.get("BINANCE_API_SECRET") or kv.get("BINANCE_SECRET_KEY") or sec).strip()
     return key, sec
 
-def _init_report(initial_equity: float) -> None:
-    generate_report(
-        REPORT_MD,
-        {
-            "session_start_time": _utcnow_str(),
-            "initial_capital": initial_equity,
-            "total_equity": initial_equity,
-            "unrealized_pnl_amount": 0.0,
-            "unrealized_pnl_percent": 0.0,
-            "position": "FLAT",
-            "total_trades": 0, "win_rate": 0.0,
-            "long_trades": 0, "long_win_rate": 0.0,
-            "short_trades": 0, "short_win_rate": 0.0,
-            "hold_trades": 0,
-        },
-        is_new_session=True,
-    )
+def _calculate_stats_from_log(log_path: str) -> dict:
+    stats = {
+        "total_trades": 0, "win_rate": 0.0, "wins": 0,
+        "long_trades": 0, "long_win_rate": 0.0, "long_wins": 0,
+        "short_trades": 0, "short_win_rate": 0.0, "short_wins": 0,
+        "hold_trades": 0,
+    }
+    if not os.path.exists(log_path):
+        return stats
+
+    trades = []
+    with open(log_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key in ('Price', 'Profit'):
+                if key in row and row[key] == '':
+                    row[key] = '0'
+            trades.append(row)
+
+    if not trades:
+        return stats
+
+    current_pos = 'FLAT'
+    for trade in trades:
+        trade_type = trade.get('Type')
+        if trade_type == 'ENTRY_LONG':
+            current_pos = 'LONG'
+        elif trade_type == 'ENTRY_SHORT':
+            current_pos = 'SHORT'
+        elif trade_type == 'CLOSE':
+            if current_pos == 'FLAT':
+                continue
+
+            stats['total_trades'] += 1
+            profit = float(trade.get('Profit', 0) or 0)
+            if profit > 0:
+                stats['wins'] += 1
+
+            if current_pos == 'LONG':
+                stats['long_trades'] += 1
+                if profit > 0:
+                    stats['long_wins'] += 1
+            elif current_pos == 'SHORT':
+                stats['short_trades'] += 1
+                if profit > 0:
+                    stats['short_wins'] += 1
+            
+            current_pos = 'FLAT'
+
+    if stats['total_trades'] > 0:
+        stats['win_rate'] = (stats['wins'] / stats['total_trades']) * 100
+    if stats['long_trades'] > 0:
+        stats['long_win_rate'] = (stats['long_wins'] / stats['long_trades']) * 100
+    if stats['short_trades'] > 0:
+        stats['short_win_rate'] = (stats['short_wins'] / stats['short_trades']) * 100
+        
+    return stats
 
 def _compute_reason(obs_s) -> str:
     """영문 레짐/신호 → 한글 요약 문자열 생성"""
@@ -103,7 +143,7 @@ def _build_stack():
         if not (api_key and api_secret):
             raise SystemExit(
                 "MODE='live'인데 키 없음. OS 환경변수 또는 ai_binance/.env에 설정하세요.\n"
-                "예)\n  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
+                "예)\\n  BINANCE_API_KEY=...\\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
             )
         ex = BinanceExchange(
             symbol_eth=SYMBOL_ETH, symbol_btc=SYMBOL_BTC,
@@ -131,21 +171,63 @@ def main():
     _start_bot_async()
 
     ingest, trader = _build_stack()
-    _init_report(trader.initial_equity)
+    
+    report_data = _calculate_stats_from_log(LOG_PATH)
+    report_data["session_start_time"] = _utcnow_str()
+    report_data["initial_capital"] = trader.initial_equity
+    
+    report_data["total_equity"] = trader.equity if hasattr(trader, 'equity') else trader.initial_equity
+    report_data["unrealized_pnl_amount"] = 0.0
+    report_data["unrealized_pnl_percent"] = 0.0
+    report_data["position"] = "FLAT"
+    generate_report(REPORT_MD, report_data, is_new_session=True)
+
+    position_type_for_stat = 'FLAT'
 
     while True:
         obs_s, ts = ingest.wait_next_5m_and_build(poll_sec=2.0, grace_sec=2.0)
         step: StepResult = trader.step(obs_s.to_numpy(), ts)
 
+        new_trade_closed = False
         for row in step.logs:
             update_trade_log(LOG_PATH, row)
-        generate_report(REPORT_MD, step.report_snapshot, is_new_session=False)
+            if row.get('type', '').startswith('ENTRY_'):
+                position_type_for_stat = row['type'].split('_')[1]
+            elif row.get('type') == 'CLOSE':
+                if position_type_for_stat == 'FLAT': continue
+                new_trade_closed = True
+                report_data['total_trades'] += 1
+                profit = float(row.get('profit', 0) or 0)
+                
+                if profit > 0:
+                    report_data['wins'] += 1
+
+                if position_type_for_stat == 'LONG':
+                    report_data['long_trades'] += 1
+                    if profit > 0: report_data['long_wins'] += 1
+                elif position_type_for_stat == 'SHORT':
+                    report_data['short_trades'] += 1
+                    if profit > 0: report_data['short_wins'] += 1
+                
+                position_type_for_stat = 'FLAT'
+
+        if new_trade_closed:
+            if report_data['total_trades'] > 0:
+                report_data['win_rate'] = (report_data['wins'] / report_data['total_trades']) * 100
+            if report_data['long_trades'] > 0:
+                report_data['long_win_rate'] = (report_data['long_wins'] / report_data['long_trades']) * 100
+            if report_data['short_trades'] > 0:
+                report_data['short_win_rate'] = (report_data['short_wins'] / report_data['short_trades']) * 100
+
+        report_data.update(step.report_snapshot)
+        generate_report(REPORT_MD, report_data, is_new_session=False)
 
         s = step.summary
         print(
             f"{ts.isoformat()} | mode={MODE} | action={s['action']} | "
             f"pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')} | {_compute_reason(obs_s)}"
         )
+
 
 if __name__ == "__main__":
     main()
