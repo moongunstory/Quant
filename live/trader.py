@@ -378,12 +378,14 @@ class LiveTrader(BaseTrader):
                  model_path: Optional[str] = None, vec_path: Optional[str] = None,
                  norm_reward_at_train: bool = False, symbol_eth: str = "ETHUSDT",
                  leverage: float = 5.0, risk_fraction: float = 1.0,
-                 prob_threshold: float = 0.65):
+                 prob_threshold_entry: float = 0.65,
+                 prob_threshold_switch: float = 0.67):
         acc = exec_client.client.futures_account()
         total_eq = float(acc.get("totalMarginBalance", "0"))
         super().__init__(exec_client, exec_client, model_path, vec_path, norm_reward_at_train,
                          symbol_eth, leverage, risk_fraction, init_equity=total_eq)
-        self.prob_threshold = prob_threshold
+        self.prob_threshold_entry = prob_threshold_entry
+        self.prob_threshold_switch = prob_threshold_switch
 
     def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
         before_pos = self.exec.position()
@@ -392,46 +394,57 @@ class LiveTrader(BaseTrader):
         
         logs: List[Dict[str, Any]] = []
         filter_info = None
+        final_action = action
 
-        # 확률 임계값 필터: 무포지션일 때, 진입 액션(1:Long, 2:Short)에만 적용
-        if before_pos == 0 and action in (1, 2):
+        # 상황별 임계값 필터
+        if action in (1, 2): # 롱 또는 숏 진입/전환 시도
             import torch
             logits = torch.tensor(prediction["logits"])
             probs = torch.nn.functional.softmax(logits, dim=0)
             action_prob = probs[action].item()
+
+            context = ""
+            threshold = 0.0
+
+            if before_pos == 0: # 1. 신규 진입
+                context, threshold = "ENTRY", self.prob_threshold_entry
+            else: # 2. 포지션 전환
+                context, threshold = "SWITCH", self.prob_threshold_switch
+
+            if action_prob < threshold:
+                final_action = 0 # WAIT으로 강제 변경
+                filter_info = f"OVERRIDE({context} prob {action_prob:.2f} < {threshold})"
+            else:
+                filter_info = f"PASS({context} prob {action_prob:.2f} >= {threshold})"
             
-            if action_prob < self.prob_threshold:
-                filter_info = f"OVERRIDE(prob {action_prob:.2f} < {self.prob_threshold})"
-                logs.append({"timestamp": ts.isoformat(), "type": "FILTER", "info": filter_info})
-                action = 0  # 액션을 WAIT으로 강제 변경
+            logs.append({"timestamp": ts.isoformat(), "type": "FILTER", "info": filter_info})
 
         # PREDICT 로그는 필터링 결정 후에 추가 (실제 수행될 action을 기록하기 위함)
-        prediction["action"] = action # 필터링이 적용된 최종 액션으로 업데이트
+        prediction["action"] = final_action # 필터링이 적용된 최종 액션으로 업데이트
         logs.insert(0, {
             "timestamp": ts.isoformat(),
             "type": "PREDICT",
             "value": f"{prediction['value']:.4f}",
             "logits[W,L,S,C]": [f"{l:.3f}" for l in prediction['logits']],
-            "masked_action": action,
+            "masked_action": final_action,
         })
 
         price = self._last_close()
 
         def _account_equity() -> float:
-            # 실제 주문 가능 증거금 기준 (가용 잔고)
             a = self.exec.client.futures_account()
             return float(a.get("availableBalance", "0"))
 
-        if action == 3:
+        if final_action == 3:
             self.exec.market_close()
             logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT", "price": f"{price:.2f}"})
-        elif action in (1, 2):
-            if (action == 1 and before_pos < 0) or (action == 2 and before_pos > 0):
+        elif final_action in (1, 2):
+            if (final_action == 1 and before_pos < 0) or (final_action == 2 and before_pos > 0):
                 self.exec.market_close()
                 logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT", "price": f"{price:.2f}"})
             equity = _account_equity()
             qty = self._size_full(equity, price)
-            if action == 1:
+            if final_action == 1:
                 self.exec.market_long(qty)
                 logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_LONG", "position": "LONG", "price": f"{price:.2f}"})
             else:
@@ -441,12 +454,137 @@ class LiveTrader(BaseTrader):
         acc = self.exec.client.futures_account()
         total_eq = float(acc.get("totalMarginBalance", "0"))
         unrl    = float(acc.get("totalUnrealizedProfit", "0"))
-        pos_str = "LONG" if self.exec.position() > 0 else ("SHORT" if self.exec.position() < 0 else "FLAT")
+        
+        after_pos = self.exec.position()
+        pos_map = {0: "FLAT", 1: "LONG", -1: "SHORT"}
+        pos_str = pos_map[after_pos]
+        if before_pos != after_pos:
+            pos_str = f"{pos_map[before_pos]}->{pos_map[after_pos]}"
+
         report = {
             "total_equity": total_eq,
             "unrealized_pnl_amount": unrl,
             "unrealized_pnl_percent": (unrl / total_eq * 100.0) if total_eq > 0 else 0.0,
-            "position": pos_str,
+            "position": pos_map[after_pos],
+        }
+        
+        prediction_str = self._format_prediction_string(prediction, before_pos)
+        summary = {
+            "pos": pos_str, 
+            "price": f"{price:.2f}", 
+            "equity": f"{total_eq:.2f}", 
+            "value": f"{prediction['value']:.4f}",
+            "prediction": prediction_str
+        }
+        if filter_info:
+            summary["filter"] = filter_info
+
+        return StepResult(logs=logs, report_snapshot=report, summary=summary)
+
+# ===== 페이퍼 트레이더 =====
+class PaperTrader(BaseTrader):
+    def __init__(self, data_client: PublicBinanceData, exec_client: PaperBroker,
+                 model_path: Optional[str] = None, vec_path: Optional[str] = None,
+                 norm_reward_at_train: bool = False, symbol_eth: str = "ETHUSDT",
+                 leverage: float = 5.0, risk_fraction: float = 1.0, init_equity: float = 10_000.0,
+                 prob_threshold_entry: float = 0.65,
+                 prob_threshold_switch: float = 0.67):
+        super().__init__(exec_client, data_client, model_path, vec_path, norm_reward_at_train,
+                         symbol_eth, leverage, risk_fraction, init_equity)
+        self.realized = 0.0
+        self.entry_side = 0
+        self.entry_price: Optional[float] = None
+        self.entry_qty: float = 0.0
+        self.prob_threshold_entry = prob_threshold_entry
+        self.prob_threshold_switch = prob_threshold_switch
+
+    def _unrealized(self, price: float) -> float:
+        if self.entry_side == 0 or self.entry_price is None:
+            return 0.0
+        sign = 1.0 if self.entry_side > 0 else -1.0
+        return (price - self.entry_price) * sign * self.entry_qty
+
+    def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
+        before_pos = self.exec.position()
+        prediction = self._predict_action(obs_vec)
+        action = prediction["action"]
+
+        logs: List[Dict[str, Any]] = []
+        filter_info = None
+        final_action = action
+
+        # 상황별 임계값 필터
+        if action in (1, 2): # 롱 또는 숏 진입/전환 시도
+            import torch
+            logits = torch.tensor(prediction["logits"])
+            probs = torch.nn.functional.softmax(logits, dim=0)
+            action_prob = probs[action].item()
+
+            context = ""
+            threshold = 0.0
+
+            if before_pos == 0: # 1. 신규 진입
+                context, threshold = "ENTRY", self.prob_threshold_entry
+            else: # 2. 포지션 전환
+                context, threshold = "SWITCH", self.prob_threshold_switch
+
+            if action_prob < threshold:
+                final_action = 0 # WAIT으로 강제 변경
+                filter_info = f"OVERRIDE({context} prob {action_prob:.2f} < {threshold})"
+            else:
+                filter_info = f"PASS({context} prob {action_prob:.2f} >= {threshold})"
+            
+            logs.append({"timestamp": ts.isoformat(), "type": "FILTER", "info": filter_info})
+
+        # PREDICT 로그는 필터링 결정 후에 추가 (실제 수행될 action을 기록하기 위함)
+        prediction["action"] = final_action # 필터링이 적용된 최종 액션으로 업데이트
+        logs.insert(0, {
+            "timestamp": ts.isoformat(),
+            "type": "PREDICT",
+            "value": f"{prediction['value']:.4f}",
+            "logits[W,L,S,C]": [f"{l:.3f}" for l in prediction['logits']],
+            "masked_action": final_action,
+        })
+
+        price = self._last_close()
+
+        if final_action == 3:
+            if self.entry_side != 0:
+                pnl = self._unrealized(price)
+                self.realized += pnl
+                logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT",
+                             "price": f"{price:.2f}", "profit": f"{pnl:.2f}"})
+                self.entry_side, self.entry_price, self.entry_qty = 0, None, 0.0
+            self.exec.market_close()
+        elif final_action in (1, 2):
+            if self.entry_side != 0 and ((final_action == 1 and self.entry_side < 0) or (final_action == 2 and self.entry_side > 0)):
+                pnl = self._unrealized(price)
+                self.realized += pnl
+                logs.append({"timestamp": ts.isoformat(), "type": "CLOSE", "position": "FLAT",
+                             "price": f"{price:.2f}", "profit": f"{pnl:.2f}"})
+            equity_now = self.initial_equity + self.realized + self._unrealized(price)
+            qty = self._size_full(equity_now, price)
+            if final_action == 1:
+                self.exec.market_long(qty);  self.entry_side, self.entry_price, self.entry_qty = +1, price, qty
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_LONG", "position": "LONG", "price": f"{price:.2f}"})
+            else:
+                self.exec.market_short(qty); self.entry_side, self.entry_price, self.entry_qty = -1, price, qty
+                logs.append({"timestamp": ts.isoformat(), "type": "ENTRY_SHORT", "position": "SHORT", "price": f"{price:.2f}"})
+        
+        unrl = self._unrealized(price)
+        total_eq = self.initial_equity + self.realized + unrl
+        
+        after_pos = self.exec.position()
+        pos_map = {0: "FLAT", 1: "LONG", -1: "SHORT"}
+        pos_str = pos_map[after_pos]
+        if before_pos != after_pos:
+            pos_str = f"{pos_map[before_pos]}->{pos_map[after_pos]}"
+
+        report = {
+            "total_equity": total_eq,
+            "unrealized_pnl_amount": unrl,
+            "unrealized_pnl_percent": (unrl / total_eq * 100.0) if total_eq > 0 else 0.0,
+            "position": pos_map[after_pos],
         }
         
         prediction_str = self._format_prediction_string(prediction, before_pos)

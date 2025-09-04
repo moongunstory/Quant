@@ -119,12 +119,16 @@ def _start_bot_async():
 
 def _build_stack():
     """MODE에 따라 인제스터/트레이더/초기자산 구성"""
+    # 상황별 임계값 설정
+    PROB_THRESHOLD_ENTRY = 0.65
+    PROB_THRESHOLD_SWITCH = 0.67
+
     if MODE == "live":
         api_key, api_secret = _load_api_keys()
         if not (api_key and api_secret):
             raise SystemExit(
-                "MODE='live'인데 키 없음. OS 환경변수 또는 ai_binance/.env에 설정하세요.\n"
-                "예)\\n  BINANCE_API_KEY=...\\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
+                "MODE='live'인데 키 없음. OS 환경변수 또는 ai_binance/.env에 설정하세요.\n" 
+                "예)\n  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...  (또는 BINANCE_SECRET_KEY=...)"
             )
         ex = BinanceExchange(
             symbol_eth=SYMBOL_ETH, symbol_btc=SYMBOL_BTC,
@@ -135,6 +139,8 @@ def _build_stack():
         trader = LiveTrader(
             exec_client=ex, norm_reward_at_train=NORM_REWARD_AT_TRAIN,
             symbol_eth=SYMBOL_ETH, leverage=LEVERAGE, risk_fraction=RISK_FRACTION,
+            prob_threshold_entry=PROB_THRESHOLD_ENTRY,
+            prob_threshold_switch=PROB_THRESHOLD_SWITCH,
         )
     else:
         data = PublicBinanceData(testnet=USE_TESTNET)
@@ -144,6 +150,8 @@ def _build_stack():
             norm_reward_at_train=NORM_REWARD_AT_TRAIN,
             symbol_eth=SYMBOL_ETH, leverage=LEVERAGE, risk_fraction=RISK_FRACTION,
             init_equity=PAPER_INITIAL_CAPITAL,
+            prob_threshold_entry=PROB_THRESHOLD_ENTRY,
+            prob_threshold_switch=PROB_THRESHOLD_SWITCH,
         )
     return ingest, trader
 
