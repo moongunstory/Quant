@@ -34,12 +34,6 @@ LOG_DIR    = os.path.join(DATA_DIR, "logs")
 LOG_PATH   = os.path.join(LOG_DIR, "run_log.csv")
 REPORT_MD  = os.path.join(LOG_DIR, "trading_report.md")
 
-_ko_map = {
-    'BULL': '상승', 'BEAR': '하락', 'SIDE': '횡보',
-    'UP': '상승', 'DOWN': '하락', 'FLAT': '보합',
-    'SQZ': '응축', '----': ' -- ', 'TRIG': '신호'
-}
-
 def _utcnow_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -119,19 +113,6 @@ def _calculate_stats_from_log(log_path: str) -> dict:
         stats['short_win_rate'] = (stats['short_wins'] / stats['short_trades']) * 100
         
     return stats
-
-def _compute_reason(obs_s) -> str:
-    """영문 레짐/신호 → 한글 요약 문자열 생성"""
-    get = obs_s.get
-    btc_state = 'BULL' if get('f_btc1h_ret_1h_btc1h', 0) >  0.0005 else \
-                'BEAR' if get('f_btc1h_ret_1h_btc1h', 0) < -0.0005 else 'SIDE'
-    h4_dir    = get('f_4h_supertrend_dir_4h', 0)
-    h4_state  = 'UP' if h4_dir > 0 else ('DOWN' if h4_dir < 0 else 'FLAT')
-    h1_slope  = get('f_1h_ema50_slope_1h', 0)
-    h1_state  = 'UP' if h1_slope >  0.0002 else ('DOWN' if h1_slope < -0.0002 else 'FLAT')
-    m15_state = 'SQZ' if get('f_15m_squeeze_ratio_15m', 0) < -0.2 else '----'
-    m5_state  = 'TRIG' if (get('f_5m_break_up_5m', 0) > 0 or get('f_5m_break_down_5m', 0) > 0) else '----'
-    return "reason=[ " + " | ".join(_ko_map[s] for s in (btc_state, h4_state, h1_state, m15_state, m5_state)) + " ]"
 
 def _start_bot_async():
     threading.Thread(target=start_bot, daemon=True).start()
@@ -223,11 +204,15 @@ def main():
         generate_report(REPORT_MD, report_data, is_new_session=False)
 
         s = step.summary
+        probs = s.get('probs')
+        value = s.get('value')
+        probs_str = f" | probs={[round(x,2) for x in probs]}" if probs else ""
+        value_str = f" | V={value:.3f}" if value is not None else ""
         print(
             f"{ts.isoformat()} | mode={MODE} | action={s['action']} | "
-            f"pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')} | {_compute_reason(obs_s)}"
+            f"pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')}"
+            f"{probs_str}{value_str}"
         )
-
 
 if __name__ == "__main__":
     main()
