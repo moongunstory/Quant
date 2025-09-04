@@ -312,8 +312,21 @@ class BaseTrader:
 
     # 포지션 사이징: 전액 * 레버리지 / 가격 * 비율
     def _size_full(self, equity: float, price: float) -> float:
-        qty = (float(equity) * self.leverage * self.risk_fraction) / max(price, 1e-9)
-        return float(max(qty, 0.0))
+        # 가용 증거금을 100% 쓰지 않도록 안전 캡 + 초기증거금(IM) 검증
+        SAFETY = 0.95   # 가용 증거금의 95%만 사용
+        FEEBUF = 1.005  # 수수료/슬리피지 여유
+        px = max(float(price), 1e-9)
+        eq = max(float(equity), 0.0)
+        # 1차 제안 수량
+        qty = (eq * self.leverage * self.risk_fraction * SAFETY) / px
+        if qty <= 0:
+            return 0.0
+        # 초기증거금 추산: notional/lev (보수적 버퍼 포함)
+        required_im = (qty * px / max(self.leverage, 1e-9)) * FEEBUF
+        if required_im > eq:
+            scale = eq / required_im  # 살짝만 초과해도 자동 축소
+            qty *= max(min(scale, 1.0), 0.0)
+        return float(qty)
 
     def step(self, obs_vec: np.ndarray, ts: datetime) -> StepResult:
         raise NotImplementedError
