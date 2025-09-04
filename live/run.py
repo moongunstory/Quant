@@ -204,14 +204,11 @@ def main():
         generate_report(REPORT_MD, report_data, is_new_session=False)
 
         s = step.summary
-        probs = s.get('probs')
-        value = s.get('value')
-        probs_str = f" | probs={[round(x,2) for x in probs]}" if probs else ""
-        value_str = f" | V={value:.3f}" if value is not None else ""
+        filter_str = f" | filter={s['filter']}" if s.get('filter') else ""
         print(
-            f"{ts.isoformat()} | mode={MODE} | action={s['action']} | "
-            f"pos={s['pos']} | px={s['price']:.2f} | eq={s.get('equity','-')}"
-            f"{probs_str}{value_str}"
+            f"{ts.isoformat(timespec='seconds')} | mode={MODE} | pos={s['pos']} | "
+            f"px={s['price']} | eq={s['equity']} | value={s['value']} | "
+            f"prediction={s['prediction']}{filter_str}"
         )
 
 if __name__ == "__main__":
