@@ -337,8 +337,9 @@ class LiveTrader(BaseTrader):
         logs: List[Dict[str, Any]] = []
 
         def _account_equity() -> float:
+            # 실제 주문 가능 증거금 기준 (가용 잔고)
             a = self.exec.client.futures_account()
-            return float(a.get("totalMarginBalance", "0"))
+            return float(a.get("availableBalance", "0"))
 
         if action == 3:
             self.exec.market_close()
