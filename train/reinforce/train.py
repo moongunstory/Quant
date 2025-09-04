@@ -30,21 +30,22 @@ OBS_ORDER_PATH = os.path.join(CKPT_DIR, "obs_cols.json")     # 실거래 입력 
 # 학습에서 관측 제외할 원본(참조) 접미사
 REF_SUFFIXES = ["_Open", "_High", "_Low", "_Close", "_Volume", "_FundingRate", "_FundingSettle"]
 
-# ===== 데이터 병합(간결, 무경고) =====
+# ===== 데이터 병합(옵션 A: btc1h 파일 미사용) =====
 def _load_split(prefix: str) -> pd.DataFrame:
     paths = [
         os.path.join(PROC_DIR, f"{prefix}_5m.parquet"),
         os.path.join(PROC_DIR, f"{prefix}_15m.parquet"),
         os.path.join(PROC_DIR, f"{prefix}_1h.parquet"),
         os.path.join(PROC_DIR, f"{prefix}_4h.parquet"),
-        os.path.join(PROC_DIR, f"{prefix}_btc1h.parquet"),
+        # 옵션 A: 별도 btc1h parquet는 관측에서 제외 (ETH 피처 내부 요약 신호만 사용)
+        # os.path.join(PROC_DIR, f"{prefix}_btc1h.parquet"),
     ]
     dfs = []
 
-    # 환경에 필요한 참조 컬럼 목록 (fe.py의 REF_COLS_CANON과 일치)
+    # fe.py의 REF_COLS_CANON과 일치
     ref_cols_canon = ["Open", "High", "Low", "Close", "Volume", "FundingRate", "FundingSettle"]
 
-    # 타임프레임과 파일 접미사 매핑
+    # TF별 feature_list를 사용해 열 정렬(스케일된 피처만 선택)
     tf_map = {
         "_5m.parquet": "5m",
         "_15m.parquet": "15m",
@@ -52,7 +53,7 @@ def _load_split(prefix: str) -> pd.DataFrame:
         "_4h.parquet": "4h",
     }
 
-    # 원본 참조 데이터를 보관할 임시 저장소
+    # 원본 참조 데이터(5m)에서 close/펀딩을 가져오기 위해 보관
     ref_dfs = {}
 
     for p in paths:
@@ -62,36 +63,25 @@ def _load_split(prefix: str) -> pd.DataFrame:
         df = pd.read_parquet(p)
         name = os.path.basename(p)
 
-        # --- 수정된 로직 시작 ---
-        is_eth = False
+        # ETH 타임프레임만 처리
         for suffix, tf in tf_map.items():
             if name.endswith(suffix) and "btc" not in name:
                 list_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
                 if os.path.exists(list_path):
                     with open(list_path, "r", encoding="utf-8") as f:
                         feature_list = json.load(f)
-                    
-                    # 참조 컬럼은 따로 저장해 둠
+                    # 참조 컬럼 따로 보관(5m에서 close/funding 사용)
                     ref_df_cols = [c for c in ref_cols_canon if c in df.columns]
-                    ref_dfs[tf] = df[ref_df_cols]
-
+                    ref_dfs[tf] = df[ref_df_cols].copy()
                     # 선택된 특성만 유지
                     df = df.reindex(columns=feature_list, fill_value=0.0)
-                is_eth = True
+                # 접두사 부여
+                if tf == "5m":      df = df.add_prefix("f_5m_")
+                elif tf == "15m":   df = df.add_prefix("f_15m_")
+                elif tf == "1h":    df = df.add_prefix("f_1h_")
+                elif tf == "4h":    df = df.add_prefix("f_4h_")
+                dfs.append(df)
                 break
-
-        # BTC의 경우, 실시간 환경과 동일하게 참조 컬럼을 제외한 특성만 사용
-        if not is_eth and name.endswith("_btc1h.parquet"):
-            eng_cols = [c for c in df.columns if c not in ref_cols_canon]
-            df = df.reindex(columns=eng_cols, fill_value=0.0)
-        # --- 수정된 로직 끝 ---
-
-        if name.endswith("_5m.parquet"):      df = df.add_prefix("f_5m_")
-        elif name.endswith("_15m.parquet"):   df = df.add_prefix("f_15m_")
-        elif name.endswith("_1h.parquet") and "btc" not in name: df = df.add_prefix("f_1h_")
-        elif name.endswith("_4h.parquet"):    df = df.add_prefix("f_4h_")
-        elif name.endswith("_btc1h.parquet"): df = df.add_prefix("f_btc1h_")
-        dfs.append(df)
 
     if not dfs:
         raise FileNotFoundError(f"No parquet files for prefix={prefix}")
@@ -102,10 +92,11 @@ def _load_split(prefix: str) -> pd.DataFrame:
 
     base = base.sort_index().ffill().copy()  # defrag 1회
 
-    # 종가/펀딩 추가(별도로 저장했던 5m 참조 데이터 사용)
+    # 종가/펀딩 추가(5m 참조 데이터 필수)
+    if "5m" not in ref_dfs:
+        raise RuntimeError("5m reference frame not found. Check processed files and fe pipeline.")
     close_series = pd.to_numeric(ref_dfs["5m"]["Close"], errors="coerce").astype(float)
-    extra = {"close": close_series}
-    extra["price_close"] = extra["close"]
+    extra = {"close": close_series, "price_close": close_series}
     if "funding_per_bar" not in base.columns:
         extra["funding_per_bar"] = pd.Series(0.0, index=base.index)
     base = pd.concat([base, pd.DataFrame(extra, index=base.index)], axis=1)
@@ -115,7 +106,7 @@ def _load_split(prefix: str) -> pd.DataFrame:
     base = base.dropna(subset=obs_cols + ["close"]).copy()
     base[obs_cols] = base[obs_cols].astype("float32")
 
-    # 보조 라벨(4H 방향) 없으면 추가
+    # 보조 라벨(4H 방향) 없으면 추가(마지막 48개는 NaN → 콜백에서 자동 스킵)
     if "label_4h_dir" not in base.columns:
         h = 48  # 4H = 48 x 5m
         ret = (base["close"].shift(-h) - base["close"]) / base["close"]
@@ -135,10 +126,12 @@ def action_mask_fn(env) -> np.ndarray:
     if pos < 0:  mask[2] = 0
     return mask
 
-# ===== Aux Loss 콜백 =====
+# ===== Aux Loss 콜백 (trend head만 별도 업데이트) =====
 class TrendAuxLossCallback(BaseCallback):
     def __init__(self, coeff: float = 0.1, verbose: int = 0):
-        super().__init__(verbose); self.coeff = coeff; self._labels = []
+        super().__init__(verbose)
+        self.coeff = float(coeff)
+        self._labels: list[int] = []
 
     def _on_rollout_start(self) -> None:
         self._labels.clear()
@@ -158,10 +151,10 @@ class TrendAuxLossCallback(BaseCallback):
         n = min(obs.shape[0], y.shape[0])
         if n <= 0:
             self._labels.clear(); return
-        aux = self.model.policy.aux_loss(obs[:n], y[:n])
-        self.model.policy.optimizer.zero_grad(set_to_none=True)
-        (self.coeff * aux).backward(); self.model.policy.optimizer.step()
-        self.model.logger.record("train/aux_trend_loss", (self.coeff * aux).item())
+
+        # ✅ trend head만 업데이트 (backbone 고정), PPO optimizer는 건드리지 않음
+        aux_logged = self.model.policy.aux_train_step(obs[:n], y[:n], coeff=self.coeff, max_grad_norm=1.0)
+        self.model.logger.record("train/aux_trend_loss", aux_logged)
         self._labels.clear()
 
 # ===== 메인 =====
@@ -192,14 +185,19 @@ def main():
 
     eval_env = DummyVecEnv([make_env_eval])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0, training=False)
-    eval_env.obs_rms = venv.obs_rms  # returns_rms는 공유하지 않음
+    eval_env.obs_rms = venv.obs_rms  # 관측 정규화 통계 공유
+    eval_env.norm_reward = False      # ✅ 평가/조기중단은 보상 정규화 OFF
 
-    # ===== PPO 설정(안전한 강화)
+    # ===== PPO 설정(안정한 기본값)
     model = MaskablePPO(
         policy=MultiHeadPolicy,
         env=venv,
         seed=SEED,
-        policy_kwargs=dict(trend_dim=3, aux_coeff=0.1, net_arch=dict(pi=[256], vf=[256])),
+        policy_kwargs=dict(
+            trend_dim=3,
+            aux_coeff=0.1,
+            net_arch=dict(pi=[256], vf=[256])
+        ),
         n_steps=4096,
         batch_size=512,
         learning_rate=3e-4,
@@ -214,8 +212,13 @@ def main():
 
     # ===== 콜백: Aux + Eval(베스트만 저장)
     aux_cb  = TrendAuxLossCallback(coeff=0.1)
-    eval_cb = EvalCallback(eval_env, best_model_save_path=CKPT_DIR, eval_freq=100_000,
-                           n_eval_episodes=1, deterministic=True)
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=CKPT_DIR,
+        eval_freq=100_000,
+        n_eval_episodes=5,         # ✅ 분산 완화
+        deterministic=True
+    )
     cb = CallbackList([aux_cb, eval_cb])
 
     # ===== 학습

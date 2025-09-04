@@ -1,4 +1,4 @@
-# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-7.0b / Role-Tuned, VWAP Series guard)
+# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-9.0, leak-free / volume-consistent)
 from __future__ import annotations
 
 import os, json
@@ -24,7 +24,7 @@ BASE_INTERVAL  = "5m"
 FEATURE_SEARCH = True
 RANDOM_STATE = 72
 TOP_K_PER_TF = {"5m": 128, "15m": 128, "1h": 96, "4h": 64}
-TF_FOR_SEARCH = ["5m", "15m", "1h", "4h"]
+TF_FOR_SEARCH = ["5m", "15m", "1h", "4h"]  # 옵션 A: btc1h는 선정/스케일 대상 아님
 
 # Output path formats
 FEATURE_LIST_PATH_FMT = os.path.join(OUT_DIR, "fe_feature_list_{tf}.json")
@@ -64,20 +64,35 @@ def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
 def pct_slope(x: pd.Series, win: int) -> pd.Series:
     return x.pct_change().rolling(win, min_periods=win).mean().fillna(0.0)
 
+# --- robust datetime handling (ms/ns) ---
+def _to_utc_dt(s: pd.Series) -> pd.DatetimeIndex:
+    s = pd.Series(s)
+    if np.issubdtype(s.dtype, np.number):
+        vmax = float(s.dropna().max()) if s.dropna().size else 0.0
+        unit = "ms" if 1e11 < vmax < 1e14 else "ns"
+        return pd.to_datetime(s, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(s, utc=True, errors="coerce")
+
 def _enforce_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         for tcol in ["Open_time", "open_time", "time"]:
             if tcol in df.columns:
-                idx = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+                idx = _to_utc_dt(df[tcol])
                 if idx.notna().any():
                     df = df.set_index(idx).drop(columns=[tcol])
                     break
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = _to_utc_dt(df.index)
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     df.index.name = "time"
     return df
 
 def _load_raw(split: str, interval: str) -> pd.DataFrame:
+    """
+    - Volume: RAW 유지 (Volume), 로그 필요 시 별도 컬럼(VolumeLog) 생성
+    - Quote/Taker 계열도 Raw/Log 병행 보존 (향후 선택적 사용)
+    """
     if interval == "btc1h":
         p = os.path.join(RAW_DIR, "btcusdt", f"fut_{split}_data_1h.parquet")
     else:
@@ -87,21 +102,35 @@ def _load_raw(split: str, interval: str) -> pd.DataFrame:
 
     df = pd.read_parquet(p)
 
+    # 숫자형 강제
     cols = {c.lower(): c for c in df.columns}
     for k in ["open","high","low","close","volume"]:
         if k in cols:
             real = cols[k]
             df[real] = pd.to_numeric(df[real], errors="coerce")
 
+    # Funding
     if "FundingRate" not in df.columns and "funding_rate" in df.columns:
         df.rename(columns={"funding_rate": "FundingRate"}, inplace=True)
     if "FundingRate" not in df.columns:
         df["FundingRate"] = 0.0
     df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
 
-    for k in ["Volume", "Quote_asset_volume", "Taker_buy_base", "Taker_buy_quote"]:
-        if k in df.columns:
-            df[k] = np.log1p(np.clip(pd.to_numeric(df[k], errors="coerce"), 0, None))
+    # --- Volume & flows: RAW 보존 + LOG 별도 ---
+    def _mk_raw_log(col: str):
+        if col in df.columns:
+            base = pd.to_numeric(df[col], errors="coerce")
+            df[f"{col}Raw"] = base
+            df[f"{col}Log"] = np.log1p(np.clip(base, 0, None))
+
+    _mk_raw_log("Volume")
+    _mk_raw_log("Quote_asset_volume")
+    _mk_raw_log("Taker_buy_base")
+    _mk_raw_log("Taker_buy_quote")
+
+    # 관습적 이름: 가급적 Volume = Raw 로 유지
+    if "VolumeRaw" in df.columns:
+        df["Volume"] = df["VolumeRaw"]
 
     df = _enforce_dt_index(df)
 
@@ -124,7 +153,7 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def _funding_phase_features(idx: pd.DatetimeIndex) -> pd.DataFrame:
-    steps_per_8h = 96
+    steps_per_8h = 96  # 8h = 96 x 5m
     steps_since = (idx.hour % 8) * 12 + (idx.minute // 5)
     steps_to_next = (steps_per_8h - steps_since) % steps_per_8h
     phase = 2 * np.pi * (steps_since / steps_per_8h)
@@ -215,14 +244,23 @@ def kama(series: pd.Series, n: int = 30, fast: int = 2, slow: int = 30) -> pd.Se
     return kama
 
 def anchored_vwap(df: pd.DataFrame, anchor: str = "W") -> pd.Series:
+    """Anchor by week ('W'), month-end ('M'), or month-start ('MS')."""
     price = df["Close"].astype(float)
-    vol = np.clip(pd.to_numeric(df["Volume"], errors="coerce"), 0, None)
+    vol = np.clip(pd.to_numeric(df.get("VolumeRaw", df["Volume"]), errors="coerce"), 0, None)
+
+    # ✅ valid frequencies only
     if anchor == "M":
-        anchor = "ME"
-    key = pd.Grouper(freq=anchor, label="left", closed="left")
-    g = df.groupby(key, group_keys=False)
-    pv_cum = g.apply(lambda x: (x["Close"]*np.clip(pd.to_numeric(x["Volume"], errors="coerce"),0,None)).cumsum())
-    v_cum  = g.apply(lambda x: np.clip(pd.to_numeric(x["Volume"], errors="coerce"),0,None).cumsum())
+        freq = "M"   # month-end
+    elif anchor == "MS":
+        freq = "MS"  # month-start
+    elif anchor == "W":
+        freq = "W"   # week-end
+    else:
+        freq = anchor
+
+    g = df.groupby(pd.Grouper(freq=freq, label="left", closed="left"))
+    pv_cum = g.apply(lambda x: (x["Close"] * np.clip(pd.to_numeric(x.get("VolumeRaw", x["Volume"]), errors="coerce"), 0, None)).cumsum())
+    v_cum  = g.apply(lambda x: np.clip(pd.to_numeric(x.get("VolumeRaw", x["Volume"]), errors="coerce"), 0, None).cumsum())
     vwap = (pv_cum / (v_cum + 1e-9)).reindex(df.index).ffill().fillna(price)
     return vwap
 
@@ -238,7 +276,8 @@ def realized_variance(ret: pd.Series, win: int = 12) -> pd.Series:
 
 def cmf_proxy(df: pd.DataFrame, win: int = 20) -> pd.Series:
     mfm = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"] + 1e-9)
-    mfv = mfm * np.clip(pd.to_numeric(df["Volume"], errors="coerce"), 0, None)
+    vol = np.clip(pd.to_numeric(df.get("VolumeRaw", df["Volume"]), errors="coerce"), 0, None)
+    mfv = mfm * vol
     return mfv.rolling(win, min_periods=win).sum()
 
 # ===== Feature Engines (Role-Tuned) =====
@@ -246,7 +285,7 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
     df = df.sort_index()
     out = pd.DataFrame(index=df.index)
 
-    # ===== BTC 1h (standalone) =====
+    # ===== BTC 1h (standalone) — 옵션 A에서는 최종 저장하지 않음 =====
     if interval == "btc1h":
         close = df["Close"].astype(float)
         out["ret_1h"] = close.pct_change()
@@ -263,7 +302,7 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         df["Close"].astype(float),
         df["High"].astype(float),
         df["Low"].astype(float),
-        df["Volume"].astype(float),
+        df["Volume"].astype(float),  # RAW
     )
     ret1 = close.pct_change().fillna(0.0)
     out["ret_1"] = ret1
@@ -282,11 +321,16 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["ema200_slope"] = pct_slope(ema200, 5)
         out["ema50_200_spread"] = (ema50 - ema200) / (ema200 + 1e-9)
 
+        # bars_since_cross: 마지막 교차 이후 경과 바 수 (초기 구간 0으로)
         cross_up = ((ema50.shift(1) < ema200.shift(1)) & (ema50 >= ema200)).astype(int)
         cross_dn = ((ema50.shift(1) > ema200.shift(1)) & (ema50 <= ema200)).astype(int)
-        cross = (cross_up - cross_dn).replace({-1: -1, 0: 0, 1: 1})
-        out["bars_since_cross"] = (cross != 0).cumsum()
-        out["bars_since_cross"] = out["bars_since_cross"].where(cross==0, 0).cumsum()
+        cross = (cross_up - cross_dn)  # -1,0,1
+        idx = np.arange(len(df), dtype=int)
+        mark = np.where(cross != 0, idx, -1)
+        last = np.maximum.accumulate(mark)
+        bars = idx - last
+        bars[last < 0] = 0
+        out["bars_since_cross"] = bars.astype(np.int32)
 
         di_win = 14
         dm_plus  = (high - high.shift(1)).clip(lower=0)
@@ -353,7 +397,7 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["atr3"] = _atr(df, period=3)
         out["rv_12"] = realized_variance(ret1, win=12)
 
-        vwap_d = _as_series(anchored_vwap(df, "D"))
+        vwap_d = _as_series(anchored_vwap(df, "D")) if "D" else _as_series(anchored_vwap(df, "W"))
         vwap_w = _as_series(anchored_vwap(df, "W"))
         out["dist_vwap_d"] = (close - vwap_d) / (vwap_d + 1e-9)
         out["dist_vwap_w"] = (close - vwap_w) / (vwap_w + 1e-9)
@@ -372,15 +416,31 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out['hour_sin'], out['hour_cos'] = np.sin(2*np.pi*df.index.hour/24), np.cos(2*np.pi*df.index.hour/24)
         out['day_sin'],  out['day_cos']  = np.sin(2*np.pi*df.index.dayofweek/7), np.cos(2*np.pi*df.index.dayofweek/7)
         out = pd.concat([out, _funding_phase_features(out.index)], axis=1)
-        # >>> fixed: 기본값을 index 정렬된 Series(0)로 만들어서 astype 가능하게
+
         settle_series = df["FundingSettle"] if "FundingSettle" in df.columns else pd.Series(0, index=df.index)
         out["is_funding_settle"] = settle_series.astype("int8")
         out["funding_z_48"] = zscore(df["FundingRate"].astype(float), win=48)
 
-    # ===== BTC 리드/래그 & 상관/베타 =====
+    # ===== BTC 리드/래그 & 상관/베타 (옵션 A: ETH 내부 파생만) =====
     if btc_df is not None:
-        btc_renamed = btc_df.rename(columns={c: f"{c}_btc1h" for c in btc_df.columns})
-        merged = pd.merge_asof(df.reset_index(), btc_renamed.reset_index(), on="time", direction="backward").set_index("time")
+        # 필요한 컬럼만, 명확한 이름으로
+        btc_slim = pd.DataFrame(index=btc_df.index)
+        btc_slim["Close_btc1h"]  = pd.to_numeric(btc_df["Close"], errors="coerce")
+        if "Volume" in btc_df.columns:
+            btc_slim["Volume_btc1h"] = pd.to_numeric(btc_df["Volume"], errors="coerce")
+
+        # asof tolerance: interval별 합리적 허용치
+        tol_map = {"5m": "1H", "15m": "1H", "1h": "1H", "4h": "4H"}
+        tol = pd.Timedelta(tol_map.get(interval, "1H"))
+
+        merged = pd.merge_asof(
+            df.reset_index().sort_values("time"),
+            btc_slim.reset_index().sort_values("time"),
+            on="time",
+            direction="backward",
+            tolerance=tol
+        ).set_index("time")
+
         btc_close = merged["Close_btc1h"].astype(float)
         btc_vol   = merged.get("Volume_btc1h", pd.Series(0, index=merged.index)).astype(float)
 
@@ -388,10 +448,13 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["btc_vol_z_24"]  = zscore(btc_vol, win=24)
         btc_macd = ema(btc_close,12) - ema(btc_close,26)
         out["btc_macd"] = btc_macd
+
+        # ⚠️ leak-free: 과거만 사용
         for lag in range(1, 3):
             out[f"btc_ret_1h_lag{lag}"] = out["btc_ret_1h"].shift(lag)
-            out[f"btc_ret_1h_lead{lag}"] = out["btc_ret_1h"].shift(-lag)
+        # (금지) lead 사용 금지
 
+        # 공적분 유사: 베타/상관/스프레드
         if interval in ("1h","4h"):
             w = 24 if interval=="1h" else 6
         elif interval=="15m":
@@ -413,8 +476,9 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
     return _sanitize(final_out)
 
 # ===== Feature Search & Scaler =====
-def _make_proxy_y(df: pd.DataFrame) -> pd.Series:
-    return (df["Close"].astype(float).pct_change().shift(-1) > 0).astype(int).fillna(0)
+def _make_proxy_y(df: pd.DataFrame, horizon: int) -> pd.Series:
+    """RL 의사결정 지평선과 정합: 5m→+12, 15m→+4, 1h→+1, 4h→+1"""
+    return (df["Close"].astype(float).pct_change(horizon).shift(-horizon) > 0).astype(int).fillna(0)
 
 def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
     X_ = _sanitize(X).astype(float)
@@ -428,7 +492,8 @@ def _feature_search_for_tf(train_df: pd.DataFrame, tf: str) -> List[str]:
     if not FEATURE_SEARCH or not feat_cols:
         keep = feat_cols
     else:
-        y_tr = _make_proxy_y(train_df)
+        H = {"5m": 12, "15m": 4, "1h": 1, "4h": 1}
+        y_tr = _make_proxy_y(train_df, H.get(tf, 1))
         k = min(TOP_K_PER_TF.get(tf, len(feat_cols)), len(feat_cols))
         keep = _feature_search_mi(train_df[feat_cols], y_tr, k)
     path = FEATURE_LIST_PATH_FMT.format(tf=tf)
@@ -450,22 +515,16 @@ def main():
     print("[1/5] Loading all raw data...")
     raw_data = {s: {tf: _load_raw(s, tf) for tf in TIMEFRAMES} for s in ["train", "val", "test"]}
 
-    print("\n[2/5] Pre-computing BTC features...")
-    btc_features = {}
-    for split in ["train", "val", "test"]:
-        btc_df_raw = raw_data[split]["btc1h"]
-        btc_features[split] = compute_features_for_tf(btc_df_raw, "btc1h")
-        out_p = os.path.join(OUT_DIR, f"fe_{split}_btc1h.parquet")
-        btc_features[split].to_parquet(out_p)
-        print(f"  [ok] Saved standalone {split}/btc1h -> {out_p}")
+    print("\n[2/5] Prepare BTC raw frames in-memory (no save).")
+    btc_raw = {s: raw_data[s]["btc1h"] for s in ["train", "val", "test"]}
 
-    print("\n[3/5] Computing ETH features with BTC lead-lag/corr...")
+    print("\n[3/5] Computing ETH features with BTC lag/corr (no-leak)...")
     feature_data = {s: {} for s in ["train", "val", "test"]}
     for split in ["train", "val", "test"]:
         for tf in ETH_TIMEFRAMES:
             print(f"  - Computing features for {split} / {tf}...")
             eth_df_raw = raw_data[split][tf]
-            feature_data[split][tf] = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_features[split])
+            feature_data[split][tf] = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_raw[split])
 
     print(f"\n[4/5] Building TF-specific feature lists & scalers...")
     feature_list_per_tf = {}
@@ -495,7 +554,7 @@ def main():
             final_df.to_parquet(out_p)
             print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
 
-    print("\n[+] MTF Role-Tuned Feature Engineering complete (BTC lead/lag + corr/beta).")
+    print("\n[+] MTF Feature Engineering complete (leak-free, volume-consistent, BTC integrated, option A).")
 
 if __name__ == "__main__":
     main()

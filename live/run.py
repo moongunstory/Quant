@@ -214,9 +214,9 @@ def main():
         s = step.summary
         filter_str = f" | filter={s['filter']}" if s.get('filter') else ""
         print(
-            f"{ts.isoformat(timespec='seconds')} | mode={MODE} | pos={s['pos']} | "
-            f"px={s['price']} | eq={s['equity']} | value={s['value']} | "
-            f"prediction={s['prediction']}{filter_str}"
+            f"{ts.isoformat(timespec='seconds')} | mode={MODE} | position={s['position']} | "
+            f"px={s['price']} | eq={s['equity']} | value={s['value']} | reward={s['reward']} | done={s['done']} | "
+            f"prediction={s['prediction']} | probs={s['probs']} | obs={s['obs_summary']}{filter_str}"
         )
 
 if __name__ == "__main__":

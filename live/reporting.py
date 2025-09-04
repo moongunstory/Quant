@@ -72,12 +72,19 @@ def _run_coro(coro: Awaitable[None]) -> None:
 # ── file reporting ──
 def update_trade_log(log_path: str, trade_info: Dict[str, Any]) -> None:
     _ensure_dir(log_path)
-    need_header = (not os.path.exists(log_path)) or (os.path.getsize(log_path) == 0)
-    row = [trade_info.get(k, "") for k in ("timestamp", "type", "position", "price", "profit", "duration")]
+    # 모든 로그 유형에서 사용될 수 있는 전체 필드 목록을 정의
+    ALL_FIELDNAMES = [
+        'timestamp', 'type', 'position', 'price', 'equity', 'value', 'reward', 'done',
+        'prediction', 'probs', 'obs_summary', 'filter', 'info', 'profit', 'duration'
+    ]
+    need_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+
     with open(log_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if need_header: w.writerow(["Timestamp", "Type", "Position", "Price", "Profit", "Holding Duration"])
-        w.writerow(row)
+        # DictWriter에 고정된 필드 목록을 제공
+        writer = csv.DictWriter(f, fieldnames=ALL_FIELDNAMES)
+        if need_header:
+            writer.writeheader()
+        writer.writerow(trade_info)
 
 def generate_report(report_path: str, d: Dict[str, Any], is_new_session: bool) -> None:
     _ensure_dir(report_path)
