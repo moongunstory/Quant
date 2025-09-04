@@ -19,7 +19,7 @@ from trader import (
 )
 
 # ===== 설정 =====
-MODE = "paper"                 # "live" 또는 "paper"
+MODE = "live"                 # "live" 또는 "paper"
 SYMBOL_ETH = "ETHUSDT"
 SYMBOL_BTC = "BTCUSDT"
 USE_TESTNET = False
