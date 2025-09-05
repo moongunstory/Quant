@@ -129,7 +129,7 @@ def run(
     corr_thr: float = 0.9,
     n_jobs: int = 4,
     cache_dir: str = "./.hpo_cache",
-    out_dir: str = os.path.join("train", "reinforce", "hpo"),
+    out_dir: str = os.path.abspath(os.path.join(HERE, "..", "..", "..", "data", "hpo")),
     save_best_path: str = "best_features.json",
 ) -> Dict:
     os.makedirs(out_dir, exist_ok=True)

@@ -108,7 +108,7 @@ def main():
             df_scaled = rename_with_f_prefix(df_scaled, feats)
 
             final_df = pd.concat([df_scaled, hpo[REF_COLS_CANON]], axis=1)
-            out_path = os.path.join(HPO_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
+            out_path = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
             final_df.to_parquet(out_path)
             print(f"    [ok] Saved HPO {split}/{tf}: {len(final_df):,} rows")
 
