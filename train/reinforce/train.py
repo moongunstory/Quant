@@ -96,9 +96,17 @@ def _load_split(prefix: str) -> pd.DataFrame:
     if "5m" not in ref_dfs:
         raise RuntimeError("5m reference frame not found. Check processed files and fe pipeline.")
     close_series = pd.to_numeric(ref_dfs["5m"]["Close"], errors="coerce").astype(float)
-    extra = {"close": close_series, "price_close": close_series}
-    if "funding_per_bar" not in base.columns:
-        extra["funding_per_bar"] = pd.Series(0.0, index=base.index)
+    fund_rate = pd.to_numeric(ref_dfs["5m"].get("FundingRate", 0.0), errors="coerce").fillna(0.0)
+    settle    = ref_dfs["5m"].get("FundingSettle", pd.Series(0, index=close_series.index)).astype("int8")
+
+    extra = {
+        "close": close_series,
+        "price_close": close_series,
+        # ✅ 정산 시점 일괄 차감형 (정산 바에서만 비용 반영)
+        "funding_per_bar": (fund_rate * settle).astype(float),
+        # 균등 분할형으로 쓰고 싶으면 위 한 줄 대신:
+        # "funding_per_bar": (fund_rate / 96.0).astype(float),
+    }
     base = pd.concat([base, pd.DataFrame(extra, index=base.index)], axis=1)
 
     # 관측 피처: f_* & REF 접미사 제외
@@ -162,10 +170,30 @@ def main():
     df_train = _load_split("fe_train")
     df_val   = _load_split("fe_val")
 
+    # HPO 결과(best_features.json)가 있으면 해당 피처만 사용, 없으면 기존 방식대로 전체 사용
+    hpo_features_path = os.path.join(os.path.dirname(__file__), "hpo", "best_features.json")
+    if os.path.exists(hpo_features_path):
+        print(f"[info] Loading best features from HPO: {hpo_features_path}")
+        with open(hpo_features_path, "r", encoding="utf-8") as f:
+            best_features = json.load(f)
+
+        # HPO에서 선택된 피처를 obs_cols로 사용
+        obs_cols = [c for c in best_features if c in df_train.columns]
+
+        # 데이터프레임 필터링: 필수 컬럼 + 선택된 피처만 남김
+        essential_cols = [c for c in df_train.columns if not c.startswith("f_")]
+        df_train = df_train[essential_cols + obs_cols]
+        df_val = df_val[essential_cols + obs_cols]
+        print(f"[info] Filtered dataframe with {len(obs_cols)} features from HPO.")
+
+    else:
+        print("[warn] HPO 'best_features.json' not found. Using all features from source.")
+        # 기존 방식: fe_feature_list_*.json에서 로드된 모든 피처 사용
+        obs_cols = df_train.attrs.get("obs_cols") or [
+            c for c in df_train.columns if c.startswith("f_") and not any(c.endswith(s) for s in REF_SUFFIXES)
+        ]
+
     # 학습 관측 컬럼 순서 저장 → 실거래에서 동일 정렬/차원 보장
-    obs_cols = df_train.attrs.get("obs_cols") or [
-        c for c in df_train.columns if c.startswith("f_") and not any(c.endswith(s) for s in REF_SUFFIXES)
-    ]
     with open(OBS_ORDER_PATH, "w", encoding="utf-8") as f:
         json.dump(list(obs_cols), f, ensure_ascii=False, indent=2)
     print(f"[obs] saved order -> {OBS_ORDER_PATH} (dim={len(obs_cols)})")

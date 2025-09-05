@@ -1,4 +1,5 @@
-# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h (REV-9.0, leak-free / volume-consistent)
+# fe.py — Feature Engineering for ETHUSDT (MTF) + BTC1h
+# (REV-10.0, leak-free / volume-consistent / HPO-extended)
 from __future__ import annotations
 
 import os, json
@@ -20,13 +21,20 @@ TIMEFRAMES     = ["5m", "15m", "1h", "4h", "btc1h"]
 ETH_TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 BASE_INTERVAL  = "5m"
 
-# === TF별 피처검색/스케일 설정 ===
+# === TF별 피처검색/스케일 설정 (기존 파이프라인 유지) ===
 FEATURE_SEARCH = True
 RANDOM_STATE = 72
 TOP_K_PER_TF = {"5m": 128, "15m": 128, "1h": 96, "4h": 64}
 TF_FOR_SEARCH = ["5m", "15m", "1h", "4h"]  # 옵션 A: btc1h는 선정/스케일 대상 아님
 
-# Output path formats
+# === HPO 확장 아티팩트 ===
+HPO_OUT_PREFIX          = "feHPO"      # feHPO_{split}_{tf}.parquet
+HPO_FEATURE_LIST_FMT    = os.path.join(OUT_DIR, "feHPO_feature_list_{tf}.json")
+HPO_SCALER_PATH_FMT     = os.path.join(OUT_DIR, "scaler_hpo_{tf}.joblib")
+HPO_EXPAND_WINDOWS      = [12, 24, 48, 96]  # rolling window 확장
+HPO_MAX_FEATURES_HINT   = 2000  # 안전 가이드 (하드 컷은 하지 않음)
+
+# Output path formats (기존)
 FEATURE_LIST_PATH_FMT = os.path.join(OUT_DIR, "fe_feature_list_{tf}.json")
 SCALER_PATH_FMT       = os.path.join(OUT_DIR, "scaler_{tf}.joblib")
 
@@ -62,7 +70,7 @@ def zscore(s: pd.Series, win: int | None = None) -> pd.Series:
     return out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
 def pct_slope(x: pd.Series, win: int) -> pd.Series:
-    return x.pct_change().rolling(win, min_periods=win).mean().fillna(0.0)
+    return x.pct_change(fill_method=None).rolling(win, min_periods=win).mean().fillna(0.0)
 
 # --- robust datetime handling (ms/ns) ---
 def _to_utc_dt(s: pd.Series) -> pd.DatetimeIndex:
@@ -173,7 +181,7 @@ def compute_heikin_ashi(df_ohlc: pd.DataFrame, o="Open", h="High", l="Low", c="C
     HA_H, HA_L = np.maximum.reduce([H, HA_O, HA_C]), np.minimum.reduce([L, HA_O, HA_C])
     out = pd.DataFrame({"HA_O": HA_O, "HA_H": HA_H, "HA_L": HA_L, "HA_C": HA_C}, index=df_ohlc.index)
     out["HA_TR"], out["HA_BC"] = out["HA_H"] - out["HA_L"], out["HA_C"] - out["HA_O"]
-    out["HA_R"]  = out["HA_C"].pct_change().fillna(0.0)
+    out["HA_R"]  = out["HA_C"].pct_change(fill_method=None).fillna(0.0)
     return out
 
 def ema(s: pd.Series, span: int) -> pd.Series:
@@ -244,21 +252,19 @@ def kama(series: pd.Series, n: int = 30, fast: int = 2, slow: int = 30) -> pd.Se
     return kama
 
 def anchored_vwap(df: pd.DataFrame, anchor: str = "W") -> pd.Series:
-    """Anchor by week ('W'), month-end ('M'), or month-start ('MS')."""
     price = df["Close"].astype(float)
     vol = np.clip(pd.to_numeric(df.get("VolumeRaw", df["Volume"]), errors="coerce"), 0, None)
 
-    # ✅ valid frequencies only
-    if anchor == "M":
-        freq = "M"   # month-end
-    elif anchor == "MS":
-        freq = "MS"  # month-start
-    elif anchor == "W":
-        freq = "W"   # week-end
-    else:
-        freq = anchor
+    # 빈도 매핑
+    a = anchor.upper()
+    if a == "M":       freq = "ME"
+    elif a == "W":     freq = "W"
+    elif a == "D":     freq = "D"
+    else:              freq = anchor
 
-    g = df.groupby(pd.Grouper(freq=freq, label="left", closed="left"))
+    key = pd.Grouper(freq=freq, label="left", closed="left")
+    g = df.groupby(key, group_keys=False)
+
     pv_cum = g.apply(lambda x: (x["Close"] * np.clip(pd.to_numeric(x.get("VolumeRaw", x["Volume"]), errors="coerce"), 0, None)).cumsum())
     v_cum  = g.apply(lambda x: np.clip(pd.to_numeric(x.get("VolumeRaw", x["Volume"]), errors="coerce"), 0, None).cumsum())
     vwap = (pv_cum / (v_cum + 1e-9)).reindex(df.index).ffill().fillna(price)
@@ -288,8 +294,8 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
     # ===== BTC 1h (standalone) — 옵션 A에서는 최종 저장하지 않음 =====
     if interval == "btc1h":
         close = df["Close"].astype(float)
-        out["ret_1h"] = close.pct_change()
-        out["ret_4h"] = close.pct_change(4)
+        out["ret_1h"] = close.pct_change(fill_method=None)
+        out["ret_4h"] = close.pct_change(4, fill_method=None)
         out["atr14"]  = _atr(df, period=14)
         ha = compute_heikin_ashi(df[["Open","High","Low","Close"]])
         out = pd.concat([out, ha], axis=1)
@@ -304,9 +310,9 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         df["Low"].astype(float),
         df["Volume"].astype(float),  # RAW
     )
-    ret1 = close.pct_change().fillna(0.0)
+    ret1 = close.pct_change(fill_method=None).fillna(0.0)
     out["ret_1"] = ret1
-    out["ret_3"] = close.pct_change(3)
+    out["ret_3"] = close.pct_change(3, fill_method=None)
     out["hl_spread"] = (high - low) / (close + 1e-9)
     out["vol_z_48"] = zscore(volume, win=48)
     out["atr14"] = _atr(df, period=14)
@@ -321,10 +327,9 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["ema200_slope"] = pct_slope(ema200, 5)
         out["ema50_200_spread"] = (ema50 - ema200) / (ema200 + 1e-9)
 
-        # bars_since_cross: 마지막 교차 이후 경과 바 수 (초기 구간 0으로)
         cross_up = ((ema50.shift(1) < ema200.shift(1)) & (ema50 >= ema200)).astype(int)
         cross_dn = ((ema50.shift(1) > ema200.shift(1)) & (ema50 <= ema200)).astype(int)
-        cross = (cross_up - cross_dn)  # -1,0,1
+        cross = (cross_up - cross_dn)
         idx = np.arange(len(df), dtype=int)
         mark = np.where(cross != 0, idx, -1)
         last = np.maximum.accumulate(mark)
@@ -387,11 +392,11 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["stochrsi_k"], out["stochrsi_d"] = k, d_
 
         out["tails_ratio_20"] = tails_ratio(df, win=20)
-        comp = (bb_w.pct_change().rolling(10, min_periods=1).mean() < 0).astype(int)
+        comp = (bb_w.pct_change(fill_method=None).rolling(10, min_periods=1).mean() < 0).astype(int)
         out["compress_run"] = comp.groupby((comp != comp.shift()).cumsum()).cumsum()
 
-        out["ret_5"]  = close.pct_change(5)
-        out["ret_10"] = close.pct_change(10)
+        out["ret_5"]  = close.pct_change(5, fill_method=None)
+        out["ret_10"] = close.pct_change(10, fill_method=None)
 
     elif interval == "5m":
         out["atr3"] = _atr(df, period=3)
@@ -404,8 +409,8 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["vwap_d_slope"] = pct_slope(vwap_d, 12)
 
         out["momo_1"] = ret1
-        out["momo_3"] = close.pct_change(3)
-        out["momo_5"] = close.pct_change(5)
+        out["momo_3"] = close.pct_change(3, fill_method=None)
+        out["momo_5"] = close.pct_change(5, fill_method=None)
         n_break = 36
         out["break_up"]   = (close > close.rolling(n_break, min_periods=n_break).max().shift(1)).astype(int)
         out["break_down"] = (close < close.rolling(n_break, min_periods=n_break).min().shift(1)).astype(int)
@@ -421,48 +426,42 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
         out["is_funding_settle"] = settle_series.astype("int8")
         out["funding_z_48"] = zscore(df["FundingRate"].astype(float), win=48)
 
-    # ===== BTC 리드/래그 & 상관/베타 (옵션 A: ETH 내부 파생만) =====
+    # ===== BTC 리드/래그 & 상관/베타 =====
     if btc_df is not None:
-        # 필요한 컬럼만, 명확한 이름으로
         btc_slim = pd.DataFrame(index=btc_df.index)
         btc_slim["Close_btc1h"]  = pd.to_numeric(btc_df["Close"], errors="coerce")
         if "Volume" in btc_df.columns:
             btc_slim["Volume_btc1h"] = pd.to_numeric(btc_df["Volume"], errors="coerce")
 
-        # asof tolerance: interval별 합리적 허용치
-        tol_map = {"5m": "1H", "15m": "1H", "1h": "1H", "4h": "4H"}
-        tol = pd.Timedelta(tol_map.get(interval, "1H"))
+        tol_map = {"5m": pd.Timedelta(hours=1), "15m": pd.Timedelta(hours=1),
+                   "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4)}
+        tol = tol_map.get(interval, pd.Timedelta(hours=1))
 
         merged = pd.merge_asof(
             df.reset_index().sort_values("time"),
             btc_slim.reset_index().sort_values("time"),
-            on="time",
-            direction="backward",
-            tolerance=tol
+            on="time", direction="backward", tolerance=tol
         ).set_index("time")
 
         btc_close = merged["Close_btc1h"].astype(float)
         btc_vol   = merged.get("Volume_btc1h", pd.Series(0, index=merged.index)).astype(float)
 
-        out["btc_ret_1h"]    = btc_close.pct_change()
+        out["btc_ret_1h"]    = btc_close.pct_change(fill_method=None)
         out["btc_vol_z_24"]  = zscore(btc_vol, win=24)
         btc_macd = ema(btc_close,12) - ema(btc_close,26)
         out["btc_macd"] = btc_macd
 
-        # ⚠️ leak-free: 과거만 사용
         for lag in range(1, 3):
             out[f"btc_ret_1h_lag{lag}"] = out["btc_ret_1h"].shift(lag)
-        # (금지) lead 사용 금지
 
-        # 공적분 유사: 베타/상관/스프레드
         if interval in ("1h","4h"):
             w = 24 if interval=="1h" else 6
         elif interval=="15m":
             w = 96
         else:
             w = 288
-        e_ret = close.pct_change()
-        b_ret = btc_close.pct_change()
+        e_ret = close.pct_change(fill_method=None)
+        b_ret = btc_close.pct_change(fill_method=None)
         cov = e_ret.rolling(w).cov(b_ret)
         var_b = b_ret.rolling(w).var()
         beta = (cov / (var_b + 1e-9)).fillna(0.0)
@@ -475,10 +474,77 @@ def compute_features_for_tf(df: pd.DataFrame, interval: str, btc_df: Optional[pd
     final_out = pd.concat([out, df[REF_COLS_CANON]], axis=1)
     return _sanitize(final_out)
 
+# ===== HPO 전용: 후보 피처 확장 & 변환 =====
+def _add_hpo_candidates_local(df_tf: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    - 기존 피처에서 누적/변환으로 유니버스를 확장 (leak-free: 과거 기반 rolling)
+    - 범용 변환: rolling mean/std, zscore, pct_change, 바이너리 이벤트
+    """
+    df = df_tf.copy()
+    # (1) 변화율/변동성 정규화
+    if "Close" in df.columns:
+        px = df["Close"].astype(float)
+        ret = px.pct_change(fill_method=None).fillna(0.0)
+        for n in (2,3,5,8,12,24,36,48):
+            df[f"ret_{n}_{interval}"] = px.pct_change(n, fill_method=None)
+        # ATR 대비 수익률
+        atr_col = f"atr14_{interval}" if f"atr14_{interval}" in df.columns else None
+        if atr_col:
+            df[f"ret_over_atr_{interval}"] = (ret / (df[atr_col] + 1e-9)).clip(-10,10)
+
+    # (2) 거래량/레인지 스파이크
+    if "Volume" in df.columns:
+        df[f"vol_z_96_{interval}"] = zscore(pd.to_numeric(df["Volume"], errors="coerce"), win=96)
+    hi, lo = df.get(f"High", None), df.get(f"Low", None)
+    if hi is not None and lo is not None:
+        rng = (pd.to_numeric(hi, errors="coerce") - pd.to_numeric(lo, errors="coerce")).abs()
+        df[f"range_z_96_{interval}"] = zscore(rng, win=96)
+
+    # (3) EMA 크로스 바이너리 (자체 계산)
+    if "Close" in df.columns:
+        c = pd.to_numeric(df["Close"], errors="coerce")
+        ema_fast = ema(c, 12); ema_slow = ema(c, 26)
+        cross_up   = ((ema_fast.shift(1) <= ema_slow.shift(1)) & (ema_fast > ema_slow)).astype("int8")
+        cross_down = ((ema_fast.shift(1) >= ema_slow.shift(1)) & (ema_fast < ema_slow)).astype("int8")
+        df[f"bin_cross_up_{interval}"] = cross_up
+        df[f"bin_cross_dn_{interval}"] = cross_down
+
+    # (4) RSI 다이버전스 근사
+    rsi_col = f"rsi_14_{interval}"
+    if rsi_col in df.columns and "Close" in df.columns:
+        r = pd.to_numeric(df[rsi_col], errors="coerce")
+        c = pd.to_numeric(df["Close"], errors="coerce")
+        mom_up = (r.diff() > 0).rolling(5, min_periods=5).sum()
+        px_dn  = (c.diff() < 0).rolling(5, min_periods=5).sum()
+        mom_dn = (r.diff() < 0).rolling(5, min_periods=5).sum()
+        px_up  = (c.diff() > 0).rolling(5, min_periods=5).sum()
+        df[f"div_bull_{interval}"] = ((mom_up>=3) & (px_dn>=3)).astype("int8")
+        df[f"div_bear_{interval}"] = ((mom_dn>=3) & (px_up>=3)).astype("int8")
+
+    # (5) 윈도우 통계 확장: 기존 수치 피처에 rolling mean/std zscore
+    #  └ 반복적인 df[col] 추가로 인한 fragmentation 방지: 딕셔너리에 모아 한 번에 concat
+    base_cols = [c for c in df.columns if c not in REF_COLS_CANON]
+    new_feats: Dict[str, pd.Series] = {}
+
+    for c in base_cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.dtype.kind not in ("i","u","f"):  # 숫자만
+            continue
+        for w in HPO_EXPAND_WINDOWS:
+            m  = s.rolling(w, min_periods=w).mean()
+            sd = s.rolling(w, min_periods=w).std().replace(0, np.nan)
+            new_feats[f"{c}_mean{w}"] = m
+            new_feats[f"{c}_z{w}"]    = (s - m) / (sd + 1e-9)
+
+    if new_feats:
+        df = pd.concat([df, pd.DataFrame(new_feats, index=df.index)], axis=1).copy()  # defrag
+
+    return _sanitize(df)
+
 # ===== Feature Search & Scaler =====
 def _make_proxy_y(df: pd.DataFrame, horizon: int) -> pd.Series:
     """RL 의사결정 지평선과 정합: 5m→+12, 15m→+4, 1h→+1, 4h→+1"""
-    return (df["Close"].astype(float).pct_change(horizon).shift(-horizon) > 0).astype(int).fillna(0)
+    return (df["Close"].astype(float).pct_change(horizon, fill_method=None).shift(-horizon) > 0).astype(int).fillna(0)
 
 def _feature_search_mi(X: pd.DataFrame, y: pd.Series, top_k: int) -> List[str]:
     X_ = _sanitize(X).astype(float)
@@ -502,59 +568,161 @@ def _feature_search_for_tf(train_df: pd.DataFrame, tf: str) -> List[str]:
     print(f"[ok] feature_list[{tf}] = {len(keep)} -> {path}")
     return keep
 
-def _fit_scaler_for_tf(train_df: pd.DataFrame, feat_list: List[str], tf: str) -> StandardScaler:
+def _fit_scaler_for_tf(train_df: pd.DataFrame, feat_list: List[str], tf: str, path_fmt: str = SCALER_PATH_FMT) -> StandardScaler:
     X = _sanitize(train_df[feat_list]).to_numpy(dtype=float)
     sc = StandardScaler().fit(X)
-    path = SCALER_PATH_FMT.format(tf=tf)
+    path = path_fmt.format(tf=tf)
     joblib.dump(sc, path)
     print(f"[ok] scaler[{tf}] saved -> {path}")
     return sc
 
+# ===== Helper: 접두 f_ 보장 =====
+def _prefix_f(cols: List[str]) -> List[str]:
+    return [c if c.startswith("f_") else f"f_{c}" for c in cols]
+
+def _rename_with_f_prefix(df: pd.DataFrame, feat_cols: List[str]) -> pd.DataFrame:
+    mapping = {}
+    for c in feat_cols:
+        fc = c if c.startswith("f_") else f"f_{c}"
+        if fc != c:
+            mapping[c] = fc
+    return df.rename(columns=mapping)
+
+# ===== Public Utils (HPO/Train에서 사용) =====
+def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:
+    """
+    mode:
+      - "auto": HPO 파일(feHPO_*)이 있으면 우선, 없으면 기본(fe_*)
+      - "hpo" : HPO 전용 프레임 강제 로딩
+      - "base": 기존 Top-K 프레임 로딩
+    """
+    base_p = os.path.join(OUT_DIR, f"fe_{split}_{tf}.parquet")
+    hpo_p  = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
+    path = None
+    if mode == "hpo":
+        path = hpo_p
+    elif mode == "base":
+        path = base_p
+    else:
+        path = hpo_p if os.path.exists(hpo_p) else base_p
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Processed frame not found: {path}")
+    return pd.read_parquet(path)
+
+def feature_universe(df: pd.DataFrame, prefix: str = "f_") -> List[str]:
+    return [c for c in df.columns if c.startswith(prefix)]
+
+def build_universe_from_processed(split: str = "train", tf: str = "5m", mode: str = "auto") -> List[str]:
+    df = load_processed(split, tf, mode=mode)
+    feats = feature_universe(df, prefix="f_")
+    if len(feats) < 10:
+        raise RuntimeError(f"Feature universe too small: {len(feats)} (check FE expansion).")
+    return feats
+
+def apply_feature_mask(df: pd.DataFrame, selected: List[str], ref_cols: List[str] | None = None) -> pd.DataFrame:
+    if ref_cols is None:
+        ref_cols = [c for c in REF_COLS_CANON if c in df.columns]
+    X = df.reindex(columns=selected, fill_value=0.0)
+    return pd.concat([X, df[ref_cols]], axis=1)
+
 # ===== Main =====
 def main():
-    print("[1/5] Loading all raw data...")
+    print("[1/6] Loading all raw data...")
     raw_data = {s: {tf: _load_raw(s, tf) for tf in TIMEFRAMES} for s in ["train", "val", "test"]}
 
-    print("\n[2/5] Prepare BTC raw frames in-memory (no save).")
+    print("\n[2/6] Prepare BTC raw frames in-memory (no save).")
     btc_raw = {s: raw_data[s]["btc1h"] for s in ["train", "val", "test"]}
 
-    print("\n[3/5] Computing ETH features with BTC lag/corr (no-leak)...")
+    print("\n[3/6] Computing ETH features with BTC lag/corr (no-leak)...")
     feature_data = {s: {} for s in ["train", "val", "test"]}
     for split in ["train", "val", "test"]:
         for tf in ETH_TIMEFRAMES:
             print(f"  - Computing features for {split} / {tf}...")
             eth_df_raw = raw_data[split][tf]
-            feature_data[split][tf] = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_raw[split])
+            base = compute_features_for_tf(eth_df_raw, tf, btc_df=btc_raw[split])
+            feature_data[split][tf] = base
 
-    print(f"\n[4/5] Building TF-specific feature lists & scalers...")
-    feature_list_per_tf = {}
-    scalers = {}
+    print(f"\n[4/6] Building TF-specific feature lists & scalers (BASE pipeline)...")
+    feature_list_per_tf: Dict[str, List[str]] = {}
+    scalers: Dict[str, StandardScaler] = {}
     for tf in TF_FOR_SEARCH:
         tr_df = feature_data["train"][tf]
+        # BASE: Top-K 선택
         feat_list = _feature_search_for_tf(tr_df, tf)
-        feature_list_per_tf[tf] = feat_list
-        scalers[tf] = _fit_scaler_for_tf(tr_df, feat_list, tf)
+        # 접두 f_ 보장
+        feat_list_f = _prefix_f(feat_list)
+        feature_list_per_tf[tf] = feat_list_f
 
-    print("\n[5/5] Processing and saving all ETH timeframe data...")
+        # 스케일러는 원래 컬럼명 기준으로 학습 후, 저장만 함 (적용 시엔 f_로 rename)
+        sc = _fit_scaler_for_tf(tr_df, feat_list, tf=tf, path_fmt=SCALER_PATH_FMT)
+        scalers[tf] = sc
+
+    print("\n[5/6] Processing and saving all ETH timeframe data (BASE, Top-K)...")
     for split in ["train", "val", "test"]:
         for tf in ETH_TIMEFRAMES:
-            print(f"  - Processing {split} / {tf}...")
+            print(f"  - [BASE] Processing {split} / {tf}...")
             df = feature_data[split][tf].copy()
-            feat_list = feature_list_per_tf[tf]
-
-            df_sel = df.reindex(columns=feat_list, fill_value=0.0)
+            feat_list_no_f = [c[2:] if c.startswith("f_") else c for c in feature_list_per_tf[tf]]
+            df_sel = df.reindex(columns=feat_list_no_f, fill_value=0.0)
             X = _sanitize(df_sel).to_numpy(dtype=float)
             Xs = scalers[tf].transform(X)
-            df_scaled = pd.DataFrame(Xs, index=df.index, columns=feat_list)
+            df_scaled = pd.DataFrame(Xs, index=df.index, columns=feat_list_no_f)
+            # f_ 접두로 rename
+            df_scaled = _rename_with_f_prefix(df_scaled, feat_list_no_f)
 
             ref_cols = [c for c in REF_COLS_CANON if c in df.columns]
             final_df = pd.concat([df_scaled, df[ref_cols]], axis=1)
 
             out_p = os.path.join(OUT_DIR, f"fe_{split}_{tf}.parquet")
             final_df.to_parquet(out_p)
-            print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
+            print(f"    [ok] Saved BASE {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
 
-    print("\n[+] MTF Feature Engineering complete (leak-free, volume-consistent, BTC integrated, option A).")
+    # ===== HPO 확장: 후보 추가 + NO Top-K + 별도 스케일 =====
+    print("\n[6/6] Building & saving HPO-extended frames (NO Top-K, expanded features)...")
+    # 6-1) train split에서 확장 후보 포함 전체 리스트 만들고 스케일러 학습
+    hpo_feat_lists: Dict[str, List[str]] = {}
+    hpo_scalers: Dict[str, StandardScaler] = {}
+    expanded_train_frames: Dict[str, pd.DataFrame] = {}
+
+    for tf in ETH_TIMEFRAMES:
+        tr_base = feature_data["train"][tf]
+        tr_hpo  = _add_hpo_candidates_local(tr_base, tf)
+        # REF 제거 후 전체 컬럼
+        feat_all = [c for c in tr_hpo.columns if c not in REF_COLS_CANON]
+        # 접두 f_ 보장
+        feat_all_f = _prefix_f(feat_all)
+        hpo_feat_lists[tf] = feat_all_f
+        # 스케일러 학습 (원래명 기준)
+        sc_hpo = _fit_scaler_for_tf(tr_hpo, feat_all, tf=tf, path_fmt=HPO_SCALER_PATH_FMT)
+        hpo_scalers[tf] = sc_hpo
+        expanded_train_frames[tf] = tr_hpo
+        # 목록 저장
+        with open(HPO_FEATURE_LIST_FMT.format(tf=tf), "w", encoding="utf-8") as f:
+            json.dump(feat_all_f, f, ensure_ascii=False, indent=2)
+        print(f"    [ok] HPO feature universe [{tf}] = {len(feat_all_f)} (hint≤{HPO_MAX_FEATURES_HINT})")
+
+    # 6-2) 모든 split/TF에 대해 HPO 프레임 스케일 & 저장
+    for split in ["train", "val", "test"]:
+        for tf in ETH_TIMEFRAMES:
+            print(f"  - [HPO] Processing {split} / {tf}...")
+            base_df = feature_data[split][tf]
+            df_hpo  = _add_hpo_candidates_local(base_df, tf)
+
+            feat_all_no_f = [c[2:] if c.startswith("f_") else c for c in hpo_feat_lists[tf]]
+            df_sel = df_hpo.reindex(columns=feat_all_no_f, fill_value=0.0)
+            X = _sanitize(df_sel).to_numpy(dtype=float)
+            Xs = hpo_scalers[tf].transform(X)
+            df_scaled = pd.DataFrame(Xs, index=df_hpo.index, columns=feat_all_no_f)
+            df_scaled = _rename_with_f_prefix(df_scaled, feat_all_no_f)
+
+            ref_cols = [c for c in REF_COLS_CANON if c in df_hpo.columns]
+            final_df = pd.concat([df_scaled, df_hpo[ref_cols]], axis=1)
+
+            out_p = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
+            final_df.to_parquet(out_p)
+            print(f"    [ok] Saved HPO {split}/{tf}: {len(final_df):,} x {final_df.shape[1]} -> {out_p}")
+
+    print("\n[+] MTF Feature Engineering complete (BASE + HPO extended, leak-free, BTC integrated).")
 
 if __name__ == "__main__":
     main()

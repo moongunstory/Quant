@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -311,6 +312,24 @@ class BaseTrader:
         self.initial_equity = float(init_equity)
         self.last_equity = float(init_equity)
 
+        obs_meta_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "model", "obs_cols.json"))
+        if os.path.exists(obs_meta_path):
+            with open(obs_meta_path, "r", encoding="utf-8") as f:
+                self._obs_names = json.load(f)
+        else:
+            self._obs_names = None
+
+    def _idx(self, name: str) -> Optional[int]:
+        if not self._obs_names: return None
+        try: return self._obs_names.index(name)
+        except ValueError: return None
+
+    def _obs_value(self, obs_vec: np.ndarray, name: str, default: float = float("nan")) -> float:
+        i = self._idx(name)
+        if i is None or i < 0 or i >= len(obs_vec): return default
+        try: return float(obs_vec[i])
+        except Exception: return default
+
     @staticmethod
     def _mask_from_pos(pos: int) -> np.ndarray:
         # 액션: 0 WAIT, 1 LONG, 2 SHORT, 3 CLOSE
@@ -404,7 +423,7 @@ class LiveTrader(BaseTrader):
     def __init__(self, exec_client: BinanceExchange,
                  model_path: Optional[str] = None, vec_path: Optional[str] = None,
                  norm_reward_at_train: bool = False, symbol_eth: str = "ETHUSDT",
-                 leverage: float = 5.0, risk_fraction: float = 1.0,
+                 leverage: float = 1.0, risk_fraction: float = 1.0,
                  prob_threshold_entry: float = 0.65,
                  prob_threshold_switch: float = 0.67):
         acc = exec_client.client.futures_account()
@@ -493,10 +512,10 @@ class LiveTrader(BaseTrader):
 
         # --- 확률 및 Obs 요약 ---
         probs = prediction["probs"]
-        if len(obs_vec) > 5:
-            obs_summary = f"[pos_val:{obs_vec[4]:.2f}, funding:{obs_vec[5]:.4f}]"
-        else:
-            obs_summary = f"[len:{len(obs_vec)}]"
+        t2f = self._obs_value(obs_vec, "f_5m_time_to_funding_5m", float("nan"))
+        is_settle = self._obs_value(obs_vec, "f_5m_is_funding_settle", float("nan"))
+        fz = self._obs_value(obs_vec, "f_5m_funding_z_48", float("nan"))
+        obs_summary = f"[t2fund:{t2f:.0f} bars, settle:{is_settle:.0f}, fz48:{fz:.2f}]"
 
         summary = {
             "position": pos_str,
@@ -619,10 +638,10 @@ class PaperTrader(BaseTrader):
         done = total_eq <= 0
 
         probs = prediction["probs"]
-        if len(obs_vec) > 5:
-            obs_summary = f"[pos_val:{obs_vec[4]:.2f}, funding:{obs_vec[5]:.4f}]"
-        else:
-            obs_summary = f"[len:{len(obs_vec)}]"
+        t2f = self._obs_value(obs_vec, "f_5m_time_to_funding_5m", float("nan"))
+        is_settle = self._obs_value(obs_vec, "f_5m_is_funding_settle", float("nan"))
+        fz = self._obs_value(obs_vec, "f_5m_funding_z_48", float("nan"))
+        obs_summary = f"[t2fund:{t2f:.0f} bars, settle:{is_settle:.0f}, fz48:{fz:.2f}]"
 
         summary = {
             "position": pos_str,
@@ -645,4 +664,3 @@ class PaperTrader(BaseTrader):
 
         return StepResult(logs=logs, report_snapshot=report, summary=summary)
 
-# ===== (참고) 중복 PaperTrader 클래스가 있다면 위와 동일 수정 반영 =====

@@ -15,6 +15,7 @@
   "btc_macd_5m",
   "hour_cos_5m",
   "vwap_d_slope_5m",
+  "dist_vwap_w_5m",
   "btc_spread_z_5m",
   "HA_BC_5m",
   "break_up_5m",
@@ -34,9 +35,8 @@
   "funding_phase_cos_5m",
   "hl_spread_5m",
   "rv_12_5m",
-  "dist_vwap_d_5m",
-  "dist_vwap_w_5m",
   "atr3_5m",
+  "dist_vwap_d_5m",
   "is_funding_settle_5m",
   "funding_z_48_5m",
   "btc_vol_z_24_5m"
