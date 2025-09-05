@@ -10,9 +10,12 @@ Sharpe / IR / MDD / 거래빈도 등을 산출한다.
 from __future__ import annotations
 import os, sys, json, hashlib, pickle
 from typing import List, Dict, Tuple, Optional
+import random
 import numpy as np
 import pandas as pd
-from gymnasium.spaces import Box, Discrete
+import torch as th
+from sb3_contrib import MaskablePPO  # ✅ SB3 에이전트로 학습/평가
+
 # ----- 안전 임포트 (패키지/스크립트 실행 모두 대응) -----
 HERE = os.path.dirname(__file__)
 TRAIN_DIR = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -94,42 +97,52 @@ def evaluate_feature_set(
             with open(cache_path, "rb") as f:
                 m = pickle.load(f)
         else:
-            # 환경 생성 (훈련/검증)
-            env_tr = TradingEnv(tr_masked, obs_cols=selected_feats, **env_kwargs)
-            env_va = TradingEnv(va_masked, obs_cols=selected_feats, **env_kwargs)
-
-            # 정책 초기화 및 짧은 학습
-            # 관측 공간 (연속, selected_feats의 길이에 맞춰 설정)
-            observation_space = Box(low=-np.inf, high=np.inf, shape=(len(selected_feats),), dtype=np.float32)
-
-            # 행동 공간 (정해진 4개의 행동)
-            action_space = Discrete(4)
-
-            # 재현성 설정 ❶ (policy가 아닌 환경/전역 시드로 이동)
-            import random, torch as th
+            # ==== 재현성 시드 설정 (policy가 아닌 전역/환경 기준) ====
             random.seed(seed)
             np.random.seed(seed)
             th.manual_seed(seed)
+
+            # ==== 환경 생성 (훈련/검증) ====
+            env_tr = TradingEnv(tr_masked, obs_cols=selected_feats, **env_kwargs)
+            env_va = TradingEnv(va_masked, obs_cols=selected_feats, **env_kwargs)
             env_tr.reset(seed=seed)
             env_va.reset(seed=seed)
 
-            # 학습률 스케줄 (고정 값 사용)
-            lr_schedule = lambda _: 1e-4
-
-            # 정책 객체 생성 ❷ (seed 인자 제거)
-            policy = MultiHeadPolicy(
-                observation_space=observation_space,
-                action_space=action_space,
-                lr_schedule=lr_schedule,
+            # ==== SB3 에이전트(PPO)로 학습 (MultiHeadPolicy 사용) ====
+            model = MaskablePPO(
+                policy=MultiHeadPolicy,
+                env=env_tr,
+                learning_rate=1e-4,
+                n_steps=2048,
+                batch_size=256,
+                n_epochs=5,
+                seed=seed,       # ✅ SB3 v2.x는 에이전트에서 seed 허용
+                verbose=0,
             )
-            policy.train_ppo(env_tr, total_steps=train_steps)  # << 빠른 평가: steps만 짧게
+            model.learn(total_timesteps=train_steps)
 
-            # 검증 롤아웃
-            rets, equity, actions = policy.rollout(env_va, max_steps=val_steps)  # (rets, equity, actions) 가정
+            # ==== 검증 롤아웃 (model.predict 사용) ====
+            obs, info = env_va.reset(seed=seed)
+            rets, equity, actions = [], [], []
+            for _ in range(val_steps):
+                action, _ = model.predict(obs, deterministic=True)
+                # 단건 환경에서 numpy 배열이면 스칼라로 변환
+                if isinstance(action, (np.ndarray, list)):
+                    try:
+                        action = int(action[0])
+                    except Exception:
+                        action = int(np.asarray(action).squeeze().item())
+                obs, reward, terminated, truncated, info = env_va.step(action)
+                rets.append(float(reward))
+                equity.append(float(info.get("equity", 0.0)))
+                actions.append(int(action))
+                if terminated or truncated:
+                    obs, info = env_va.reset(seed=seed)
+
             sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
             ir     = sharpe  # 벤치마크가 없으므로 동일 대체
             mdd    = _max_drawdown(np.asarray(equity, dtype=np.float32))
-            tpd    = float((np.asarray(actions) != 0).mean() * 288.0)  # 5m → 288 bars/day
+            tpd    = float((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)  # 5m → 288 bars/day
 
             m = {"sharpe": float(sharpe), "ir": float(ir), "mdd": float(mdd), "trades_per_day": float(tpd)}
             if cache_path:
@@ -143,18 +156,3 @@ def evaluate_feature_set(
     for k in agg:
         agg[k] /= max(K, 1)
     return agg
-
-# ----- 간단한 수동 테스트 -----
-if __name__ == "__main__":
-    from fe import load_processed, build_universe_from_processed
-    # 데이터 로드(자동: HPO 확장 프레임 있으면 사용)
-    df_tr = load_processed("train", "5m", mode="auto")
-    df_va = load_processed("val",   "5m", mode="auto")
-    feats = build_universe_from_processed("train", "5m", mode="auto")[:80]  # 80개만 샘플
-    met = evaluate_feature_set(
-        df_tr, df_va, feats,
-        env_kwargs={"fee_rate":0.0004, "slip_bp":2.0, "random_start":False},
-        seeds=[0], train_steps=10_000, val_steps=8_000,
-        cache_dir="./.hpo_cache"
-    )
-    print("[eval] metrics:", met)
