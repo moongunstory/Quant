@@ -21,6 +21,7 @@ random.seed(SEED); np.random.seed(SEED); th.manual_seed(SEED)
 # ===== 경로 =====
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
 PROC_DIR = os.path.join(DATA_DIR, "processed")
+HPO_DIR = os.path.join(DATA_DIR, "hpo")
 CKPT_DIR = os.path.join(DATA_DIR, "model")
 os.makedirs(CKPT_DIR, exist_ok=True)
 VEC_PATH = os.path.join(CKPT_DIR, "unified_vecnorm.pkl")
@@ -32,13 +33,12 @@ REF_SUFFIXES = ["_Open", "_High", "_Low", "_Close", "_Volume", "_FundingRate", "
 
 # ===== 데이터 병합(옵션 A: btc1h 파일 미사용) =====
 def _load_split(prefix: str) -> pd.DataFrame:
+    # HPO 데이터를 HPO_DIR에서 로드
     paths = [
-        os.path.join(PROC_DIR, f"{prefix}_5m.parquet"),
-        os.path.join(PROC_DIR, f"{prefix}_15m.parquet"),
-        os.path.join(PROC_DIR, f"{prefix}_1h.parquet"),
-        os.path.join(PROC_DIR, f"{prefix}_4h.parquet"),
-        # 옵션 A: 별도 btc1h parquet는 관측에서 제외 (ETH 피처 내부 요약 신호만 사용)
-        # os.path.join(PROC_DIR, f"{prefix}_btc1h.parquet"),
+        os.path.join(HPO_DIR, f"{prefix}_5m.parquet"),
+        os.path.join(HPO_DIR, f"{prefix}_15m.parquet"),
+        os.path.join(HPO_DIR, f"{prefix}_1h.parquet"),
+        os.path.join(HPO_DIR, f"{prefix}_4h.parquet"),
     ]
     dfs = []
 
@@ -66,7 +66,8 @@ def _load_split(prefix: str) -> pd.DataFrame:
         # ETH 타임프레임만 처리
         for suffix, tf in tf_map.items():
             if name.endswith(suffix) and "btc" not in name:
-                list_path = os.path.join(PROC_DIR, f"fe_feature_list_{tf}.json")
+                # HPO 피처 리스트 사용
+                list_path = os.path.join(HPO_DIR, f"feHPO_feature_list_{tf}.json")
                 if os.path.exists(list_path):
                     with open(list_path, "r", encoding="utf-8") as f:
                         feature_list = json.load(f)
@@ -84,7 +85,7 @@ def _load_split(prefix: str) -> pd.DataFrame:
                 break
 
     if not dfs:
-        raise FileNotFoundError(f"No parquet files for prefix={prefix}")
+        raise FileNotFoundError(f"No parquet files for prefix={prefix} in {HPO_DIR}")
 
     base = dfs[0]
     for d in dfs[1:]:
@@ -167,8 +168,8 @@ class TrendAuxLossCallback(BaseCallback):
 
 # ===== 메인 =====
 def main():
-    df_train = _load_split("fe_train")
-    df_val   = _load_split("fe_val")
+    df_train = _load_split("feHPO_train")
+    df_val   = _load_split("feHPO_val")
 
     # HPO 결과(best_features.json)가 있으면 해당 피처만 사용, 없으면 기존 방식대로 전체 사용
     hpo_features_path = os.path.join(os.path.dirname(__file__), "hpo", "best_features.json")

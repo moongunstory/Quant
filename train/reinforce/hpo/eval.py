@@ -26,14 +26,14 @@ if TRAIN_DIR not in sys.path:
 try:
     from reinforce.env import TradingEnv
     from reinforce.policy import MultiHeadPolicy
-    from fe import apply_feature_mask
+    from prepare.utils import apply_feature_mask
 except Exception:
     BASE = os.path.abspath(os.path.join(HERE, "..", ".."))
     if BASE not in sys.path:
         sys.path.append(BASE)
     from reinforce.env import TradingEnv
     from reinforce.policy import MultiHeadPolicy
-    from fe import apply_feature_mask
+    from prepare.utils import apply_feature_mask
 
 # ----- 메트릭 유틸 -----
 def _annualize_sharpe(rets: np.ndarray, bars_per_day: int = 288, days_per_year: int = 252) -> float:
@@ -71,6 +71,12 @@ def action_mask_fn(env) -> np.ndarray:
         mask[3] = (pos != 0)   # CLOSE
     return mask
 
+# ----- 안전한 피처 마스킹 -----
+def apply_feature_mask_safe(df: pd.DataFrame, selected_feats: List[str], fill_value: float = 0.0) -> pd.DataFrame:
+    missing = [c for c in selected_feats if c not in df.columns]
+    assert not missing, f"Missing columns in input: {missing}"
+    return df[selected_feats].fillna(fill_value)
+
 # ----- 메인 평가 함수 -----
 def evaluate_feature_set(
     df_train_5m: pd.DataFrame,
@@ -81,7 +87,7 @@ def evaluate_feature_set(
     train_steps: int,
     val_steps: int,
     cache_dir: Optional[str] = None,
-    window: Optional[Tuple[int,int]] = None,  # (start_idx, end_idx) on validation frame
+    window: Optional[Tuple[int,int]] = None,
 ) -> Dict[str, float]:
     """
     선택된 피처들로 학습/검증하여 평균 성능을 반환.
@@ -91,16 +97,25 @@ def evaluate_feature_set(
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
 
-    # 검증 프레임 윈도우 슬라이스
+    # 검증 프레임 윈도우 슬라이스 (시간 연속성 보장)
     if window is None:
         va_df = df_val_5m
     else:
         s, e = window
-        va_df = df_val_5m.iloc[s:e]
+        if not df_val_5m.index.is_monotonic_increasing:
+            raise ValueError("Validation index is not time-ordered.")
+        if df_val_5m.index.inferred_freq is None:
+            raise ValueError("Validation index frequency is not consistent.")
+        try:
+            start_dt = df_val_5m.index[s]
+            end_dt   = df_val_5m.index[e - 1]
+            va_df = df_val_5m.loc[start_dt:end_dt]
+        except Exception as ex:
+            raise IndexError(f"Invalid window indices: {s}, {e} -> {ex}")
 
-    # 마스킹(관측 컬럼 선택)
-    tr_masked = apply_feature_mask(df_train_5m, selected_feats)
-    va_masked = apply_feature_mask(va_df,       selected_feats)
+    # 마스킹 (피처 유효성 검증 포함)
+    tr_masked = apply_feature_mask_safe(df_train_5m, selected_feats)
+    va_masked = apply_feature_mask_safe(va_df,       selected_feats)
 
     agg = {"sharpe": 0.0, "ir": 0.0, "mdd": 0.0, "trades_per_day": 0.0}
     K = 0
@@ -113,20 +128,17 @@ def evaluate_feature_set(
             with open(cache_path, "rb") as f:
                 m = pickle.load(f)
         else:
-            # ==== 재현성 시드 ====
             random.seed(seed)
             np.random.seed(seed)
             th.manual_seed(seed)
 
-            # ==== 환경 생성 + 액션 마스킹 ====
-            env_tr = TradingEnv(tr_masked, obs_cols=selected_feats, **env_kwargs)
-            env_va = TradingEnv(va_masked, obs_cols=selected_feats, **env_kwargs)
+            env_tr = TradingEnv(df_train_5m, obs_cols=selected_feats, **env_kwargs)
+            env_va = TradingEnv(va_df,       obs_cols=selected_feats, **env_kwargs)
             env_tr = ActionMasker(env_tr, action_mask_fn)
             env_va = ActionMasker(env_va, action_mask_fn)
             env_tr.reset(seed=seed)
             env_va.reset(seed=seed)
 
-            # ==== SB3 에이전트(PPO, 마스킹 지원) ====
             model = MaskablePPO(
                 policy=MultiHeadPolicy,
                 env=env_tr,
@@ -139,7 +151,6 @@ def evaluate_feature_set(
             )
             model.learn(total_timesteps=train_steps)
 
-            # ==== 검증 롤아웃 ====
             obs, info = env_va.reset(seed=seed)
             rets, equity, actions = [], [], []
             for _ in range(val_steps):
@@ -159,7 +170,7 @@ def evaluate_feature_set(
             sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
             ir     = sharpe
             mdd    = _max_drawdown(np.asarray(equity, dtype=np.float32))
-            tpd    = float((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)  # 5m → 288 bars/day
+            tpd    = float((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)
 
             m = {"sharpe": float(sharpe), "ir": float(ir), "mdd": float(mdd), "trades_per_day": float(tpd)}
             if cache_path:
