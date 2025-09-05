@@ -14,7 +14,8 @@ import random
 import numpy as np
 import pandas as pd
 import torch as th
-from sb3_contrib import MaskablePPO  # ✅ SB3 에이전트로 학습/평가
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
 
 # ----- 안전 임포트 (패키지/스크립트 실행 모두 대응) -----
 HERE = os.path.dirname(__file__)
@@ -23,12 +24,10 @@ if TRAIN_DIR not in sys.path:
     sys.path.append(TRAIN_DIR)
 
 try:
-    # 패키지 형태로 실행(-m) 시
     from reinforce.env import TradingEnv
     from reinforce.policy import MultiHeadPolicy
     from fe import apply_feature_mask
 except Exception:
-    # 스크립트 직접 실행 시 대비
     BASE = os.path.abspath(os.path.join(HERE, "..", ".."))
     if BASE not in sys.path:
         sys.path.append(BASE)
@@ -54,6 +53,23 @@ def _max_drawdown(equity: np.ndarray) -> float:
 def _cache_key(selected: List[str], seed: int, train_steps: int, val_steps: int, window: Optional[Tuple[int,int]]):
     key = "|".join(sorted(selected)) + f"|{seed}|{train_steps}|{val_steps}|{window}"
     return hashlib.md5(key.encode()).hexdigest()
+
+# ----- 마스킹 함수 (전역: pickle 가능) -----
+def action_mask_fn(env) -> np.ndarray:
+    """
+    WAIT(0) 항상 허용
+    LONG(1): 현재 포지션이 롱이 아닐 때
+    SHORT(2): 현재 포지션이 숏이 아닐 때
+    CLOSE(3): 포지션 있을 때만
+    """
+    pos = getattr(env, "position", 0)
+    n = int(env.action_space.n)
+    mask = np.ones(n, dtype=bool)
+    if n >= 4:
+        mask[1] = (pos <= 0)   # LONG
+        mask[2] = (pos >= 0)   # SHORT
+        mask[3] = (pos != 0)   # CLOSE
+    return mask
 
 # ----- 메인 평가 함수 -----
 def evaluate_feature_set(
@@ -82,7 +98,7 @@ def evaluate_feature_set(
         s, e = window
         va_df = df_val_5m.iloc[s:e]
 
-    # 마스킹(관측 컬럼 선택) — REF 컬럼은 뒤에 붙음
+    # 마스킹(관측 컬럼 선택)
     tr_masked = apply_feature_mask(df_train_5m, selected_feats)
     va_masked = apply_feature_mask(va_df,       selected_feats)
 
@@ -97,18 +113,20 @@ def evaluate_feature_set(
             with open(cache_path, "rb") as f:
                 m = pickle.load(f)
         else:
-            # ==== 재현성 시드 설정 (policy가 아닌 전역/환경 기준) ====
+            # ==== 재현성 시드 ====
             random.seed(seed)
             np.random.seed(seed)
             th.manual_seed(seed)
 
-            # ==== 환경 생성 (훈련/검증) ====
+            # ==== 환경 생성 + 액션 마스킹 ====
             env_tr = TradingEnv(tr_masked, obs_cols=selected_feats, **env_kwargs)
             env_va = TradingEnv(va_masked, obs_cols=selected_feats, **env_kwargs)
+            env_tr = ActionMasker(env_tr, action_mask_fn)
+            env_va = ActionMasker(env_va, action_mask_fn)
             env_tr.reset(seed=seed)
             env_va.reset(seed=seed)
 
-            # ==== SB3 에이전트(PPO)로 학습 (MultiHeadPolicy 사용) ====
+            # ==== SB3 에이전트(PPO, 마스킹 지원) ====
             model = MaskablePPO(
                 policy=MultiHeadPolicy,
                 env=env_tr,
@@ -116,22 +134,21 @@ def evaluate_feature_set(
                 n_steps=2048,
                 batch_size=256,
                 n_epochs=5,
-                seed=seed,       # ✅ SB3 v2.x는 에이전트에서 seed 허용
+                seed=seed,
                 verbose=0,
             )
             model.learn(total_timesteps=train_steps)
 
-            # ==== 검증 롤아웃 (model.predict 사용) ====
+            # ==== 검증 롤아웃 ====
             obs, info = env_va.reset(seed=seed)
             rets, equity, actions = [], [], []
             for _ in range(val_steps):
                 action, _ = model.predict(obs, deterministic=True)
-                # 단건 환경에서 numpy 배열이면 스칼라로 변환
                 if isinstance(action, (np.ndarray, list)):
                     try:
-                        action = int(action[0])
-                    except Exception:
                         action = int(np.asarray(action).squeeze().item())
+                    except Exception:
+                        action = int(action[0])
                 obs, reward, terminated, truncated, info = env_va.step(action)
                 rets.append(float(reward))
                 equity.append(float(info.get("equity", 0.0)))
@@ -140,7 +157,7 @@ def evaluate_feature_set(
                     obs, info = env_va.reset(seed=seed)
 
             sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
-            ir     = sharpe  # 벤치마크가 없으므로 동일 대체
+            ir     = sharpe
             mdd    = _max_drawdown(np.asarray(equity, dtype=np.float32))
             tpd    = float((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)  # 5m → 288 bars/day
 
