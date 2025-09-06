@@ -122,7 +122,7 @@ def run(
     seeds: List[int] = [0, 1],
     train_steps: int = 30_000,
     val_steps: int = 20_000,
-    env_kwargs: Dict = {"fee_rate": 0.0004, "slip_bp": 2.0, "random_start": False},
+    env_kwargs = {"fee_rate": 0.0004,"slip_bp": 2.0,"random_start": False,"price_col": "price_close"},
     weights: Dict = {"sharpe": 1.0, "ir": 0.3, "mdd": 1.0},
     limits: Dict = {"max_mdd": 0.25, "max_trades_per_day": 40},
     corr_thr: float = 0.9,
@@ -137,6 +137,20 @@ def run(
 
     df_tr = load_processed("train", "5m", mode="auto")
     df_va = load_processed("val",   "5m", mode="auto")
+
+    # `price_close` 컬럼 추가 (TradingEnv에서 사용) 및 조각화 경고 해결
+    if "Close" in df_tr.columns:
+        price_close_tr = df_tr[['Close']].rename(columns={'Close': 'price_close'})
+        df_tr = pd.concat([df_tr, price_close_tr], axis=1)
+    else:
+        raise ValueError("Column 'Close' not found in the training dataframe.")
+        
+    if "Close" in df_va.columns:
+        price_close_va = df_va[['Close']].rename(columns={'Close': 'price_close'})
+        df_va = pd.concat([df_va, price_close_va], axis=1)
+    else:
+        raise ValueError("Column 'Close' not found in the validation dataframe.")
+
     universe = build_universe_from_processed("train", "5m", mode="auto")
     if len(universe) < max_k:
         print(f"[warn] universe size ({len(universe)}) < max_k ({max_k}).")

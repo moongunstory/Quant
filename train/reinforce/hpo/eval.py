@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-HPO 평가 실행기: 선택된 피처셋으로 짧은 PPO 학습 후 검증 롤아웃을 수행하여
-Sharpe / IR / MDD / 거래빈도 등을 산출한다.
-
-- policy.py 수정 불필요: total_steps만 짧게 주어 빠르게 측정
-- env는 obs_cols로 가변 차원을 받도록 이미 패치된 상태를 가정
-- 캐싱 지원: 동일 (feature set, seed, window, steps) 조합 재평가 방지
-"""
 from __future__ import annotations
 import os, sys, json, hashlib, pickle
 from typing import List, Dict, Tuple, Optional
@@ -17,7 +9,6 @@ import torch as th
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 
-# ----- 안전 임포트 (패키지/스크립트 실행 모두 대응) -----
 HERE = os.path.dirname(__file__)
 TRAIN_DIR = os.path.abspath(os.path.join(HERE, "..", ".."))
 if TRAIN_DIR not in sys.path:
@@ -35,7 +26,6 @@ except Exception:
     from reinforce.policy import MultiHeadPolicy
     from prepare.utils import apply_feature_mask
 
-# ----- 메트릭 유틸 -----
 def _annualize_sharpe(rets: np.ndarray, bars_per_day: int = 288, days_per_year: int = 252) -> float:
     if rets.size == 0:
         return 0.0
@@ -54,15 +44,8 @@ def _cache_key(selected: List[str], seed: int, train_steps: int, val_steps: int,
     key = "|".join(sorted(selected)) + f"|{seed}|{train_steps}|{val_steps}|{window}"
     return hashlib.md5(key.encode()).hexdigest()
 
-# ----- 마스킹 함수 (전역: pickle 가능) -----
 def action_mask_fn(env) -> np.ndarray:
-    """
-    WAIT(0) 항상 허용
-    LONG(1): 현재 포지션이 롱이 아닐 때
-    SHORT(2): 현재 포지션이 숏이 아닐 때
-    CLOSE(3): 포지션 있을 때만
-    """
-    pos = getattr(env, "position", 0)
+    pos = getattr(env.portfolio, "position", 0)
     n = int(env.action_space.n)
     mask = np.ones(n, dtype=bool)
     if n >= 4:
@@ -71,13 +54,11 @@ def action_mask_fn(env) -> np.ndarray:
         mask[3] = (pos != 0)   # CLOSE
     return mask
 
-# ----- 안전한 피처 마스킹 -----
 def apply_feature_mask_safe(df: pd.DataFrame, selected_feats: List[str], fill_value: float = 0.0) -> pd.DataFrame:
     missing = [c for c in selected_feats if c not in df.columns]
     assert not missing, f"Missing columns in input: {missing}"
     return df[selected_feats].fillna(fill_value)
 
-# ----- 메인 평가 함수 -----
 def evaluate_feature_set(
     df_train_5m: pd.DataFrame,
     df_val_5m: pd.DataFrame,
@@ -110,6 +91,14 @@ def evaluate_feature_set(
     tr_masked = apply_feature_mask_safe(df_train_5m, selected_feats)
     va_masked = apply_feature_mask_safe(va_df, selected_feats)
 
+    # HPO 환경에서 price_close가 누락되는 문제 수정
+    # apply_feature_mask_safe가 selected_feats에 없는 모든 컬럼을 제거하므로,
+    # TradingEnv에 필수적인 price_close를 다시 추가해준다.
+    if 'price_close' in df_train_5m.columns:
+        tr_masked['price_close'] = df_train_5m['price_close']
+    if 'price_close' in va_df.columns:
+        va_masked['price_close'] = va_df['price_close']
+
     agg = {"sharpe": 0.0, "mdd": 0.0, "trades_per_day": 0.0}
     K = 0
 
@@ -126,8 +115,8 @@ def evaluate_feature_set(
                 np.random.seed(seed)
                 th.manual_seed(seed)
 
-                env_tr = TradingEnv(df_train_5m, obs_cols=selected_feats, **env_kwargs)
-                env_va = TradingEnv(va_df, obs_cols=selected_feats, **env_kwargs)
+                env_tr = TradingEnv(tr_masked, obs_cols=selected_feats, **env_kwargs)
+                env_va = TradingEnv(va_masked, obs_cols=selected_feats, **env_kwargs)
                 env_tr = ActionMasker(env_tr, action_mask_fn)
                 env_va = ActionMasker(env_va, action_mask_fn)
                 env_tr.reset(seed=seed)
@@ -146,6 +135,8 @@ def evaluate_feature_set(
                 model.learn(total_timesteps=train_steps)
 
                 obs, info = env_va.reset(seed=seed)
+                obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
                 initial_eq = np.float32(info.get("initial_equity", 10_000.0))
                 rets, equity, actions = [], [], []
                 total_reward = np.float32(0.0)
@@ -157,18 +148,19 @@ def evaluate_feature_set(
                             action = int(np.asarray(action).squeeze().item())
                         except Exception:
                             action = int(action[0])
+
                     obs, reward, terminated, truncated, info = env_va.step(action)
+                    obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
                     rets.append(np.float32(reward))
                     equity_val = np.float32(info.get("equity", 0.0)) / initial_eq
                     equity.append(equity_val)
                     actions.append(int(action))
                     total_reward += np.float32(reward)
 
-                    if i in {6000, 10000, 15000}:
-                        print(f"[rollout] seed={seed} step={i+1}/{val_steps} equity={info.get('equity', 0):.2f} reward={reward:.6f}")
-
                     if terminated or truncated:
                         obs, info = env_va.reset(seed=seed)
+                        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
                 sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
                 mdd = _max_drawdown(np.asarray(equity, dtype=np.float32))
@@ -176,14 +168,7 @@ def evaluate_feature_set(
 
                 print(f"[summary] seed={seed} sharpe={sharpe:.4f} mdd={mdd:.4f} tpd={tpd:.1f} reward_sum={total_reward:.4f}")
 
-                if sharpe < -5:
-                    print(f"[warn] 🔻 very low sharpe: {sharpe:.4f} | seed={seed}")
-                if mdd > 0.7:
-                    print(f"[warn] 📉 high drawdown: {mdd:.4f} | seed={seed}")
-                if total_reward < -1.0:
-                    print(f"[warn] ⚠️ net negative reward: {total_reward:.4f} | seed={seed}")
-
-                m = {"sharpe": np.float32(sharpe), "mdd": np.float32(mdd), "trades_per_day": np.float32(tpd)}
+                m = {"sharpe": sharpe, "mdd": mdd, "trades_per_day": tpd}
                 if cache_path:
                     with open(cache_path, "wb") as f:
                         pickle.dump(m, f)

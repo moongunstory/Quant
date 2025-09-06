@@ -6,14 +6,14 @@ import numpy as np
 @dataclass
 class TradeCosts:
     fee_rate: float = 0.0004
-    slip_bp: float = 2.0  # 1bp = 0.0001 → 2bp = 0.0002
+    slip_bp: float = 2.0  # basis points
     turn_cost: float = 0.0
 
     def fee(self, price: float, size: float) -> float:
         return abs(price * size) * self.fee_rate
 
     def slippage(self, price: float, size: float) -> float:
-        return abs(price * size) * self.slip_bp * 1e-4
+        return abs(price * size) * (self.slip_bp * 1e-4)
 
 class Portfolio:
     def __init__(self, initial_equity: float, costs: TradeCosts):
@@ -24,7 +24,7 @@ class Portfolio:
     def reset(self):
         self.equity = self.initial_equity
         self.cash = self.initial_equity
-        self.position = 0  # 0: flat, 1: long, -1: short
+        self.position = 0          # +1 long, -1 short, 0 flat
         self.position_size = 0.0
         self.entry_price = np.nan
         self.holding = 0
@@ -33,10 +33,16 @@ class Portfolio:
         return self.costs.fee(price, size) + self.costs.slippage(price, size)
 
     def open_position(self, price: float, direction: int):
-        assert self.position == 0
-        size = self.cash / price
+        size = abs(self.cash / price)
         cost = self._apply_costs(price, size)
-        self.cash -= size * price
+        
+        # LONG
+        if direction == 1:
+            self.cash -= size * price
+        # SHORT
+        elif direction == -1:
+            self.cash += size * price
+
         self.equity -= cost
         self.position = direction
         self.position_size = size
@@ -63,17 +69,19 @@ class Portfolio:
         else:
             self.equity = self.cash
 
-    def get_reward(self):
-        return (self.equity - self.initial_equity) / self.initial_equity
+    def get_reward(self, prev_equity: float) -> float:
+        if prev_equity <= 0:
+            return 0.0
+        return (self.equity - prev_equity) / prev_equity
 
     def info(self, price: float):
         pos_val = self.position * self.position_size * price
         return {
-            "equity": self.equity,
-            "cash": self.cash,
-            "position": self.position,
-            "size": self.position_size,
-            "entry_price": self.entry_price if not np.isnan(self.entry_price) else None,
-            "position_value": pos_val,
-            "holding": self.holding
+            "equity": float(self.equity),
+            "cash": float(self.cash),
+            "position": int(self.position),
+            "size": float(self.position_size),
+            "entry_price": float(self.entry_price) if not np.isnan(self.entry_price) else None,
+            "position_value": float(pos_val),
+            "holding": int(self.holding),
         }

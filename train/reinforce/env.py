@@ -24,31 +24,39 @@ class TradingEnv(gym.Env):
         obs_cols: Optional[List[str]] = None,
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
+        price_col: Optional[str] = None,  
     ):
         super().__init__()
         assert df.index.is_monotonic_increasing
-
         self._full_df = df.copy()
         if start_idx is None: start_idx = 0
         if end_idx is None: end_idx = len(self._full_df)
         self._window = (start_idx, end_idx)
         self.df = self._full_df.iloc[start_idx:end_idx].copy()
-
         self._set_obs_cols(obs_cols)
 
-        self.price_col = "price_close" if "price_close" in self.df.columns else "Close"
+        self.price_col = price_col or (
+            "price_close" if "price_close" in self.df.columns else (
+                "Close" if "Close" in self.df.columns else self.df.columns[0]
+            )
+        )
         self.funding_col = "funding_per_bar" if "funding_per_bar" in self.df.columns else None
 
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self.obs_cols),), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(len(self.obs_cols),),
+            dtype=np.float32
+        )
 
-        self.idx = self.df.index.to_numpy()
         self.random_start = random_start
-        self.t = 0
         self.max_position_bars = max_position_bars
 
         costs = TradeCosts(fee_rate, slip_bp, turn_cost)
         self.portfolio = Portfolio(initial_equity=10_000.0, costs=costs)
+
+        self.t = 0
 
     def _set_obs_cols(self, obs_cols: Optional[List[str]]):
         if obs_cols is None:
@@ -71,39 +79,34 @@ class TradingEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.t = np.random.randint(0, len(self.df) - 2) if self.random_start else 0
+        self.t = np.random.randint(0, len(self.df)-2) if self.random_start else 0
         self.portfolio.reset()
         obs = self._obs(self.t)
         info = self._info()
         return obs, info
 
     def step(self, action: int):
-        terminated = False
-        truncated = False
         cur_price = self._price(self.t)
-        next_t = self.t + 1
-        if next_t >= len(self.df):
-            terminated = True
-            next_t = self.t
+        next_t = min(self.t + 1, len(self.df) - 1)
         next_price = self._price(next_t)
+        prev_equity = self.portfolio.equity
 
-        # === 액션 처리 ===
+        # Action handling
         if action == LONG and self.portfolio.position <= 0:
             self.portfolio.close_position(cur_price)
             self.portfolio.open_position(cur_price, direction=+1)
-
         elif action == SHORT and self.portfolio.position >= 0:
             self.portfolio.close_position(cur_price)
             self.portfolio.open_position(cur_price, direction=-1)
-
         elif action == CLOSE and self.portfolio.position != 0:
             self.portfolio.close_position(cur_price)
 
-        # === 펀딩 및 평가 ===
         funding = self._funding(next_t)
         self.portfolio.step(next_price, funding)
+        reward = self.portfolio.get_reward(prev_equity)
 
-        reward = self.portfolio.get_reward()
+        terminated = (next_t == len(self.df) - 1)
+        truncated = False
 
         if abs(reward) > 0.5:
             print(f"[anomaly] t={self.t} action={action} reward={reward:.6f}")
@@ -111,7 +114,6 @@ class TradingEnv(gym.Env):
 
         self.t = next_t
 
-        # === 보유 최대 바 초과 시 강제 청산 ===
         if self.max_position_bars and self.portfolio.position != 0 and self.portfolio.holding >= self.max_position_bars:
             self.portfolio.close_position(next_price)
 
@@ -121,8 +123,8 @@ class TradingEnv(gym.Env):
 
     def _info(self, extra: dict | None = None):
         price = self._price(self.t)
-        base_info = self.portfolio.info(price)
-        base_info.update({
+        base = self.portfolio.info(price)
+        base.update({
             "t": int(self.t),
             "price": float(price),
             "obs_dim": len(self.obs_cols),
@@ -131,5 +133,9 @@ class TradingEnv(gym.Env):
             "initial_equity": float(self.portfolio.initial_equity),
         })
         if extra:
-            base_info.update(extra)
-        return base_info
+            base.update(extra)
+        return base
+
+    @property
+    def position(self) -> int:
+        return self.portfolio.position
