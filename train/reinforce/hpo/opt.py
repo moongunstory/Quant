@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 HPO 탐색 오케스트레이터 (유전 알고리즘)
 """
@@ -33,7 +32,7 @@ def _correlation_penalty(df: pd.DataFrame, cols: List[str], thr: float = 0.9) ->
     assert not missing, f"Missing columns in df for correlation check: {missing}"
     if len(cols) < 2:
         return 0.0
-    C = df[cols].astype(float).corr().abs()
+    C = df[cols].astype(np.float32).corr().abs()
     np.fill_diagonal(C.values, 0.0)
     return float((C.values > thr).sum() / 2)
 
@@ -97,11 +96,11 @@ def _eval_candidate(args) -> Dict:
         )
 
         score = (m["sharpe"] * weights.get("sharpe", 1.0)
-                 + m["ir"]   * weights.get("ir", 0.0)
-                 - m["mdd"]  * abs(weights.get("mdd", 1.0)))
+                 + m.get("ir", 0.0) * weights.get("ir", 0.0)
+                 - m["mdd"] * abs(weights.get("mdd", 1.0)))
 
         corr_p = _correlation_penalty(df_va, selected, thr=corr_thr)
-        div_p  = _diversity_penalty(selected)
+        div_p = _diversity_penalty(selected)
         score += -0.2 * corr_p - 0.2 * div_p
 
         if m["mdd"] > limits.get("max_mdd", 0.3):
@@ -109,11 +108,11 @@ def _eval_candidate(args) -> Dict:
         if m["trades_per_day"] > limits.get("max_trades_per_day", 60):
             score -= (m["trades_per_day"] - limits["max_trades_per_day"]) * 0.5
 
-        return {"metrics": m, "score": float(score)}
+        return {"metrics": m, "score": np.float32(score), "features": selected}
 
     except Exception as e:
         print(f"[eval error] {e}")
-        return {"metrics": None, "score": float("-inf")}
+        return {"metrics": None, "score": np.float32("-inf"), "features": []}
 
 # ----- 메인 러너 -----
 def run(
@@ -132,6 +131,7 @@ def run(
     out_dir: str = os.path.abspath(os.path.join(HERE, "..", "..", "..", "data", "hpo")),
     save_best_path: str = "best_features.json",
 ) -> Dict:
+    
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -150,6 +150,7 @@ def run(
     history = []
 
     for gen in range(generations):
+        print(f"\n[gen {gen:02d}] Evaluating population...")
         args = [
             (df_tr, df_va, ind, env_kwargs, seeds, train_steps, val_steps,
              weights, limits, corr_thr, cache_dir)
@@ -165,22 +166,33 @@ def run(
         scores = [r["score"] for r in results]
         g_best_idx = int(np.argmax(scores))
         g_best = pop[g_best_idx]
-        g_score = float(scores[g_best_idx])
-        g_mean = float(np.mean(scores))
+        g_score = np.float32(scores[g_best_idx])
+        g_mean = np.float32(np.mean(scores))
 
         history.append({"gen": gen, "best_score": g_score, "mean_score": g_mean, "best_size": len(g_best)})
-        print(f"[gen {gen:02d}] best={g_score:.3f} mean={g_mean:.3f} | size={len(g_best)}")
+        print(f"[gen {gen:02d}] ✅ best={g_score:.3f} | mean={g_mean:.3f} | size={len(g_best)}")
+        print(f"[gen {gen:02d}] top features (partial): {g_best[:5]} ... ({len(g_best)} total)")
+
+        # Top 5 candidates overview
+        top_indices = np.argsort(scores)[-5:][::-1]
+        for rank, idx in enumerate(top_indices):
+            m = results[idx]["metrics"]
+            if m:
+                print(f"  - Top{rank+1}: score={scores[idx]:.3f}, sharpe={m['sharpe']:.3f}, "
+                      f"mdd={m['mdd']:.3f}, tpd={m['trades_per_day']:.1f}, size={len(results[idx]['features'])}")
 
         if g_score > best_score:
             best, best_score, stall = g_best, g_score, 0
-            with open(os.path.join(out_dir, save_best_path), "w", encoding="utf-8") as f:
+            path = os.path.join(out_dir, save_best_path)
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(best, f, ensure_ascii=False, indent=2,
                           default=lambda x: int(x) if isinstance(x, (np.integer, np.int_)) else x)
+            print(f"[save] ✅ New best saved to {path}")
         else:
             stall += 1
 
         if stall >= 5:
-            print("[early-stop] score stalled.")
+            print("[early-stop] ⚠️ score stalled.")
             break
 
         next_pop = [g_best]
@@ -192,11 +204,11 @@ def run(
             next_pop.append(C)
         pop = next_pop
 
-    out = {"best_feats": best, "best_score": float(best_score), "history": history}
+    out = {"best_feats": best, "best_score": np.float32(best_score), "history": history}
     with open(os.path.join(out_dir, "hpo_history.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2,
                   default=lambda x: int(x) if isinstance(x, (np.integer, np.int_)) else x)
-    print(f"[done] best_score={best_score:.3f}, feats={len(best) if best else 0}")
+    print(f"\n[done] 🎯 best_score={best_score:.3f}, feats={len(best) if best else 0}")
     return out
 
 if __name__ == "__main__":

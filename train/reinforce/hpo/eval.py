@@ -39,8 +39,8 @@ except Exception:
 def _annualize_sharpe(rets: np.ndarray, bars_per_day: int = 288, days_per_year: int = 252) -> float:
     if rets.size == 0:
         return 0.0
-    mu = float(np.mean(rets))
-    sd = float(np.std(rets)) + 1e-9
+    mu = np.float32(np.mean(rets))
+    sd = np.float32(np.std(rets)) + 1e-9
     return (mu / sd) * np.sqrt(bars_per_day * days_per_year)
 
 def _max_drawdown(equity: np.ndarray) -> float:
@@ -48,7 +48,7 @@ def _max_drawdown(equity: np.ndarray) -> float:
         return 0.0
     peak = np.maximum.accumulate(equity)
     dd = (equity - peak) / (peak + 1e-9)
-    return float(-dd.min())
+    return np.float32(-dd.min())
 
 def _cache_key(selected: List[str], seed: int, train_steps: int, val_steps: int, window: Optional[Tuple[int,int]]):
     key = "|".join(sorted(selected)) + f"|{seed}|{train_steps}|{val_steps}|{window}"
@@ -89,15 +89,9 @@ def evaluate_feature_set(
     cache_dir: Optional[str] = None,
     window: Optional[Tuple[int,int]] = None,
 ) -> Dict[str, float]:
-    """
-    선택된 피처들로 학습/검증하여 평균 성능을 반환.
-    반환 예:
-      {"sharpe": 1.23, "ir": 1.23, "mdd": 0.18, "trades_per_day": 27.4}
-    """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
 
-    # 검증 프레임 윈도우 슬라이스 (시간 연속성 보장)
     if window is None:
         va_df = df_val_5m
     else:
@@ -108,16 +102,15 @@ def evaluate_feature_set(
             raise ValueError("Validation index frequency is not consistent.")
         try:
             start_dt = df_val_5m.index[s]
-            end_dt   = df_val_5m.index[e - 1]
+            end_dt = df_val_5m.index[e - 1]
             va_df = df_val_5m.loc[start_dt:end_dt]
         except Exception as ex:
             raise IndexError(f"Invalid window indices: {s}, {e} -> {ex}")
 
-    # 마스킹 (피처 유효성 검증 포함)
     tr_masked = apply_feature_mask_safe(df_train_5m, selected_feats)
-    va_masked = apply_feature_mask_safe(va_df,       selected_feats)
+    va_masked = apply_feature_mask_safe(va_df, selected_feats)
 
-    agg = {"sharpe": 0.0, "ir": 0.0, "mdd": 0.0, "trades_per_day": 0.0}
+    agg = {"sharpe": 0.0, "mdd": 0.0, "trades_per_day": 0.0}
     K = 0
 
     for seed in seeds:
@@ -128,54 +121,77 @@ def evaluate_feature_set(
             with open(cache_path, "rb") as f:
                 m = pickle.load(f)
         else:
-            random.seed(seed)
-            np.random.seed(seed)
-            th.manual_seed(seed)
+            try:
+                random.seed(seed)
+                np.random.seed(seed)
+                th.manual_seed(seed)
 
-            env_tr = TradingEnv(df_train_5m, obs_cols=selected_feats, **env_kwargs)
-            env_va = TradingEnv(va_df,       obs_cols=selected_feats, **env_kwargs)
-            env_tr = ActionMasker(env_tr, action_mask_fn)
-            env_va = ActionMasker(env_va, action_mask_fn)
-            env_tr.reset(seed=seed)
-            env_va.reset(seed=seed)
+                env_tr = TradingEnv(df_train_5m, obs_cols=selected_feats, **env_kwargs)
+                env_va = TradingEnv(va_df, obs_cols=selected_feats, **env_kwargs)
+                env_tr = ActionMasker(env_tr, action_mask_fn)
+                env_va = ActionMasker(env_va, action_mask_fn)
+                env_tr.reset(seed=seed)
+                env_va.reset(seed=seed)
 
-            model = MaskablePPO(
-                policy=MultiHeadPolicy,
-                env=env_tr,
-                learning_rate=1e-4,
-                n_steps=2048,
-                batch_size=256,
-                n_epochs=5,
-                seed=seed,
-                verbose=0,
-            )
-            model.learn(total_timesteps=train_steps)
+                model = MaskablePPO(
+                    policy=MultiHeadPolicy,
+                    env=env_tr,
+                    learning_rate=1e-4,
+                    n_steps=2048,
+                    batch_size=256,
+                    n_epochs=5,
+                    seed=seed,
+                    verbose=0,
+                )
+                model.learn(total_timesteps=train_steps)
 
-            obs, info = env_va.reset(seed=seed)
-            rets, equity, actions = [], [], []
-            for _ in range(val_steps):
-                action, _ = model.predict(obs, deterministic=True)
-                if isinstance(action, (np.ndarray, list)):
-                    try:
-                        action = int(np.asarray(action).squeeze().item())
-                    except Exception:
-                        action = int(action[0])
-                obs, reward, terminated, truncated, info = env_va.step(action)
-                rets.append(float(reward))
-                equity.append(float(info.get("equity", 0.0)))
-                actions.append(int(action))
-                if terminated or truncated:
-                    obs, info = env_va.reset(seed=seed)
+                obs, info = env_va.reset(seed=seed)
+                initial_eq = np.float32(info.get("initial_equity", 10_000.0))
+                rets, equity, actions = [], [], []
+                total_reward = np.float32(0.0)
 
-            sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
-            ir     = sharpe
-            mdd    = _max_drawdown(np.asarray(equity, dtype=np.float32))
-            tpd    = float((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)
+                for i in range(val_steps):
+                    action, _ = model.predict(obs, deterministic=True)
+                    if isinstance(action, (np.ndarray, list)):
+                        try:
+                            action = int(np.asarray(action).squeeze().item())
+                        except Exception:
+                            action = int(action[0])
+                    obs, reward, terminated, truncated, info = env_va.step(action)
+                    rets.append(np.float32(reward))
+                    equity_val = np.float32(info.get("equity", 0.0)) / initial_eq
+                    equity.append(equity_val)
+                    actions.append(int(action))
+                    total_reward += np.float32(reward)
 
-            m = {"sharpe": float(sharpe), "ir": float(ir), "mdd": float(mdd), "trades_per_day": float(tpd)}
-            if cache_path:
-                with open(cache_path, "wb") as f:
-                    pickle.dump(m, f)
+                    if i in {6000, 10000, 15000}:
+                        print(f"[rollout] seed={seed} step={i+1}/{val_steps} equity={info.get('equity', 0):.2f} reward={reward:.6f}")
+
+                    if terminated or truncated:
+                        obs, info = env_va.reset(seed=seed)
+
+                sharpe = _annualize_sharpe(np.asarray(rets, dtype=np.float32))
+                mdd = _max_drawdown(np.asarray(equity, dtype=np.float32))
+                tpd = np.float32((np.asarray(actions, dtype=np.int32) != 0).mean() * 288.0)
+
+                print(f"[summary] seed={seed} sharpe={sharpe:.4f} mdd={mdd:.4f} tpd={tpd:.1f} reward_sum={total_reward:.4f}")
+
+                if sharpe < -5:
+                    print(f"[warn] 🔻 very low sharpe: {sharpe:.4f} | seed={seed}")
+                if mdd > 0.7:
+                    print(f"[warn] 📉 high drawdown: {mdd:.4f} | seed={seed}")
+                if total_reward < -1.0:
+                    print(f"[warn] ⚠️ net negative reward: {total_reward:.4f} | seed={seed}")
+
+                m = {"sharpe": np.float32(sharpe), "mdd": np.float32(mdd), "trades_per_day": np.float32(tpd)}
+                if cache_path:
+                    with open(cache_path, "wb") as f:
+                        pickle.dump(m, f)
+
+            except Exception as e:
+                print(f"[eval error] {e} | seed={seed}")
+                print(f"[debug] features used: {selected_feats[:5]} ... ({len(selected_feats)} total)")
+                m = {"sharpe": 0.0, "mdd": 1.0, "trades_per_day": 999.0}
 
         for k in agg:
             agg[k] += m[k]

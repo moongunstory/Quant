@@ -131,7 +131,11 @@ def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:
         path = hpo_p if os.path.exists(hpo_p) else base_p
     if not os.path.exists(path):
         raise FileNotFoundError(f"Processed file not found: {path}")
-    return pd.read_parquet(path)
+    df = pd.read_parquet(path)
+    # Cast float columns to float32 to save memory
+    float_cols = df.select_dtypes(include=['float64']).columns
+    df[float_cols] = df[float_cols].astype(np.float32)
+    return df
 
 def feature_universe(df: pd.DataFrame, prefix: str = "f_") -> List[str]:
     return [c for c in df.columns if c.startswith(prefix)]
