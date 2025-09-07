@@ -178,14 +178,22 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # === 지표 + 기존 방식으로 확장 피처 생성 ===
 def add_hpo_candidates(df: pd.DataFrame, interval: str) -> tuple[pd.DataFrame, List[str]]:
-    """
-    기술 지표 + 파생 피처 조합 + 피처 리스트 반환.
-    """
     df = df.copy()
+
+    # ✅ 미리 메타 컬럼 저장
+    ref_cols = df[REF_COLS_CANON].copy()
+
     df = add_technical_indicators(df)
-    df, new_feat_names = generate_feature_combinations(df)  # ✅ 새 피처 이름까지 받아옴
+    df, feat_names = generate_feature_combinations(df)
+
     df = sanitize(df)
-    return df, new_feat_names
+
+    # ✅ 사라졌을 수 있는 메타 컬럼 복원
+    for col in REF_COLS_CANON:
+        if col not in df.columns:
+            df[col] = ref_cols[col] if col in ref_cols.columns else 0.0
+
+    return df, feat_names
 
 # === 결과 로딩 ===
 def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:
