@@ -1,5 +1,6 @@
 # train/prepare/feature_engineering.py
 
+import warnings
 import pandas as pd
 import numpy as np
 from itertools import combinations
@@ -16,7 +17,7 @@ def zscore(s: pd.Series, win: Optional[int] = None) -> pd.Series:
     sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
     return ((s - mu) / sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-def generate_feature_combinations(df: pd.DataFrame) -> pd.DataFrame:
+def generate_feature_combinations(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
     df = df.copy()
     new_feats = {}
 
@@ -34,6 +35,8 @@ def generate_feature_combinations(df: pd.DataFrame) -> pd.DataFrame:
         new_feats[f"f_sq_{col}"] = (s ** 2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
         new_feats[f"f_log_{col}"] = np.log1p(np.abs(s)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
         new_feats[f"f_zscore_{col}"] = zscore(s)
+
+        # 조건 피처는 조건 만족할 때만 생성
         if s.max() > 70:
             new_feats[f"f_cond_{col}_gt70"] = (s > 70).astype(float)
         if s.min() < 30:
@@ -41,8 +44,10 @@ def generate_feature_combinations(df: pd.DataFrame) -> pd.DataFrame:
         new_feats[f"f_cond_{col}_gt0"] = (s > 0).astype(float)
         new_feats[f"f_cond_{col}_lt0"] = (s < 0).astype(float)
 
-    new_df = pd.concat([df] + [pd.Series(v, name=k, index=df.index) for k, v in new_feats.items()], axis=1)
-    return new_df
+    new_feat_df = pd.concat([pd.Series(v, name=k, index=df.index) for k, v in new_feats.items()], axis=1)
+    result_df = pd.concat([df, new_feat_df], axis=1)
+
+    return result_df, list(new_feat_df.columns)
 
 def filter_features(df: pd.DataFrame, target: pd.Series, top_k: int = 300, vif_thresh: float = 10.0) -> pd.DataFrame:
     df = df.copy()
@@ -59,16 +64,21 @@ def filter_features(df: pd.DataFrame, target: pd.Series, top_k: int = 300, vif_t
     # VIF 기반 다중공선성 제거
     X_const = add_constant(X)
     keep_cols = X.columns.tolist()
-    while True:
-        vifs = pd.Series([variance_inflation_factor(X_const.values, i)
-                         for i in range(X_const.shape[1])],
-                         index=X_const.columns)
-        vifs = vifs.drop("const", errors="ignore")
-        high_vif = vifs[vifs > vif_thresh]
-        if high_vif.empty:
-            break
-        drop_col = high_vif.idxmax()
-        keep_cols.remove(drop_col)
-        X_const = X_const.drop(columns=[drop_col])
+
+    # ⚠️ VIF 계산 중 divide by zero 경고 억제
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+        while True:
+            vifs = pd.Series([variance_inflation_factor(X_const.values, i)
+                              for i in range(X_const.shape[1])],
+                             index=X_const.columns)
+            vifs = vifs.drop("const", errors="ignore")
+            high_vif = vifs[vifs > vif_thresh]
+            if high_vif.empty:
+                break
+            drop_col = high_vif.idxmax()
+            keep_cols.remove(drop_col)
+            X_const = X_const.drop(columns=[drop_col])
 
     return df[keep_cols]

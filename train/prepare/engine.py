@@ -9,13 +9,31 @@ from .paths import RAW_DIR, OUT_DIR, REF_COLS_CANON, BASE_INTERVAL, HPO_FEATURE_
 from .feature_engineering import generate_feature_combinations
 
 # === 유틸 함수들 통합 ===
-def sanitize(df: pd.DataFrame) -> pd.DataFrame:
+def sanitize(
+    df: pd.DataFrame,
+    verbose: bool = False,
+    drop_zero_std: bool = True,
+    std_thresh: float = 1e-8
+) -> pd.DataFrame:
     df = df.replace([np.inf, -np.inf], np.nan)
+
+    # === 1. 결측치 전체인 컬럼 제거 ===
+    all_nan_cols = df.columns[df.isna().all()].tolist()
+
+    # === 2. 상수값 컬럼 제거 ===
+    constant_cols = df.columns[df.nunique(dropna=False) <= 1].tolist()
+
+    # === 3. 표준편차 거의 0인 컬럼 제거 ===
     std = df.std(numeric_only=True)
-    zero_std_cols = std[std == 0].index.tolist()
-    if zero_std_cols:
-        print(f"[INFO] Zero std columns detected: {zero_std_cols[:5]}...")
+    zero_std_cols = std[std <= std_thresh].index.tolist()
+
+    # === 제거 또는 대체 ===
+    if drop_zero_std:
+        cols_to_drop = set(all_nan_cols + constant_cols + zero_std_cols)
+        df = df.drop(columns=cols_to_drop, errors="ignore")
+    else:
         df[zero_std_cols] = 0.0
+
     return df.fillna(0.0)
 
 def enforce_dt_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +109,10 @@ def load_raw(split: str, interval: str) -> pd.DataFrame:
     if interval == BASE_INTERVAL:
         df["FundingSettle"] = (((df.index.hour % 8 == 0) & (df.index.minute == 0))).astype("int8")
 
+    # ✅ y_class 추가
+    if "Close" in df.columns:
+        df["y_class"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+
     return df
 
 # === 기술 지표 피처 추가 ===
@@ -155,14 +177,15 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 # === 지표 + 기존 방식으로 확장 피처 생성 ===
-def add_hpo_candidates(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+def add_hpo_candidates(df: pd.DataFrame, interval: str) -> tuple[pd.DataFrame, List[str]]:
     """
-    기술 지표 + 파생 피처 조합까지 포함된 확장 버전 (HPO 대상).
+    기술 지표 + 파생 피처 조합 + 피처 리스트 반환.
     """
     df = df.copy()
     df = add_technical_indicators(df)
-    df = generate_feature_combinations(df)
-    return sanitize(df)
+    df, new_feat_names = generate_feature_combinations(df)  # ✅ 새 피처 이름까지 받아옴
+    df = sanitize(df)
+    return df, new_feat_names
 
 # === 결과 로딩 ===
 def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from ai_binance.train.prepare.paths import *
 from ai_binance.train.prepare.engine import *
+from ai_binance.train.prepare.feature_engineering import filter_features
 from sklearn.preprocessing import StandardScaler
 
 def check_zero_std_consistency(feature_data: Dict[str, Dict[str, pd.DataFrame]]):
@@ -34,37 +35,41 @@ def main():
     raw_data = {split: {tf: load_raw(split, tf) for tf in TIMEFRAMES} for split in ["train", "val", "test"]}
     btc_data = {split: raw_data[split]["btc1h"] for split in ["train", "val", "test"]}
 
-    print("\n[2/4] Adding technical indicators...")
+    print("\n[2/4] Adding technical indicators & features...")
     features: Dict[str, Dict[str, pd.DataFrame]] = {s: {} for s in ["train", "val", "test"]}
     for split in ["train", "val", "test"]:
         for tf in ETH_TIMEFRAMES:
             df = raw_data[split][tf]
             btc_df = btc_data[split]
-            extended = add_hpo_candidates(df, tf)
-            features[split][tf] = sanitize(extended)
+            df, feat_names = add_hpo_candidates(df, tf)
+            features[split][tf] = df
 
     print("\n[3/4] Saving HPO features & scalers...")
     for tf in ETH_TIMEFRAMES:
         tr_df = features["train"][tf]
-        all_feats = [c for c in tr_df.columns if c not in REF_COLS_CANON]
+        val_df = features["val"][tf]
+        test_df = features["test"][tf]
 
-        # 접두어 f_ 붙이기
-        feat_list = [c if c.startswith("f_") else f"f_{c}" for c in all_feats]
+        # 공통 피처 추출
+        base_feats = [c for c in tr_df.columns if c.startswith("f_")]
+        common_feats = [f for f in base_feats if f in val_df.columns and f in test_df.columns]
 
-        with open(HPO_FEATURE_LIST_FMT.format(tf=tf), "w", encoding="utf-8") as f:
-            json.dump(feat_list, f, indent=2)
+        # MI + VIF 기반 필터링 (train 데이터에서)
+        filtered_df = filter_features(tr_df[common_feats], target=tr_df["y_class"], top_k=300, vif_thresh=10.0)
+        selected_feats = filtered_df.columns.tolist()
 
-        scaler = StandardScaler().fit(sanitize(tr_df[all_feats]).astype(float))
+        # 스케일러 학습 및 저장
+        scaler = StandardScaler().fit(filtered_df.astype(float))
         joblib.dump(scaler, HPO_SCALER_PATH_FMT.format(tf=tf))
+
+        # 피처 목록 저장
+        with open(HPO_FEATURE_LIST_FMT.format(tf=tf), "w", encoding="utf-8") as f:
+            json.dump(selected_feats, f, indent=2)
 
         for split in ["train", "val", "test"]:
             df = features[split][tf]
-            X = sanitize(df[all_feats])
-            X_scaled = scaler.transform(X)
-
-            # f_ 접두어 컬럼으로 변환
-            renamed_cols = [c if c.startswith("f_") else f"f_{c}" for c in all_feats]
-            df_scaled = pd.DataFrame(X_scaled, index=df.index, columns=renamed_cols)
+            df_selected = df[selected_feats].copy()
+            df_scaled = pd.DataFrame(scaler.transform(df_selected), index=df.index, columns=selected_feats)
 
             final_df = pd.concat([df_scaled, df[REF_COLS_CANON]], axis=1)
             out_path = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
