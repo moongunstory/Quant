@@ -1,5 +1,3 @@
-# paths.py — 공통 경로 및 상수 정의
-
 import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11,12 +9,6 @@ os.makedirs(OUT_DIR, exist_ok=True)
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "btc1h"]
 ETH_TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 BASE_INTERVAL = "5m"
-
-# Feature selection settings
-FEATURE_SEARCH = True
-RANDOM_STATE = 72
-TOP_K_PER_TF = {"5m": 128, "15m": 128, "1h": 96, "4h": 64}
-TF_FOR_SEARCH = ["5m", "15m", "1h", "4h"]
 
 # HPO 확장 관련 설정
 HPO_OUT_PREFIX = "feHPO"
@@ -31,3 +23,13 @@ SCALER_PATH_FMT = os.path.join(OUT_DIR, "scaler_{tf}.joblib")
 
 # 유지할 기본 열
 REF_COLS_CANON = ["Open", "High", "Low", "Close", "Volume", "FundingRate"]
+
+# (선택) 기술 지표 기반 피처 종류 명시
+TA_FEATURE_TYPES = [
+    "ema_5", "ema_10", "ema_20", "ema_60", "ema_120",
+    "rsi_14", "macd", "macd_signal", "macd_hist",
+    "stoch_k", "stoch_d", "cci_20",
+    "bb_upper", "bb_lower", "bb_mid", "bb_std",
+    "ha_open", "ha_close", "ha_high", "ha_low",
+    "tenkan_sen", "kijun_sen", "senkou_a", "senkou_b", "chikou_span"
+]

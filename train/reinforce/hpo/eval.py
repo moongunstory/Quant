@@ -14,17 +14,9 @@ TRAIN_DIR = os.path.abspath(os.path.join(HERE, "..", ".."))
 if TRAIN_DIR not in sys.path:
     sys.path.append(TRAIN_DIR)
 
-try:
-    from reinforce.env import TradingEnv
-    from reinforce.policy import MultiHeadPolicy
-    from prepare.utils import apply_feature_mask
-except Exception:
-    BASE = os.path.abspath(os.path.join(HERE, "..", ".."))
-    if BASE not in sys.path:
-        sys.path.append(BASE)
-    from reinforce.env import TradingEnv
-    from reinforce.policy import MultiHeadPolicy
-    from prepare.utils import apply_feature_mask
+from reinforce.env import TradingEnv
+from reinforce.policy import MultiHeadLSTMPolicy as MultiHeadPolicy
+
 
 def _annualize_sharpe(rets: np.ndarray, bars_per_day: int = 288, days_per_year: int = 252) -> float:
     if rets.size == 0:

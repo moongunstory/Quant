@@ -3,7 +3,7 @@ HPO 탐색 오케스트레이터 (유전 알고리즘)
 """
 from __future__ import annotations
 import os, sys, json, random, multiprocessing as mp
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 import numpy as np
 import pandas as pd
 
@@ -26,7 +26,7 @@ except Exception:
         sys.path.append(HPO_DIR)
     from eval import evaluate_feature_set
 
-# ----- 제약/패널티 -----
+# ----- 제약/패널티 ----- 
 def _correlation_penalty(df: pd.DataFrame, cols: List[str], thr: float = 0.9) -> float:
     missing = [c for c in cols if c not in df.columns]
     assert not missing, f"Missing columns in df for correlation check: {missing}"
@@ -52,29 +52,29 @@ def _diversity_penalty(cols: List[str]) -> float:
     gmax = max(Counter([_grp(c) for c in cols]).values()) / len(cols)
     return float(tf_max + gmax)
 
-# ----- GA 연산 -----
-def _init_population(universe: List[str], pop_size: int, min_k: int, max_k: int) -> List[List[str]]:
-    return [random.sample(universe, random.randint(min_k, max_k)) for _ in range(pop_size)]
+# ----- GA 연산 ----- 
+def _init_population(universe: List[str], pop_size: int) -> List[List[str]]:
+    return [random.sample(universe, random.randint(1, len(universe))) for _ in range(pop_size)]
 
 def _tournament_select(pop: List[List[str]], scores: List[float], k: int = 3) -> List[str]:
     cand = random.sample(range(len(pop)), min(k, len(pop)))
     cand.sort(key=lambda i: scores[i], reverse=True)
     return list(pop[cand[0]])
 
-def _crossover(A: List[str], B: List[str], max_k: int) -> List[str]:
-    inter = list(set(A) & set(B))
-    only  = list(set(A) ^ set(B))
-    need  = max(0, max_k - len(inter))
-    add   = random.sample(only, min(need, len(only)))
-    return inter + add
+def _crossover(A: List[str], B: List[str]) -> List[str]:
+    child = set(A) & set(B)
+    sym_diff = set(A) ^ set(B)
+    for item in sym_diff:
+        if random.random() < 0.5:
+            child.add(item)
+    return list(child)
 
 def _mutate(S: List[str], universe: List[str],
-            p_add=0.3, p_del=0.3, p_swap=0.1,
-            min_k: int = 50, max_k: int = 100) -> List[str]:
+            p_add=0.3, p_del=0.3, p_swap=0.1) -> List[str]:
     S = set(S)
-    if random.random() < p_add and len(S) < max_k:
+    if random.random() < p_add and len(S) < len(universe):
         S.add(random.choice(universe))
-    if random.random() < p_del and len(S) > min_k:
+    if random.random() < p_del and len(S) > 1:
         S.remove(random.choice(list(S)))
     if random.random() < p_swap and len(S) >= 1 and len(universe) > len(S):
         out = list(S)
@@ -82,7 +82,7 @@ def _mutate(S: List[str], universe: List[str],
         S = set(out)
     return list(S)
 
-# ----- 후보 평가 -----
+# ----- 후보 평가 ----- 
 def _eval_candidate(args) -> Dict:
     try:
         (df_tr, df_va, selected, env_kwargs, seeds, train_steps, val_steps,
@@ -114,11 +114,10 @@ def _eval_candidate(args) -> Dict:
         print(f"[eval error] {e}")
         return {"metrics": None, "score": np.float32("-inf"), "features": []}
 
-# ----- 메인 러너 -----
+# ----- 메인 러너 ----- 
 def run(
     pop_size: int = 24,
     generations: int = 20,
-    min_k: int = 50, max_k: int = 100,
     seeds: List[int] = [0, 1],
     train_steps: int = 30_000,
     val_steps: int = 20_000,
@@ -140,26 +139,23 @@ def run(
 
     # `price_close` 컬럼 추가 (TradingEnv에서 사용) 및 조각화 경고 해결
     if "Close" in df_tr.columns:
-        price_close_tr = df_tr[['Close']].rename(columns={'Close': 'price_close'})
+        price_close_tr = df_tr[["Close"]].rename(columns={'Close': 'price_close'})
         df_tr = pd.concat([df_tr, price_close_tr], axis=1)
     else:
         raise ValueError("Column 'Close' not found in the training dataframe.")
         
     if "Close" in df_va.columns:
-        price_close_va = df_va[['Close']].rename(columns={'Close': 'price_close'})
+        price_close_va = df_va[["Close"]].rename(columns={'Close': 'price_close'})
         df_va = pd.concat([df_va, price_close_va], axis=1)
     else:
         raise ValueError("Column 'Close' not found in the validation dataframe.")
 
     universe = build_universe_from_processed("train", "5m", mode="auto")
-    if len(universe) < max_k:
-        print(f"[warn] universe size ({len(universe)}) < max_k ({max_k}).")
-        max_k = max(10, len(universe) // 2)
 
     print(f"[init] universe={len(universe)}, pop={pop_size}, gen={generations}, "
-          f"k∈[{min_k},{max_k}], seeds={seeds}, steps={train_steps}/{val_steps}")
+          f"seeds={seeds}, steps={train_steps}/{val_steps}")
 
-    pop = _init_population(universe, pop_size, min_k, max_k)
+    pop = _init_population(universe, pop_size)
     best, best_score, stall = None, -1e9, 0
     history = []
 
@@ -213,8 +209,8 @@ def run(
         while len(next_pop) < len(pop):
             A = _tournament_select(pop, scores, k=3)
             B = _tournament_select(pop, scores, k=3)
-            C = _crossover(A, B, max_k)
-            C = _mutate(C, universe, min_k=min_k, max_k=max_k)
+            C = _crossover(A, B)
+            C = _mutate(C, universe)
             next_pop.append(C)
         pop = next_pop
 

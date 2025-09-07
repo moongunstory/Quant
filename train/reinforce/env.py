@@ -73,9 +73,20 @@ class TradingEnv(gym.Env):
         return self.df.iloc[t][self.obs_cols].to_numpy(dtype=np.float32)
 
     def _funding(self, t: int) -> float:
-        if self.funding_col is None or self.portfolio.position == 0:
+        if self.portfolio.position == 0:
             return 0.0
-        return float(self.df.iloc[t][self.funding_col])
+
+        timestamp = self.df.index[t]
+
+        # 정산 시각인지 확인 (8시간마다 정각)
+        if (timestamp.hour % 8 == 0) and (timestamp.minute == 0):
+            # funding_rate 컬럼 이름 유연하게 처리
+            for col_name in ["funding_rate", "FundingRate"]:
+                if col_name in self.df.columns:
+                    rate = float(self.df.iloc[t][col_name])
+                    return self.portfolio.position * rate
+
+        return 0.0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
