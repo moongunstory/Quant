@@ -6,9 +6,17 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 from typing import List, Optional, Tuple
-from .portfolio import Portfolio, TradeCosts
+from collections import deque
+from ai_binance.train.reinforce.portfolio import Portfolio, TradeCosts
 
 WAIT, LONG, SHORT, CLOSE = 0, 1, 2, 3
+
+SEQ_LEN_PER_TF = {
+    "5m": 24,
+    "15m": 16,
+    "1h": 12,
+    "4h": 6,
+}
 
 class TradingEnv(gym.Env):
     metadata = {"render_modes": []}
@@ -24,7 +32,8 @@ class TradingEnv(gym.Env):
         obs_cols: Optional[List[str]] = None,
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
-        price_col: Optional[str] = None,  
+        price_col: Optional[str] = None,
+        tf_name="5m",
     ):
         super().__init__()
         assert df.index.is_monotonic_increasing
@@ -42,11 +51,15 @@ class TradingEnv(gym.Env):
         )
         self.funding_col = "funding_per_bar" if "funding_per_bar" in self.df.columns else None
 
+        self.tf_name = tf_name
+        self.seq_len = SEQ_LEN_PER_TF.get(tf_name, 16)
+        self.obs_buffer = deque(maxlen=self.seq_len)
+
         self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(len(self.obs_cols),),
+            shape=(self.seq_len, len(self.obs_cols)),
             dtype=np.float32
         )
 
@@ -90,9 +103,20 @@ class TradingEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.t = np.random.randint(0, len(self.df)-2) if self.random_start else 0
+        
+        if len(self.df) <= self.seq_len:
+            raise ValueError(
+                f"DataFrame length ({len(self.df)}) must be greater than sequence length ({self.seq_len})."
+            )
+
+        self.t = np.random.randint(0, len(self.df) - self.seq_len + 1) if self.random_start else 0
         self.portfolio.reset()
-        obs = self._obs(self.t)
+
+        self.obs_buffer.clear()
+        for i in range(self.seq_len):
+            self.obs_buffer.append(self._obs(self.t + i))
+
+        obs = np.stack(self.obs_buffer, axis=0)
         info = self._info()
         return obs, info
 
@@ -128,9 +152,21 @@ class TradingEnv(gym.Env):
         if self.max_position_bars and self.portfolio.position != 0 and self.portfolio.holding >= self.max_position_bars:
             self.portfolio.close_position(next_price)
 
-        obs = self._obs(self.t)
+        # append next observation to buffer
+        self.obs_buffer.append(self._obs(self.t))
+        obs = np.stack(self.obs_buffer, axis=0)
         info = self._info(extra=dict(funding=funding))
         return obs, reward, terminated, truncated, info
+
+    def _action_mask(self) -> np.ndarray:
+        mask = np.ones(4, dtype=bool)
+        if self.portfolio.position > 0:
+            mask[LONG] = False
+        elif self.portfolio.position < 0:
+            mask[SHORT] = False
+        else:
+            mask[CLOSE] = False
+        return mask
 
     def _info(self, extra: dict | None = None):
         price = self._price(self.t)
@@ -142,6 +178,7 @@ class TradingEnv(gym.Env):
             "window_start": int(self._window[0]),
             "window_end": int(self._window[1]),
             "initial_equity": float(self.portfolio.initial_equity),
+            "action_mask": self._action_mask(),  # ✅ 추가된 부분
         })
         if extra:
             base.update(extra)

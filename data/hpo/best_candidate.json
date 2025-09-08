@@ -1,0 +1,21 @@
+{
+  "features": [
+    "f_ratio_y_class_macd_hist",
+    "f_ratio_ema_20_kijun_sen",
+    "f_mul_y_class_atr_14",
+    "f_diff_y_class_aroondown",
+    "f_ratio_Number_of_trades_obv",
+    "f_ratio_y_class_adosc",
+    "f_mul_y_class_macd_signal",
+    "f_mul_y_class_cci_20",
+    "f_diff_y_class_ema_120",
+    "f_log_ppo",
+    "f_ratio_ha_low_senkou_b",
+    "f_mul_bb_std_macd",
+    "f_diff_Open_adx_14"
+  ],
+  "learning_rate": 0.00014301435704618392,
+  "batch_size": 512,
+  "n_steps": 1024,
+  "n_epochs": 5
+}

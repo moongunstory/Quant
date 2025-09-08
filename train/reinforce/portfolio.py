@@ -65,9 +65,10 @@ class Portfolio:
         if self.position != 0:
             pos_val = self.position * self.position_size * price
             self.equity = self.cash + pos_val - funding
-            self.holding += 1
+            self.holding = int(self.holding) + 1
         else:
             self.equity = self.cash
+            self.holding = 0
 
     def get_reward(self, prev_equity: float) -> float:
         if prev_equity <= 0:

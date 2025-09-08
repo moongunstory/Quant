@@ -1,70 +1,109 @@
-from __future__ import annotations
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 
-class MultiHeadLSTMPolicy(MaskableActorCriticPolicy):
-    def __init__(self, *args,
-                 trend_dim: int = 3,
-                 aux_coeff: float = 0.1,
-                 aux_lr: float = 1e-3,
-                 freeze_backbone_for_aux: bool = True,
-                 lstm_hidden_dim: int = 128,
-                 num_lstm_layers: int = 1,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
+
+class MultiHeadLSTMPolicy(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        seq_len: int,
+        action_dim: int,
+        trend_dim: int = 3,
+        aux_coeff: float = 0.1,
+        aux_lr: float = 1e-3,
+        freeze_backbone_for_aux: bool = True,
+        lstm_hidden_dim: int = 128,
+        num_lstm_layers: int = 1,
+        mlp_hidden_dims: tuple[int, int] = (128, 64),
+        device: str = "cpu",
+    ):
+        super().__init__()
+        self.device = device
+        self.obs_dim = obs_dim
+        self.seq_len = seq_len
+        self.action_dim = action_dim
         self.aux_coeff = aux_coeff
         self.freeze_backbone_for_aux = freeze_backbone_for_aux
 
-        d_feat = int(self.features_extractor.features_dim)
-        d_pi = int(self.mlp_extractor.latent_dim_pi)
-        d_vf = int(self.mlp_extractor.latent_dim_vf)
+        # 1. input projection → LSTM input
+        self.input_proj = nn.Linear(obs_dim, lstm_hidden_dim)
 
-        # LSTM 추가
-        self.lstm = nn.LSTM(input_size=d_feat,
-                            hidden_size=lstm_hidden_dim,
-                            num_layers=num_lstm_layers,
-                            batch_first=True)
+        # 2. LSTM encoder
+        self.lstm = nn.LSTM(
+            input_size=lstm_hidden_dim,
+            hidden_size=lstm_hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+        )
 
+        # 3. MLP for policy
+        self.policy_net = nn.Sequential(
+            nn.Linear(lstm_hidden_dim, mlp_hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dims[0], mlp_hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dims[1], action_dim),
+        )
+
+        # 4. MLP for value function
+        self.value_net = nn.Sequential(
+            nn.Linear(lstm_hidden_dim, mlp_hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dims[0], mlp_hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dims[1], 1),
+        )
+
+        # 5. Trend head (auxiliary task)
         self.trend_head = nn.Sequential(
             nn.Linear(lstm_hidden_dim, 128),
             nn.ReLU(),
             nn.Linear(128, trend_dim),
         )
-        self.action_net = nn.Linear(d_pi, self.action_space.n)
-        self.value_net = nn.Linear(d_vf, 1)
-
-        if hasattr(self, "_init_weights"):
-            self._init_weights(self.action_net)
-            self._init_weights(self.value_net)
-            self.trend_head.apply(self._init_weights)
 
         self.aux_optimizer = th.optim.Adam(self.trend_head.parameters(), lr=aux_lr)
 
+        self.to(self.device)
+
     def extract_lstm_features(self, obs_seq: th.Tensor) -> th.Tensor:
-        B, T, _ = obs_seq.shape
-        xf = self.extract_features(obs_seq.view(-1, obs_seq.shape[-1]))
-        xf = xf.view(B, T, -1)  # (batch, seq_len, feat)
+        # obs_seq: (B, T, D)
+        xf = self.input_proj(obs_seq)  # (B, T, H)
         _, (h_n, _) = self.lstm(xf)
-        return h_n[-1]  # 마지막 레이어의 마지막 히든 상태
+        return h_n[-1]  # (B, H)
 
-    @th.no_grad()
+    def forward(self, obs_seq: th.Tensor):
+        z = self.extract_lstm_features(obs_seq)  # (B, H)
+        logits = self.policy_net(z)              # (B, action_dim)
+        value = self.value_net(z).squeeze(-1)    # (B,)
+        return logits, value
+
+    def get_action(self, obs_seq: th.Tensor, deterministic=False, action_mask: th.Tensor | None = None):
+        logits, value = self.forward(obs_seq)  # (B, action_dim), (B,)
+        if action_mask is not None:
+            logits = logits.masked_fill(~action_mask.bool(), float("-inf"))
+        dist = th.distributions.Categorical(logits=logits)
+        action = dist.probs.argmax(dim=-1) if deterministic else dist.sample()
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        return action, log_prob, entropy, value
+
     def compute_trend_logits(self, obs_seq: th.Tensor) -> th.Tensor:
-        z = self.extract_lstm_features(obs_seq)
-        return self.trend_head(z)
+        with th.no_grad():
+            z = self.extract_lstm_features(obs_seq)
+            return self.trend_head(z)
 
-    def aux_loss(self, obs_seq: th.Tensor, labels_4h: th.Tensor) -> th.Tensor:
+    def aux_loss(self, obs_seq: th.Tensor, labels: th.Tensor) -> th.Tensor:
         z = self.extract_lstm_features(obs_seq)
         if self.freeze_backbone_for_aux:
             z = z.detach()
         logits = self.trend_head(z)
-        return F.cross_entropy(logits, labels_4h)
+        return F.cross_entropy(logits, labels)
 
-    def aux_train_step(self, obs_seq: th.Tensor, labels_4h: th.Tensor,
+    def aux_train_step(self, obs_seq: th.Tensor, labels: th.Tensor,
                        coeff: float | None = None, max_grad_norm: float = 1.0) -> float:
         self.trend_head.train(True)
-        loss = self.aux_loss(obs_seq, labels_4h)
+        loss = self.aux_loss(obs_seq, labels)
         scale = self.aux_coeff if coeff is None else coeff
         self.aux_optimizer.zero_grad(set_to_none=True)
         (scale * loss).backward()
@@ -72,13 +111,3 @@ class MultiHeadLSTMPolicy(MaskableActorCriticPolicy):
             nn.utils.clip_grad_norm_(self.trend_head.parameters(), max_grad_norm)
         self.aux_optimizer.step()
         return float((scale * loss).detach().item())
-
-    def forward(self, obs: th.Tensor, deterministic=False, action_masks=None):
-        # 입력: (batch, seq_len, feat_dim) 형태 가정
-        features = self.extract_lstm_features(obs)
-        policy_latent, value_latent = self.mlp_extractor(features)
-        distribution = self._get_action_dist_from_latent(policy_latent, action_masks=action_masks)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        value = self.value_net(value_latent)
-        return actions, value, log_prob

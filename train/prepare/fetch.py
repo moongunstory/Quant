@@ -118,19 +118,6 @@ def _warn_if_irregular(df: pd.DataFrame, itv: str, sym: str) -> pd.DatetimeIndex
         print(f"    [warn] {sym} {itv}: missing bars = {len(missing)} (e.g., {missing[0]})")
     return full
 
-def _find_global_cuts_by_eth5m(start_ms: int, end_ms: int):
-    print("  - ETHUSDT 5m fetching for global cuts...")
-    df5 = _fetch("ETHUSDT", "5m", start_ms, end_ms)
-    if df5.empty:
-        print("    [warn] no ETHUSDT 5m data; fallback to per-interval split")
-        return None, None
-    n = len(df5)
-    i1 = max(int(n * SPLIT[0]) - 1, 0)
-    i2 = max(int(n * (SPLIT[0] + SPLIT[1])) - 1, 0)
-    t1, t2 = df5.index[i1], df5.index[i2]
-    print(f"    [ok] global cut times (UTC): t1={t1}, t2={t2}")
-    return (t1, t2), df5
-
 def _split_by_cuts(df, t1, t2):
     if df.empty:
         return df, df, df
@@ -139,24 +126,12 @@ def _split_by_cuts(df, t1, t2):
     test = df.loc[t2:].iloc[1:]
     return train, val, test
 
-def _split(df: pd.DataFrame, a: float, b: float, c: float):
-    n = len(df)
-    if n == 0:
-        return df, df, df
-    idx = df.index
-    i1 = max(int(n * a) - 1, 0)
-    i2 = max(int(n * (a + b)) - 1, 0)
-    train = df.loc[:idx[i1]]
-    val = df.loc[idx[i1]:idx[i2]].iloc[1:] if n > 1 else df.iloc[0:0]
-    test = df.loc[idx[i2]:].iloc[1:] if n > 2 else df.iloc[0:0]
-    return train, val, test
-
 def _attach_funding(df: pd.DataFrame, fr: Optional[pd.Series]) -> pd.DataFrame:
     if fr is not None and not df.empty:
-        fr.name = "FundingRate"  # <- 🔧 이름 직접 지정해서 rename() 피함
+        fr.name = "FundingRate"
         merged = pd.merge_asof(
             df.sort_index(),
-            fr.sort_index().to_frame(),  # <- 🔧 Series를 DataFrame으로 변환
+            fr.sort_index().to_frame(),
             left_index=True,
             right_index=True,
             direction="backward",
@@ -181,22 +156,72 @@ def main():
     end_ms = _to_ms(end_date)
     print(f"Ingest {SYMBOLS} | {START_DATE} → {end_date} (UTC)")
 
-    global_cuts, df5_eth = _find_global_cuts_by_eth5m(start_ms, end_ms)
-
+    # 1. Fetch all data first
+    print("=== Step 1: Fetching all data... ===")
+    all_dfs = {}
     for sym in SYMBOLS:
-        print(f"\n=== {sym} ===")
-        print("  - FundingRate fetching...")
-        df_fund = _fetch_funding_rates(sym, start_ms, end_ms)
-        fr = df_fund["fundingRate"] if not df_fund.empty and "fundingRate" in df_fund.columns else None
+        all_dfs[sym] = {}
         intervals = INTERVALS_PER_SYMBOL.get(sym, [])
         for itv in intervals:
-            print(f"  - {sym} {itv} fetching...")
-            if sym == "ETHUSDT" and itv == "5m" and df5_eth is not None and not df5_eth.empty:
-                df = df5_eth.copy()
-            else:
-                df = _fetch(sym, itv, start_ms, end_ms)
+            print(f"  - Fetching {sym} {itv}...")
+            df = _fetch(sym, itv, start_ms, end_ms)
             if df.empty:
-                print("    [skip] no data")
+                print(f"    [warn] No data for {sym} {itv}, it will be skipped.")
+            all_dfs[sym][itv] = df
+
+    # 2. Find common date range
+    print("=== Step 2: Finding common date range... ===")
+    max_start = None
+    min_end = None
+    for sym in all_dfs:
+        for itv in all_dfs[sym]:
+            df = all_dfs[sym][itv]
+            if not df.empty:
+                if max_start is None or df.index.min() > max_start:
+                    max_start = df.index.min()
+                if min_end is None or df.index.max() < min_end:
+                    min_end = df.index.max()
+    
+    if max_start is None or min_end is None or max_start >= min_end:
+        raise ValueError("No overlapping data found across all symbols and intervals.")
+    
+    print(f"  - Common range found: {max_start} to {min_end}")
+
+    # 3. Trim all dataframes to common range and calculate global cuts
+    print("=== Step 3: Trimming data and calculating split points... ===")
+    trimmed_dfs = {}
+    global_cuts = None
+    for sym in all_dfs:
+        trimmed_dfs[sym] = {}
+        for itv in all_dfs[sym]:
+            if not all_dfs[sym][itv].empty:
+                trimmed_df = all_dfs[sym][itv].loc[max_start:min_end]
+                trimmed_dfs[sym][itv] = trimmed_df
+                
+                if sym == "ETHUSDT" and itv == "5m":
+                    n = len(trimmed_df)
+                    i1 = max(int(n * SPLIT[0]) - 1, 0)
+                    i2 = max(int(n * (SPLIT[0] + SPLIT[1])) - 1, 0)
+                    t1, t2 = trimmed_df.index[i1], trimmed_df.index[i2]
+                    global_cuts = (t1, t2)
+                    print(f"  - Global cut times (UTC): t1={t1}, t2={t2}")
+
+    if global_cuts is None:
+        raise ValueError("Could not determine global cuts. ETHUSDT 5m data might be missing in the common range.")
+
+    # 4. Attach funding, split, and save
+    print("=== Step 4: Processing and saving splits... ===")
+    for sym in trimmed_dfs:
+        print(f"--- Processing {sym} ---")
+        print("  - FundingRate fetching...")
+        df_fund = _fetch_funding_rates(sym, int(max_start.timestamp()*1000), int(min_end.timestamp()*1000))
+        fr = df_fund["fundingRate"] if not df_fund.empty else None
+
+        for itv in trimmed_dfs[sym]:
+            print(f"  - Processing {sym} {itv}...")
+            df = trimmed_dfs[sym][itv]
+            if df.empty:
+                print("    [skip] no data in common range")
                 continue
 
             full_index = _warn_if_irregular(df, itv, sym)
@@ -204,11 +229,8 @@ def main():
                 df = df.reindex(full_index).sort_index()
 
             df = _attach_funding(df, fr)
-
-            if global_cuts is not None:
-                train, val, test = _split_by_cuts(df, *global_cuts)
-            else:
-                train, val, test = _split(df, *SPLIT)
+            
+            train, val, test = _split_by_cuts(df, *global_cuts)
 
             out_dir = os.path.join(OUT_DIR, sym.lower())
             _ensure_dir(out_dir)
@@ -217,7 +239,7 @@ def main():
                 part.to_parquet(path)
                 print(f"    [ok] {name}: {len(part):,} → {path}")
 
-    print("\nDone.")
+    print("Done.")
 
 if __name__ == "__main__":
     main()
