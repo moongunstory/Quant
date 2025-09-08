@@ -4,7 +4,7 @@ import torch as th
 
 def compute_gae(buffer, gamma=0.99, lam=0.95):
     rewards = buffer.rewards
-    values = buffer.values.cpu().tolist()
+    values = th.tensor(buffer.values, dtype=th.float32, device=buffer.device)  
     dones = buffer.dones
 
     returns = []
