@@ -19,12 +19,7 @@ def _load_all_timeframes(split: str) -> Dict[str, pd.DataFrame]:
     for tf in ETH_TFS:
         path = os.path.join(DATA_DIR, f"feHPO_{split}_{tf}.parquet")
         if os.path.exists(path):
-            # Ensure all feature columns are included, assuming they start with 'f_'
-            temp_df = pd.read_parquet(path)
-            feature_cols = [c for c in temp_df.columns if c.startswith('f_')]
-            # Also include reference columns needed for env
-            ref_cols = [c for c in ["price_close", "FundingRate"] if c in temp_df.columns]
-            dfs[tf] = temp_df[feature_cols + ref_cols]
+            dfs[tf] = pd.read_parquet(path)
         else:
             print(f"[warn] Data file not found for {tf} in split {split}, skipping: {path}")
     return dfs
@@ -74,8 +69,8 @@ def run_hpo(
         th.manual_seed(seed)
 
         # The env now takes a dictionary of dataframes.
-        env = MultiTimeframeTradingEnv(tf_train, price_col="price_close")
-        eval_env = MultiTimeframeTradingEnv(tf_val, price_col="price_close")
+        env = MultiTimeframeTradingEnv(tf_train, price_col="Close")
+        eval_env = MultiTimeframeTradingEnv(tf_val, price_col="Close")
 
         # The policy now needs a dictionary of observation dimensions.
         policy = MultiTimeframeLSTMPolicy(

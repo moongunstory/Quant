@@ -57,7 +57,7 @@ class MultiTimeframeTradingEnv(gym.Env):
             tf: df.loc[self.common_index].copy() for tf, df in tf_data.items()
         }
 
-        self.price_col = price_col or "price_close"
+        self.price_col = price_col or "Close"
         self.price_df = self.tf_data["5m"]  # base for price and step
         self.obs_buffers = {
             tf: deque(maxlen=self.seq_lens[tf]) for tf in self.tfs
