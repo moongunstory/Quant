@@ -1,22 +1,22 @@
-# buffer.py
-
 import numpy as np
 import torch as th
 
 class RolloutBuffer:
-    def __init__(self, buffer_size: int, obs_shape, device='cpu'):
+    def __init__(self, buffer_size: int, obs_space, device='cpu'):
         self.buffer_size = buffer_size
         self.device = device
-        self.obs = []
+        self.obs = {tf: [] for tf in obs_space.spaces}
         self.actions = []
         self.log_probs = []
         self.rewards = []
         self.values = []
         self.dones = []
         self.infos = []
+        self._is_tensorized = False
 
-    def add(self, obs, action, reward, done, log_prob, value, info=None):
-        self.obs.append(obs)
+    def add(self, obs: dict, action, reward, done, log_prob, value, info=None):
+        for tf in obs:
+            self.obs[tf].append(obs[tf])
         self.actions.append(action)
         self.rewards.append(reward)
         self.dones.append(done)
@@ -38,18 +38,21 @@ class RolloutBuffer:
         # Convert to tensors
         self.returns = th.tensor(self.returns, dtype=th.float32, device=self.device)
         self.advantages = th.tensor(self.advantages, dtype=th.float32, device=self.device)
-        self.obs = th.tensor(np.array(self.obs), dtype=th.float32, device=self.device)
+        for tf in self.obs:
+            self.obs[tf] = th.tensor(np.array(self.obs[tf]), dtype=th.float32, device=self.device)
         self.actions = th.tensor(self.actions, dtype=th.int64, device=self.device)
         self.log_probs = th.tensor(self.log_probs, dtype=th.float32, device=self.device)
         self.values = th.tensor(self.values, dtype=th.float32, device=self.device)
+        self._is_tensorized = True
 
     def get_batches(self, batch_size: int):
+        assert self._is_tensorized, "Call compute_returns_and_advantages() before batching"
         idxs = np.arange(len(self.rewards))
         np.random.shuffle(idxs)
         for start in range(0, len(self.rewards), batch_size):
             batch_idx = idxs[start:start + batch_size]
             yield {
-                "obs": self.obs[batch_idx],
+                "obs": {tf: self.obs[tf][batch_idx] for tf in self.obs},
                 "actions": self.actions[batch_idx],
                 "log_probs": self.log_probs[batch_idx],
                 "values": self.values[batch_idx],
@@ -58,10 +61,12 @@ class RolloutBuffer:
             }
 
     def clear(self):
-        self.obs.clear()
+        for tf in self.obs:
+            self.obs[tf].clear()
         self.actions.clear()
         self.log_probs.clear()
         self.rewards.clear()
         self.values.clear()
         self.dones.clear()
         self.infos.clear()
+        self._is_tensorized = False

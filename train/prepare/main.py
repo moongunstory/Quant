@@ -71,9 +71,19 @@ def main():
             final_df.to_parquet(out_path)
             print(f"    [ok] Saved HPO {split}/{tf}: {len(final_df):,} rows")
 
-    print("\n[3.5/4] Saving BTC 1h features...")
+    # Get the aligned indices from the processed 1h ETH data
+    eth_1h_indices = {
+        split: features[split]['1h'].index for split in ["train", "val", "test"]
+    }
+
+    print("\n[3.5/4] Saving BTC 1h features (aligned with ETH 1h)...")
     for split in ["train", "val", "test"]:
         df = btc_data[split]
+
+        # Align BTC index with the corresponding processed ETH 1h index
+        aligned_index = eth_1h_indices[split]
+        df = df[df.index.isin(aligned_index)]
+
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         df_numeric = df[numeric_cols].copy()
         scaler = StandardScaler().fit(df_numeric.astype(float))
@@ -85,7 +95,7 @@ def main():
 
     print("\n[4/4] Checking std consistency...")
     check_zero_std_consistency(features)
-    print("[✓] All complete.")
+    print("[ok] All complete.")
 
 if __name__ == "__main__":
     main()

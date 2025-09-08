@@ -1,13 +1,13 @@
-# train/prepare/feature_engineering.py
-
 import warnings
 import pandas as pd
 import numpy as np
 from itertools import combinations
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
 from sklearn.feature_selection import mutual_info_classif
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tools.tools import add_constant
+
 
 def zscore(s: pd.Series, win: Optional[int] = None) -> pd.Series:
     if win is None:
@@ -17,38 +17,89 @@ def zscore(s: pd.Series, win: Optional[int] = None) -> pd.Series:
     sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
     return ((s - mu) / sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-def generate_feature_combinations(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
-    df = df.copy()
-    new_feats = {}
 
-    numeric_cols = df.select_dtypes(include=["float", "float32", "float64", "int"]).columns.tolist()
+# === 개선된 HPO 방식: 피처 조합 정의 ===
+def get_feature_specs_for_tf(tf: str) -> List[Tuple[str, str]]:
+    """
+    타임프레임별 사용할 피처 정의
+    각 튜플은 (피처타입, 컬럼명 또는 조합명)
+    """
+    numeric_cols = {
+        "5m": ["Close", "Volume", "rsi_14", "macd", "ema_20", "adx_14", "bb_mid"],
+        "15m": ["Close", "Volume", "rsi_14", "macd", "ema_20", "adx_14", "bb_mid"],
+        "1h": ["Close", "Volume", "rsi_14", "macd", "ema_60", "adx_14", "atr_14"],
+        "4h": ["Close", "Volume", "rsi_14", "macd", "ema_120", "adx_14", "atr_14"]
+    }.get(tf, [])
+
+    specs = []
+    for col in numeric_cols:
+        specs.extend([
+            ("sq", col),
+            ("log", col),
+            ("zscore", col),
+            ("cond_gt0", col),
+            ("cond_lt0", col),
+            ("cond_gt70", col),
+            ("cond_lt30", col),
+        ])
 
     for col1, col2 in combinations(numeric_cols, 2):
+        specs.extend([
+            ("diff", f"{col1}__{col2}"),
+            ("ratio", f"{col1}__{col2}"),
+            ("mul", f"{col1}__{col2}"),
+        ])
+    return specs
+
+
+def generate_feature(df: pd.DataFrame, spec: Tuple[str, str]) -> Tuple[str, pd.Series]:
+    """
+    개별 피처 생성기
+    """
+    kind, arg = spec
+
+    if kind in ["diff", "ratio", "mul"]:
+        col1, col2 = arg.split("__")
         s1, s2 = df[col1], df[col2]
+        if kind == "diff":
+            name = f"f_diff_{col1}_{col2}"
+            return name, (s1 - s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        elif kind == "ratio":
+            name = f"f_ratio_{col1}_{col2}"
+            return name, (s1 / (s2 + 1e-9)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        elif kind == "mul":
+            name = f"f_mul_{col1}_{col2}"
+            return name, (s1 * s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-        new_feats[f"f_diff_{col1}_{col2}"] = (s1 - s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        new_feats[f"f_ratio_{col1}_{col2}"] = (s1 / (s2 + 1e-9)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        new_feats[f"f_mul_{col1}_{col2}"] = (s1 * s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    for col in numeric_cols:
+    else:
+        col = arg
         s = df[col]
-        new_feats[f"f_sq_{col}"] = (s ** 2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        new_feats[f"f_log_{col}"] = np.log1p(np.abs(s)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        new_feats[f"f_zscore_{col}"] = zscore(s)
+        if kind == "sq":
+            name = f"f_sq_{col}"
+            return name, (s ** 2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        elif kind == "log":
+            name = f"f_log_{col}"
+            return name, np.log1p(np.abs(s)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        elif kind == "zscore":
+            name = f"f_zscore_{col}"
+            return name, zscore(s)
+        elif kind == "cond_gt0":
+            name = f"f_cond_{col}_gt0"
+            return name, (s > 0).astype(float)
+        elif kind == "cond_lt0":
+            name = f"f_cond_{col}_lt0"
+            return name, (s < 0).astype(float)
+        elif kind == "cond_gt70":
+            name = f"f_cond_{col}_gt70"
+            return name, (s > 70).astype(float)
+        elif kind == "cond_lt30":
+            name = f"f_cond_{col}_lt30"
+            return name, (s < 30).astype(float)
 
-        # 조건 피처는 조건 만족할 때만 생성
-        if s.max() > 70:
-            new_feats[f"f_cond_{col}_gt70"] = (s > 70).astype(float)
-        if s.min() < 30:
-            new_feats[f"f_cond_{col}_lt30"] = (s < 30).astype(float)
-        new_feats[f"f_cond_{col}_gt0"] = (s > 0).astype(float)
-        new_feats[f"f_cond_{col}_lt0"] = (s < 0).astype(float)
+    raise ValueError(f"Unknown feature spec: {spec}")
 
-    new_feat_df = pd.concat([pd.Series(v, name=k, index=df.index) for k, v in new_feats.items()], axis=1)
-    result_df = pd.concat([df, new_feat_df], axis=1)
 
-    return result_df, list(new_feat_df.columns)
-
+# === 선택된 피처 필터링 ===
 def filter_features(df: pd.DataFrame, target: pd.Series, top_k: int = 300, vif_thresh: float = 10.0) -> pd.DataFrame:
     df = df.copy()
     features = [c for c in df.columns if c.startswith("f_")]
@@ -65,7 +116,6 @@ def filter_features(df: pd.DataFrame, target: pd.Series, top_k: int = 300, vif_t
     X_const = add_constant(X)
     keep_cols = X.columns.tolist()
 
-    # ⚠️ VIF 계산 중 divide by zero 경고 억제
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
 

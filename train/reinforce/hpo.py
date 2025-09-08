@@ -4,67 +4,30 @@ import random
 import numpy as np
 import torch as th
 import pandas as pd
-from env import TradingEnv
-from policy import MultiHeadLSTMPolicy
+from typing import Dict
+
+from env import MultiTimeframeTradingEnv
+from policy import MultiTimeframeLSTMPolicy
 from ppo import train_with_config
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed"))
 ETH_TFS = ["5m", "15m", "1h", "4h"]
-BTC_TF = "btc1h"
 
-def _load_split(split: str) -> pd.DataFrame:
-    """
-    ETH 4개 타임프레임 + BTC 1h 데이터를 로드하여 병합.
-    가장 빈번한 5m 데이터를 기준으로, 낮은 빈도의 데이터를 `merge_asof`로 병합합니다.
-    """
-    # 기준이 되는 5분봉 데이터 로드
-    base_tf = "5m"
-    base_path = os.path.join(DATA_DIR, f"feHPO_{split}_{base_tf}.parquet")
-    if not os.path.exists(base_path):
-        raise FileNotFoundError(f"Base data file not found for {split} at {base_path}")
-
-    df_all = pd.read_parquet(base_path)
-    # merge_asof를 위해 인덱스를 datetime으로 변환하고 정렬
-    if not pd.api.types.is_datetime64_any_dtype(df_all.index):
-        df_all.index = pd.to_datetime(df_all.index)
-    df_all.sort_index(inplace=True)
-
-    # 병합할 나머지 타임프레임 목록 (타임프레임, 접두사)
-    tfs_to_merge = [
-        ("15m", "f_15m_"),
-        ("1h", "f_1h_"),
-        ("4h", "f_4h_"),
-        (BTC_TF, "btc_"),
-    ]
-
-    for tf, prefix in tfs_to_merge:
+def _load_all_timeframes(split: str) -> Dict[str, pd.DataFrame]:
+    """Loads all processed ETH dataframes for a given split into a dictionary."""
+    dfs = {}
+    for tf in ETH_TFS:
         path = os.path.join(DATA_DIR, f"feHPO_{split}_{tf}.parquet")
         if os.path.exists(path):
-            df_other = pd.read_parquet(path)
-            if not pd.api.types.is_datetime64_any_dtype(df_other.index):
-                df_other.index = pd.to_datetime(df_other.index)
-            df_other.sort_index(inplace=True)
-            
-            df_other = df_other.add_prefix(prefix)
-
-            df_all = pd.merge_asof(
-                df_all, df_other, left_index=True, right_index=True, direction="backward"
-            )
+            # Ensure all feature columns are included, assuming they start with 'f_'
+            temp_df = pd.read_parquet(path)
+            feature_cols = [c for c in temp_df.columns if c.startswith('f_')]
+            # Also include reference columns needed for env
+            ref_cols = [c for c in ["price_close", "FundingRate"] if c in temp_df.columns]
+            dfs[tf] = temp_df[feature_cols + ref_cols]
         else:
-            print(f"[warn] Missing data file for {tf} ({split})")
-
-    # merge_asof로 생긴 시작 부분의 NaN 값들을 이전 값으로 채웁니다.
-    df_all.fillna(method='ffill', inplace=True)
-    # 그래도 맨 처음에 남은 NaN이 있다면 해당 row들은 제거합니다.
-    df_all.dropna(inplace=True)
-
-
-    if df_all.empty:
-        print("[warn] DataFrame is empty after merging and filling. The data files likely do not overlap in time.")
-
-    return df_all.copy()
-
-
+            print(f"[warn] Data file not found for {tf} in split {split}, skipping: {path}")
+    return dfs
 
 def run_hpo(
     save_path: str = "best_candidate.json",
@@ -74,7 +37,7 @@ def run_hpo(
     seed: int = 42,
 ) -> dict:
     """
-    다양한 하이퍼파라미터 설정을 테스트하여 최적 config를 찾는 HPO 실행 함수.
+    Runs Hyperparameter Optimization.
     """
     search_space = [
         {
@@ -89,11 +52,15 @@ def run_hpo(
         for h in [128, 256]
     ]
 
-    df_train = _load_split(train_tag)
-    df_val = _load_split(val_tag)
+    tf_train = _load_all_timeframes(train_tag)
+    tf_val = _load_all_timeframes(val_tag)
 
-    obs_cols = [c for c in df_train.columns if c.startswith("f_") or c.startswith("btc_")]
-    print(f"[HPO] feature_dim = {len(obs_cols)}")
+    if not tf_train or not tf_val:
+        raise ValueError("Could not load training or validation data. Please run prepare scripts.")
+
+    # The policy needs to know the observation dimension for each timeframe.
+    obs_dims = {tf: df.shape[1] for tf, df in tf_train.items()}
+    print(f"[HPO] obs_dims = {obs_dims}")
 
     best_score = -np.inf
     best_config = None
@@ -106,18 +73,19 @@ def run_hpo(
         np.random.seed(seed)
         th.manual_seed(seed)
 
-        env = TradingEnv(df_train, obs_cols=obs_cols)
-        eval_env = TradingEnv(df_val, obs_cols=obs_cols)
+        # The env now takes a dictionary of dataframes.
+        env = MultiTimeframeTradingEnv(tf_train, price_col="price_close")
+        eval_env = MultiTimeframeTradingEnv(tf_val, price_col="price_close")
 
-        policy = MultiHeadLSTMPolicy(
-            obs_dim=len(obs_cols),
-            seq_len=24,
-            action_dim=4,
+        # The policy now needs a dictionary of observation dimensions.
+        policy = MultiTimeframeLSTMPolicy(
+            obs_dims=obs_dims,
+            action_dim=env.action_space.n,
             trend_dim=3,
             aux_coeff=0.1,
             lstm_hidden_dim=128,
             num_lstm_layers=1,
-            mlp_hidden_dims=tuple(config["net_arch"] + [64]),  # [128] → (128, 64) 형태로 변환
+            mlp_hidden_dims=tuple(config["net_arch"] + [64]),
             device="cuda" if th.cuda.is_available() else "cpu"
         )
 
@@ -148,6 +116,9 @@ def run_hpo(
             best_config = config
 
     print(f"\n✅ Best Config: {best_config} (Sharpe={best_score:.4f})")
+
+    # Save features for main training
+    best_config["features"] = {tf: list(df.columns) for tf, df in tf_train.items()}
 
     out = {
         "best_config": best_config,

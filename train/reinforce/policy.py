@@ -3,11 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class MultiHeadLSTMPolicy(nn.Module):
+class MultiTimeframeLSTMPolicy(nn.Module):
     def __init__(
         self,
         obs_dim: int,
-        seq_len: int,
         action_dim: int,
         trend_dim: int = 3,
         aux_coeff: float = 0.1,
@@ -20,44 +19,44 @@ class MultiHeadLSTMPolicy(nn.Module):
     ):
         super().__init__()
         self.device = device
-        self.obs_dim = obs_dim
-        self.seq_len = seq_len
-        self.action_dim = action_dim
         self.aux_coeff = aux_coeff
         self.freeze_backbone_for_aux = freeze_backbone_for_aux
 
-        # 1. input projection → LSTM input
-        self.input_proj = nn.Linear(obs_dim, lstm_hidden_dim)
+        self.timeframes = ["5m", "15m", "1h", "4h"]
+        self.lstm_hidden_dim = lstm_hidden_dim
 
-        # 2. LSTM encoder
-        self.lstm = nn.LSTM(
-            input_size=lstm_hidden_dim,
-            hidden_size=lstm_hidden_dim,
-            num_layers=num_lstm_layers,
-            batch_first=True,
-        )
+        # Projections + LSTMs per timeframe
+        self.projs = nn.ModuleDict({
+            tf: nn.Linear(obs_dim, lstm_hidden_dim) for tf in self.timeframes
+        })
+        self.lstms = nn.ModuleDict({
+            tf: nn.LSTM(lstm_hidden_dim, lstm_hidden_dim, num_layers=num_lstm_layers, batch_first=True)
+            for tf in self.timeframes
+        })
 
-        # 3. MLP for policy
+        fusion_dim = lstm_hidden_dim * len(self.timeframes)
+
+        # Policy network
         self.policy_net = nn.Sequential(
-            nn.Linear(lstm_hidden_dim, mlp_hidden_dims[0]),
+            nn.Linear(fusion_dim, mlp_hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(mlp_hidden_dims[0], mlp_hidden_dims[1]),
             nn.ReLU(),
             nn.Linear(mlp_hidden_dims[1], action_dim),
         )
 
-        # 4. MLP for value function
+        # Value network
         self.value_net = nn.Sequential(
-            nn.Linear(lstm_hidden_dim, mlp_hidden_dims[0]),
+            nn.Linear(fusion_dim, mlp_hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(mlp_hidden_dims[0], mlp_hidden_dims[1]),
             nn.ReLU(),
             nn.Linear(mlp_hidden_dims[1], 1),
         )
 
-        # 5. Trend head (auxiliary task)
+        # Trend head uses only 1h and 4h features
         self.trend_head = nn.Sequential(
-            nn.Linear(lstm_hidden_dim, 128),
+            nn.Linear(lstm_hidden_dim * 2, 128),
             nn.ReLU(),
             nn.Linear(128, trend_dim),
         )
@@ -66,20 +65,26 @@ class MultiHeadLSTMPolicy(nn.Module):
 
         self.to(self.device)
 
-    def extract_lstm_features(self, obs_seq: th.Tensor) -> th.Tensor:
-        # obs_seq: (B, T, D)
-        xf = self.input_proj(obs_seq)  # (B, T, H)
-        _, (h_n, _) = self.lstm(xf)
+    def encode(self, x: th.Tensor, tf: str) -> th.Tensor:
+        x_proj = self.projs[tf](x)
+        _, (h_n, _) = self.lstms[tf](x_proj)
         return h_n[-1]  # (B, H)
 
-    def forward(self, obs_seq: th.Tensor):
-        z = self.extract_lstm_features(obs_seq)  # (B, H)
-        logits = self.policy_net(z)              # (B, action_dim)
-        value = self.value_net(z).squeeze(-1)    # (B,)
+    def forward(self, obs_5m, obs_15m, obs_1h, obs_4h):
+        # Encode all timeframes
+        feats = {
+            tf: self.encode(eval(f"obs_{tf}"), tf)
+            for tf in self.timeframes
+        }
+
+        # Combine all features for policy/value
+        z = th.cat([feats[tf] for tf in self.timeframes], dim=-1)  # (B, H*4)
+        logits = self.policy_net(z)
+        value = self.value_net(z).squeeze(-1)
         return logits, value
 
-    def get_action(self, obs_seq: th.Tensor, deterministic=False, action_mask: th.Tensor | None = None):
-        logits, value = self.forward(obs_seq)  # (B, action_dim), (B,)
+    def get_action(self, obs_5m, obs_15m, obs_1h, obs_4h, deterministic=False, action_mask=None):
+        logits, value = self.forward(obs_5m, obs_15m, obs_1h, obs_4h)
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask.bool(), float("-inf"))
         dist = th.distributions.Categorical(logits=logits)
@@ -88,22 +93,25 @@ class MultiHeadLSTMPolicy(nn.Module):
         entropy = dist.entropy()
         return action, log_prob, entropy, value
 
-    def compute_trend_logits(self, obs_seq: th.Tensor) -> th.Tensor:
+    def compute_trend_logits(self, obs_1h, obs_4h):
         with th.no_grad():
-            z = self.extract_lstm_features(obs_seq)
+            z_1h = self.encode(obs_1h, "1h")
+            z_4h = self.encode(obs_4h, "4h")
+            z = th.cat([z_1h, z_4h], dim=-1)
             return self.trend_head(z)
 
-    def aux_loss(self, obs_seq: th.Tensor, labels: th.Tensor) -> th.Tensor:
-        z = self.extract_lstm_features(obs_seq)
+    def aux_loss(self, obs_1h, obs_4h, labels):
+        z_1h = self.encode(obs_1h, "1h")
+        z_4h = self.encode(obs_4h, "4h")
+        z = th.cat([z_1h, z_4h], dim=-1)
         if self.freeze_backbone_for_aux:
             z = z.detach()
         logits = self.trend_head(z)
         return F.cross_entropy(logits, labels)
 
-    def aux_train_step(self, obs_seq: th.Tensor, labels: th.Tensor,
-                       coeff: float | None = None, max_grad_norm: float = 1.0) -> float:
+    def aux_train_step(self, obs_1h, obs_4h, labels, coeff=None, max_grad_norm=1.0):
         self.trend_head.train(True)
-        loss = self.aux_loss(obs_seq, labels)
+        loss = self.aux_loss(obs_1h, obs_4h, labels)
         scale = self.aux_coeff if coeff is None else coeff
         self.aux_optimizer.zero_grad(set_to_none=True)
         (scale * loss).backward()

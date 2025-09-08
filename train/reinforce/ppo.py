@@ -23,12 +23,16 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
 
     for step in range(0, train_steps, rollout_steps):
         for _ in range(rollout_steps):
-            obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
+            obs_tensor = {
+                tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
+                for tf in obs
+            }
             action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)
 
-            action, log_prob, entropy, value = policy.get_action(obs_tensor, action_mask=action_mask)
+            action, log_prob, entropy, value = policy.get_action(**obs_tensor, action_mask=action_mask)
 
             next_obs, reward, done, truncated, info = env.step(action.item())
+
             buffer.add(obs, action.item(), reward, done, log_prob.item(), value.item(), info)
 
             obs = next_obs
@@ -42,9 +46,10 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
                 ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef)
 
         if hasattr(policy, "aux_train_step"):
-            obs_tensor = th.tensor(np.array([b.obs for b in buffer.buffer]), dtype=th.float32, device=device)
+            obs_1h = th.stack([th.tensor(b.obs["1h"], dtype=th.float32, device=device) for b in buffer.buffer])
+            obs_4h = th.stack([th.tensor(b.obs["4h"], dtype=th.float32, device=device) for b in buffer.buffer])
             labels = th.tensor([info.get("trend_label", 1) for info in buffer.infos], dtype=th.long, device=device)
-            policy.aux_train_step(obs_tensor, labels)
+            policy.aux_train_step(obs_1h, obs_4h, labels)
 
         buffer.clear()
 
@@ -60,7 +65,11 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef):
     returns = batch["returns"]
     values = batch["values"]
 
-    logits, new_values = policy.forward(obs)
+    obs_inputs = {
+        tf: obs[tf].to(policy.device) for tf in obs
+    }
+
+    logits, new_values = policy.forward(**obs_inputs)
     dist = th.distributions.Categorical(logits=logits)
     new_log_probs = dist.log_prob(actions)
     entropy = dist.entropy()
@@ -84,9 +93,13 @@ def evaluate(env, policy, n_steps=288) -> tuple:
     initial_eq = env.portfolio.initial_equity
 
     for _ in range(n_steps):
-        obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
+        obs_tensor = {
+            tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
+            for tf in obs
+        }
         action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)
-        action, _, _, _ = policy.get_action(obs_tensor, deterministic=True, action_mask=action_mask)
+
+        action, _, _, _ = policy.get_action(**obs_tensor, deterministic=True, action_mask=action_mask)
 
         obs, reward, done, truncated, info = env.step(action.item())
 
