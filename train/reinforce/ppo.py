@@ -24,7 +24,7 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
     for step in range(0, train_steps, rollout_steps):
         for _ in range(rollout_steps):
             obs_tensor = {
-                tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
+                f"obs_{tf}": th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
                 for tf in obs
             }
             action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)

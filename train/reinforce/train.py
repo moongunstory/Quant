@@ -49,7 +49,7 @@ def main():
 
     # 5. 정책 생성
     policy = MultiTimeframeLSTMPolicy(
-        obs_dim=obs_dim["5m"],
+        obs_dims=obs_dim,
         action_dim=4,
         trend_dim=3,
         aux_coeff=0.1,
