@@ -49,7 +49,8 @@ def main():
         val_df = features["val"][tf]
         test_df = features["test"][tf]
 
-        base_feats = [c for c in tr_df.columns if c.startswith("f_")]
+        raw_cols = ["Open", "High", "Low", "Close", "Volume"]  # 또는 실제 사용 중인 컬럼명으로
+        base_feats = raw_cols + [c for c in tr_df.columns if c.startswith("f_")]
         common_feats = [f for f in base_feats if f in val_df.columns and f in test_df.columns]
 
         filtered_df = filter_features(tr_df[common_feats], target=tr_df["y_class"], top_k=300, vif_thresh=10.0)

@@ -53,9 +53,13 @@ def run_hpo(
     if not tf_train or not tf_val:
         raise ValueError("Could not load training or validation data. Please run prepare scripts.")
 
-    # The policy needs to know the observation dimension for each timeframe.
-    obs_dims = {tf: df.shape[1] for tf, df in tf_train.items()}
-    print(f"[HPO] obs_dims = {obs_dims}")
+    # 1. 환경 먼저 생성
+    env = MultiTimeframeTradingEnv(tf_train, price_col="Close")
+
+    # 2. 실제 obs 기준으로 obs_dims 자동 결정
+    sample_obs, _ = env.reset()
+    obs_dims = {tf: sample_obs[tf].shape[1] for tf in sample_obs}
+    print(f"[HPO] Fixed obs_dims = {obs_dims}")
 
     best_score = -np.inf
     best_config = None
