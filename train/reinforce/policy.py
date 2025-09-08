@@ -1,12 +1,12 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Dict
 
 class MultiTimeframeLSTMPolicy(nn.Module):
     def __init__(
         self,
-        obs_dim: int,
+        obs_dims: Dict[str, int],
         action_dim: int,
         trend_dim: int = 3,
         aux_coeff: float = 0.1,
@@ -22,12 +22,12 @@ class MultiTimeframeLSTMPolicy(nn.Module):
         self.aux_coeff = aux_coeff
         self.freeze_backbone_for_aux = freeze_backbone_for_aux
 
-        self.timeframes = ["5m", "15m", "1h", "4h"]
+        self.timeframes = list(obs_dims.keys())
         self.lstm_hidden_dim = lstm_hidden_dim
 
         # Projections + LSTMs per timeframe
         self.projs = nn.ModuleDict({
-            tf: nn.Linear(obs_dim, lstm_hidden_dim) for tf in self.timeframes
+            tf: nn.Linear(obs_dims[tf], lstm_hidden_dim) for tf in self.timeframes
         })
         self.lstms = nn.ModuleDict({
             tf: nn.LSTM(lstm_hidden_dim, lstm_hidden_dim, num_layers=num_lstm_layers, batch_first=True)
