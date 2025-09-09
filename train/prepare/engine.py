@@ -204,8 +204,14 @@ def add_hpo_candidates(df: pd.DataFrame, interval: str,
 
 def generate_clean_features(df: pd.DataFrame, interval: str,
                             top_k: int = 300, verbose: bool = True) -> pd.DataFrame:
+    original_len = len(df)
     df = df.copy()
     ref_cols = df[REF_COLS_CANON].copy()
+
+    # 피처 생성 전 입력 데이터 NaN 체크
+    input_nan_count = df.isnull().sum().sum()
+    if input_nan_count > 0 and verbose:
+        print(f"Input data contains {input_nan_count} NaN values before feature generation")
 
     df, feat_names = add_hpo_candidates(df, interval, top_k=top_k, verbose=verbose)
 
@@ -213,13 +219,58 @@ def generate_clean_features(df: pd.DataFrame, interval: str,
         print("Feature diagnostics (top issue features):")
         print(analyze_features(df).head(30))
 
-    # df = df.dropna()  # <--- 이 부분이 너무 많은 데이터를 삭제하므로 주석 처리
-
+    # 피처 생성 후 NaN 체크
+    feature_cols = [c for c in df.columns if c.startswith('f_')]
+    nan_summary = df[feature_cols].isnull().sum()
+    nan_cols = nan_summary[nan_summary > 0]
+    
+    if len(nan_cols) > 0:
+        if verbose:
+            print(f"Features with NaN after generation: {dict(nan_cols.head(10))}")
+        
+        # NaN이 있는 행들을 제거하되, 손실률 체크
+        df_before_drop = df.copy()
+        df = df.dropna(subset=feature_cols)
+        dropped_rows = len(df_before_drop) - len(df)
+        loss_ratio = dropped_rows / original_len
+        
+        if verbose:
+            print(f"Dropped {dropped_rows} rows due to NaN features (loss ratio: {loss_ratio:.1%})")
+        
+        # 너무 많은 데이터 손실시 경고
+        if loss_ratio > 0.1:  # 10% 이상 손실
+            print(f"[WARNING] High data loss in {interval}: {loss_ratio:.1%} of original data dropped")
+    
+    # 추가 데이터 정제
     df = sanitize(df, verbose=verbose)
 
+    # 참조 컬럼 복원 (NaN 제거된 인덱스에 맞춰서)
     for col in REF_COLS_CANON:
         if col not in df.columns:
-            df[col] = ref_cols.get(col, 0.0)
+            if col in ref_cols.columns:
+                # 동일한 인덱스의 참조 데이터만 사용
+                matching_ref = ref_cols.loc[df.index, col] if col in ref_cols.columns else 0.0
+                df[col] = matching_ref.fillna(0.0)  # 참조 컬럼에 NaN이 있다면 0으로 채움
+            else:
+                df[col] = 0.0
+
+    # 최종 NaN 체크
+    final_nan_count = df.isnull().sum().sum()
+    if final_nan_count > 0:
+        if verbose:
+            print(f"[WARNING] Final data still contains {final_nan_count} NaN values")
+            nan_cols_final = df.columns[df.isnull().any()].tolist()
+            print(f"Columns with NaN: {nan_cols_final}")
+        
+        # 최후의 안전장치: 모든 NaN을 0으로 대체
+        df = df.fillna(0.0)
+        if verbose:
+            print("Applied zero-fill to all remaining NaN values")
+
+    if verbose:
+        final_len = len(df)
+        total_loss_ratio = (original_len - final_len) / original_len
+        print(f"Final data: {final_len:,} rows (total loss: {total_loss_ratio:.1%})")
 
     return df
 

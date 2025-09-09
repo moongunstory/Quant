@@ -46,8 +46,8 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
                 ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef)
 
         if hasattr(policy, "aux_train_step"):
-            obs_1h = th.stack([th.tensor(b.obs["1h"], dtype=th.float32, device=device) for b in buffer.buffer])
-            obs_4h = th.stack([th.tensor(b.obs["4h"], dtype=th.float32, device=device) for b in buffer.buffer])
+            obs_1h = buffer.obs["1h"]
+            obs_4h = buffer.obs["4h"]
             labels = th.tensor([info.get("trend_label", 1) for info in buffer.infos], dtype=th.long, device=device)
             policy.aux_train_step(obs_1h, obs_4h, labels)
 

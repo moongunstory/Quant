@@ -100,16 +100,63 @@ def main():
 
         scaler = StandardScaler().fit(filtered_df[selected_feats])
         joblib.dump(scaler, HPO_SCALER_PATH_FMT.format(tf=tf))
-        with open(HPO_FEATURE_LIST_FMT.format(tf=tf), "w") as f: json.dump(selected_feats, f, indent=2)
+        with open(HPO_FEATURE_LIST_FMT.format(tf=tf), "w") as f: 
+            json.dump(selected_feats, f, indent=2)
 
         for split in ["train", "val", "test"]:
             df_split = features[split][tf]
-            if df_split.empty: continue
-            df_selected = df_split[selected_feats].dropna()
-            if df_selected.empty: continue
-
-            df_scaled = pd.DataFrame(scaler.transform(df_selected), index=df_selected.index, columns=selected_feats)
-            final_df = pd.concat([df_scaled, df_split.loc[df_selected.index, REF_COLS_CANON]], axis=1)
+            if df_split.empty: 
+                print(f"    [skip] {split}/{tf} is empty")
+                continue
+                
+            # 모든 필요한 컬럼에서 NaN 제거
+            all_required_cols = selected_feats + REF_COLS_CANON
+            available_ref_cols = [col for col in REF_COLS_CANON if col in df_split.columns]
+            all_cols_to_check = selected_feats + available_ref_cols
+            
+            # NaN이 있는 행을 완전히 제거
+            original_len = len(df_split)
+            df_clean = df_split[all_cols_to_check].dropna()
+            
+            if df_clean.empty:
+                print(f"    [error] {split}/{tf} became empty after NaN removal")
+                continue
+                
+            # 데이터 손실 체크
+            loss_ratio = (original_len - len(df_clean)) / original_len
+            if loss_ratio > 0.05:  # 5% 이상 손실
+                print(f"    [warn] High data loss in {split}/{tf}: {loss_ratio:.1%} ({original_len} -> {len(df_clean)} rows)")
+            
+            # 피처와 참조 컬럼 분리
+            df_selected = df_clean[selected_feats]
+            ref_cols_clean = df_clean[available_ref_cols]
+            
+            # 스케일링
+            df_scaled = pd.DataFrame(
+                scaler.transform(df_selected), 
+                index=df_clean.index, 
+                columns=selected_feats
+            )
+            
+            # 최종 데이터 결합
+            final_df = pd.concat([df_scaled, ref_cols_clean], axis=1)
+            
+            # 누락된 참조 컬럼을 0으로 채우기
+            for col in REF_COLS_CANON:
+                if col not in final_df.columns:
+                    final_df[col] = 0.0
+            
+            # 최종 NaN 검증
+            nan_count = final_df.isnull().sum().sum()
+            if nan_count > 0:
+                print(f"    [error] Final data for {split}/{tf} still contains {nan_count} NaN values")
+                nan_cols = final_df.columns[final_df.isnull().any()].tolist()
+                print(f"    [error] NaN columns: {nan_cols}")
+                # 최후의 안전장치
+                final_df = final_df.fillna(0.0)
+                print(f"    [fix] Applied zero-fill to {split}/{tf}")
+            
+            # 저장
             out_path = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_{tf}.parquet")
             final_df.to_parquet(out_path)
             print(f"    [ok] Saved {split}/{tf}: {len(final_df):,} rows")
@@ -118,12 +165,42 @@ def main():
     print("-- Saving BTC 1h --")
     for split in ["train", "val", "test"]:
         df = features[split]["btc1h"]
-        if df.empty: continue
-        df_numeric = df.select_dtypes(include=[np.number]).dropna()
-        if df_numeric.empty: continue
+        if df.empty: 
+            print(f"    [skip] BTC {split}/1h is empty")
+            continue
+            
+        # BTC는 피처 생성을 안했으므로 모든 숫자형 컬럼 사용
+        original_len = len(df)
+        df_numeric = df.select_dtypes(include=[np.number])
+        
+        # NaN 제거
+        df_clean = df_numeric.dropna()
+        
+        if df_clean.empty:
+            print(f"    [error] BTC {split}/1h became empty after NaN removal")
+            continue
+        
+        # 데이터 손실 체크
+        loss_ratio = (original_len - len(df_clean)) / original_len
+        if loss_ratio > 0.05:
+            print(f"    [warn] High data loss in BTC {split}/1h: {loss_ratio:.1%} ({original_len} -> {len(df_clean)} rows)")
 
-        scaler = StandardScaler().fit(df_numeric)
-        df_scaled = pd.DataFrame(scaler.transform(df_numeric), index=df_numeric.index, columns=df_numeric.columns)
+        # 스케일링
+        scaler = StandardScaler().fit(df_clean)
+        df_scaled = pd.DataFrame(
+            scaler.transform(df_clean), 
+            index=df_clean.index, 
+            columns=df_clean.columns
+        )
+        
+        # 최종 NaN 검증
+        nan_count = df_scaled.isnull().sum().sum()
+        if nan_count > 0:
+            print(f"    [error] BTC final data for {split}/1h contains {nan_count} NaN values")
+            df_scaled = df_scaled.fillna(0.0)
+            print(f"    [fix] Applied zero-fill to BTC {split}/1h")
+        
+        # 저장
         out_path = os.path.join(OUT_DIR, f"{HPO_OUT_PREFIX}_{split}_btc1h.parquet")
         df_scaled.to_parquet(out_path)
         print(f"    [ok] Saved BTC {split}/1h: {len(df_scaled):,} rows")

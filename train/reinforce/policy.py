@@ -80,17 +80,19 @@ class MultiTimeframeLSTMPolicy(nn.Module):
         if th.isnan(x).any() or th.isinf(x).any():
             print(f"[ERROR] NaN or Inf in input to encode({tf})")
 
-        print(f"[{tf}] input stats — mean: {x.mean().item():.6f}, std: {x.std().item():.6f}, min: {x.min().item():.6f}, max: {x.max().item():.6f}")
+        # print(f"[{tf}] input stats — mean: {x.mean().item():.6f}, std: {x.std().item():.6f}, min: {x.min().item():.6f}, max: {x.max().item():.6f}")
 
         # weight/bias 확인
         w = self.projs[tf].weight
-        print(f"[{tf}] weight stats — mean: {w.mean().item():.6f}, std: {w.std().item():.6f}")
+        # print(f"[{tf}] weight stats — mean: {w.mean().item():.6f}, std: {w.std().item():.6f}")
 
         b = self.projs[tf].bias
         if b is not None:
-            print(f"[{tf}] bias stats — mean: {b.mean().item():.6f}, std: {b.std().item():.6f}")
+            # print(f"[{tf}] bias stats — mean: {b.mean().item():.6f}, std: {b.std().item():.6f}")
+            pass
         else:
-            print(f"[{tf}] bias is None")
+            # print(f"[{tf}] bias is None")
+            pass
 
         # 프로젝션
         x_proj = self.projs[tf](x)

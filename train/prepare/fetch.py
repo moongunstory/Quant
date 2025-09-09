@@ -1,4 +1,4 @@
-# ingest_futures.py (REV‑4)
+# ingest_futures.py (REV‑5) - with missing data retry
 from __future__ import annotations
 import os, time, math
 from datetime import datetime, timezone
@@ -83,6 +83,91 @@ def _fetch(symbol: str, interval: str, start_ms: int, end_ms: Optional[int]) -> 
     df = df.sort_index()
     return df
 
+def _fetch_missing_data(symbol: str, interval: str, missing_times: pd.DatetimeIndex) -> pd.DataFrame:
+    """누락된 특정 시점들의 데이터를 재요청"""
+    if len(missing_times) == 0:
+        return pd.DataFrame()
+        
+    print(f"    [retry] Attempting to fetch {len(missing_times)} missing bars")
+    
+    # 연속된 구간들로 그룹화하여 효율적으로 요청
+    missing_groups = []
+    current_group = [missing_times[0]]
+    
+    for i in range(1, len(missing_times)):
+        time_diff = missing_times[i] - missing_times[i-1]
+        expected_diff = pd.Timedelta(FREQ[interval])
+        
+        # 연속된 시점이면 같은 그룹에 추가
+        if time_diff <= expected_diff * 1.5:  # 약간의 여유 허용
+            current_group.append(missing_times[i])
+        else:
+            # 새로운 그룹 시작
+            missing_groups.append(current_group)
+            current_group = [missing_times[i]]
+    
+    missing_groups.append(current_group)
+    
+    all_recovered_data = []
+    
+    for group in missing_groups:
+        if len(group) > 100:  # 너무 많은 누락은 건너뛰기
+            print(f"    [skip] Skipping large gap of {len(group)} bars")
+            continue
+            
+        try:
+            # 그룹의 시작과 끝 시점 + 여유분으로 요청
+            start_time = group[0] - pd.Timedelta(hours=2)
+            end_time = group[-1] + pd.Timedelta(hours=2)
+            
+            start_ms = int(start_time.timestamp() * 1000)
+            end_ms = int(end_time.timestamp() * 1000)
+            
+            # 해당 구간 데이터 요청
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": min(500, len(group) * 3)  # 적절한 limit 설정
+            }
+            
+            data = _request_with_retry(BASE + KLINES, params)
+            if data:
+                all_recovered_data.extend(data)
+            
+            time.sleep(SLEEP)
+            
+        except Exception as e:
+            print(f"    [warn] Failed to fetch missing group: {e}")
+            continue
+    
+    if all_recovered_data:
+        # DataFrame으로 변환
+        cols = ["Open_time","Open","High","Low","Close","Volume","Close_time",
+                "Quote_asset_volume","Number_of_trades","Taker_buy_base","Taker_buy_quote","Ignore"]
+        df_recovered = pd.DataFrame(all_recovered_data, columns=cols)
+        df_recovered["Open_time"] = pd.to_datetime(df_recovered["Open_time"], unit="ms", utc=True)
+        df_recovered.set_index("Open_time", inplace=True)
+        
+        # 타입 변환
+        df_recovered = df_recovered.astype({
+            "Open":"float", "High":"float", "Low":"float", "Close":"float",
+            "Volume":"float", "Quote_asset_volume":"float",
+            "Number_of_trades":"int", "Taker_buy_base":"float", "Taker_buy_quote":"float"
+        }, errors="ignore")
+        
+        # 중복 제거
+        df_recovered = df_recovered[~df_recovered.index.duplicated(keep="last")]
+        df_recovered = df_recovered.sort_index()
+        
+        # 실제로 누락되었던 시점들만 필터링
+        recovered_missing = df_recovered[df_recovered.index.isin(missing_times)]
+        
+        return recovered_missing
+    
+    return pd.DataFrame()
+
 def _fetch_funding_rates(symbol: str, start_ms: int, end_ms: Optional[int]) -> pd.DataFrame:
     rows = []
     next_start = start_ms
@@ -108,14 +193,59 @@ def _fetch_funding_rates(symbol: str, start_ms: int, end_ms: Optional[int]) -> p
     df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
     return df
 
-def _warn_if_irregular(df: pd.DataFrame, itv: str, sym: str) -> pd.DatetimeIndex:
+def _process_missing_data(df: pd.DataFrame, itv: str, sym: str) -> pd.DataFrame:
+    """누락된 데이터 처리 - 재요청 → 보간 → 제거 순서"""
     if df.empty:
-        return pd.DatetimeIndex([])
-    full = pd.date_range(df.index[0], df.index[-1], freq=FREQ[itv], tz="UTC")
-    missing = full.difference(df.index)
-    if len(missing):
-        print(f"    [warn] {sym} {itv}: missing bars = {len(missing)} (e.g., {missing[0]})")
-    return full
+        return df
+        
+    full_index = pd.date_range(df.index[0], df.index[-1], freq=FREQ[itv], tz="UTC")
+    missing = full_index.difference(df.index)
+    
+    if len(missing) == 0:
+        return df
+        
+    print(f"    [warn] {sym} {itv}: missing bars = {len(missing)}")
+    
+    # 1단계: 재요청 시도
+    recovered_data = _fetch_missing_data(sym, itv, missing)
+    
+    if not recovered_data.empty:
+        # 기존 데이터와 병합
+        df_combined = pd.concat([df, recovered_data]).sort_index()
+        df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
+        
+        print(f"    [ok] Recovered {len(recovered_data)} missing bars")
+        
+        # 다시 missing 체크
+        remaining_missing = full_index.difference(df_combined.index)
+        if len(remaining_missing) == 0:
+            return df_combined
+        else:
+            df = df_combined
+            missing = remaining_missing
+            print(f"    [info] Still missing {len(missing)} bars after recovery")
+    
+    # 2단계: 남은 누락에 대해 보간 적용 (조건부)
+    missing_ratio = len(missing) / len(full_index)
+    
+    if missing_ratio > 0.05:  # 5% 이상 누락이면 해당 구간 제외
+        print(f"    [error] Too many missing bars ({missing_ratio:.1%}), cannot interpolate")
+        # 연속된 데이터가 있는 구간만 사용
+        return df
+    else:
+        print(f"    [fix] Using interpolation for remaining {len(missing)} bars ({missing_ratio:.1%})")
+        df_full = df.reindex(full_index).sort_index()
+        
+        df_full = df_full.infer_objects(copy=False)
+        df_full = df_full.interpolate(method='linear')
+        df_full = df_full.ffill().bfill()
+
+        # 최후 수단: 0으로 채우기
+        if df_full.isnull().any().any():
+            print(f"    [warn] Using zero-fill for remaining NaN in {sym} {itv}")
+            df_full = df_full.fillna(0)
+        
+        return df_full
 
 def _attach_funding(df: pd.DataFrame, fr: Optional[pd.Series]) -> pd.DataFrame:
     if fr is not None and not df.empty:
@@ -188,8 +318,8 @@ def main():
                 trimmed_df = all_dfs[sym][itv].loc[max_start:min_end]
                 trimmed_dfs[sym][itv] = trimmed_df
 
-    # 4. Attach funding and save
-    print("=== Step 4: Processing and saving full dataframes... ===")
+    # 4. Process missing data, attach funding and save
+    print("=== Step 4: Processing missing data and saving... ===")
     for sym in trimmed_dfs:
         print(f"--- Processing {sym} ---")
         print("  - FundingRate fetching...")
@@ -203,18 +333,24 @@ def main():
                 print("    [skip] no data in common range")
                 continue
 
-            full_index = _warn_if_irregular(df, itv, sym)
-            if not full_index.empty:
-                df = df.reindex(full_index).sort_index()
-
+            # 누락 데이터 처리 (재요청 + 보간)
+            df = _process_missing_data(df, itv, sym)
+            
+            # 펀딩 레이트 붙이기
             df = _attach_funding(df, fr)
+            
+            # 최종 품질 체크
+            nan_count = df.isnull().sum().sum()
+            if nan_count > 0:
+                print(f"    [warn] Final data contains {nan_count} NaN values")
+                df = df.fillna(0.0)  # 최후 안전장치
             
             out_dir = os.path.join(OUT_DIR, sym.lower())
             _ensure_dir(out_dir)
             
             path = os.path.join(out_dir, f"fut_data_{itv}.parquet")
             df.to_parquet(path)
-            print(f"    [ok] Full data: {len(df):,} -> {path}")
+            print(f"    [ok] Final data: {len(df):,} rows -> {path}")
 
     print("Done.")
 
