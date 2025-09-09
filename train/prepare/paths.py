@@ -10,6 +10,9 @@ TIMEFRAMES = ["5m", "15m", "1h", "4h", "btc1h"]
 ETH_TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 BASE_INTERVAL = "5m"
 
+# Data split ratio (train, validation, test)
+SPLIT = (0.70, 0.15, 0.15)
+
 # HPO 확장 관련 설정
 HPO_OUT_PREFIX = "feHPO"
 HPO_FEATURE_LIST_FMT = os.path.join(OUT_DIR, "feHPO_feature_list_{tf}.json")

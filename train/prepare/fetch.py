@@ -7,14 +7,13 @@ import pandas as pd
 import requests
 
 # ===== User constants =====
-START_DATE = "2019-09-10"
+START_DATE = "2019-11-27"
 END_DATE = None
 SYMBOLS = ["ETHUSDT", "BTCUSDT"]
 INTERVALS_PER_SYMBOL = {
     "ETHUSDT": ["5m", "15m", "1h", "4h"],
     "BTCUSDT": ["1h"],
 }
-SPLIT = (0.70, 0.15, 0.15)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "data", "raw"))
 SLEEP = 0.25
@@ -118,14 +117,6 @@ def _warn_if_irregular(df: pd.DataFrame, itv: str, sym: str) -> pd.DatetimeIndex
         print(f"    [warn] {sym} {itv}: missing bars = {len(missing)} (e.g., {missing[0]})")
     return full
 
-def _split_by_cuts(df, t1, t2):
-    if df.empty:
-        return df, df, df
-    train = df.loc[:t1]
-    val = df.loc[t1:].iloc[1:].loc[:t2]
-    test = df.loc[t2:].iloc[1:]
-    return train, val, test
-
 def _attach_funding(df: pd.DataFrame, fr: Optional[pd.Series]) -> pd.DataFrame:
     if fr is not None and not df.empty:
         fr.name = "FundingRate"
@@ -187,30 +178,18 @@ def main():
     
     print(f"  - Common range found: {max_start} to {min_end}")
 
-    # 3. Trim all dataframes to common range and calculate global cuts
-    print("=== Step 3: Trimming data and calculating split points... ===")
+    # 3. Trim all dataframes to common range
+    print("=== Step 3: Trimming data to common range... ===")
     trimmed_dfs = {}
-    global_cuts = None
     for sym in all_dfs:
         trimmed_dfs[sym] = {}
         for itv in all_dfs[sym]:
             if not all_dfs[sym][itv].empty:
                 trimmed_df = all_dfs[sym][itv].loc[max_start:min_end]
                 trimmed_dfs[sym][itv] = trimmed_df
-                
-                if sym == "ETHUSDT" and itv == "5m":
-                    n = len(trimmed_df)
-                    i1 = max(int(n * SPLIT[0]) - 1, 0)
-                    i2 = max(int(n * (SPLIT[0] + SPLIT[1])) - 1, 0)
-                    t1, t2 = trimmed_df.index[i1], trimmed_df.index[i2]
-                    global_cuts = (t1, t2)
-                    print(f"  - Global cut times (UTC): t1={t1}, t2={t2}")
 
-    if global_cuts is None:
-        raise ValueError("Could not determine global cuts. ETHUSDT 5m data might be missing in the common range.")
-
-    # 4. Attach funding, split, and save
-    print("=== Step 4: Processing and saving splits... ===")
+    # 4. Attach funding and save
+    print("=== Step 4: Processing and saving full dataframes... ===")
     for sym in trimmed_dfs:
         print(f"--- Processing {sym} ---")
         print("  - FundingRate fetching...")
@@ -230,14 +209,12 @@ def main():
 
             df = _attach_funding(df, fr)
             
-            train, val, test = _split_by_cuts(df, *global_cuts)
-
             out_dir = os.path.join(OUT_DIR, sym.lower())
             _ensure_dir(out_dir)
-            for name, part in (("train", train), ("val", val), ("test", test)):
-                path = os.path.join(out_dir, f"fut_{name}_data_{itv}.parquet")
-                part.to_parquet(path)
-                print(f"    [ok] {name}: {len(part):,} → {path}")
+            
+            path = os.path.join(out_dir, f"fut_data_{itv}.parquet")
+            df.to_parquet(path)
+            print(f"    [ok] Full data: {len(df):,} -> {path}")
 
     print("Done.")
 

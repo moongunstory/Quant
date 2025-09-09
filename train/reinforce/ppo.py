@@ -39,7 +39,7 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
             if done or truncated:
                 obs, _ = env.reset()
 
-        compute_gae(buffer, gamma=gamma, lam=lam)
+        buffer.compute_returns_and_advantages(gamma=gamma, lam=lam)
 
         for _ in range(n_epochs):
             for batch in buffer.get_batches(batch_size):
@@ -65,11 +65,23 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef):
     returns = batch["returns"]
     values = batch["values"]
 
+    # 🔍 입력 obs 디버깅 (미니 배치 기준)
+    for tf in obs:
+        o = obs[tf]
+        if th.isnan(o).any() or th.isinf(o).any():
+            print(f"[ERROR] NaN or Inf detected in obs[{tf}] — min: {o.min().item():.4f}, max: {o.max().item():.4f}")
+
     obs_inputs = {
-        tf: obs[tf].to(policy.device) for tf in obs
+        f"obs_{tf}": obs[tf].to(policy.device) for tf in obs
     }
 
     logits, new_values = policy.forward(**obs_inputs)
+
+    # 🔍 logits 디버깅
+    if th.isnan(logits).any() or th.isinf(logits).any():
+        print("[ERROR] NaN or Inf detected in logits!")
+        print("logits (sample):", logits[:5])
+
     dist = th.distributions.Categorical(logits=logits)
     new_log_probs = dist.log_prob(actions)
     entropy = dist.entropy()

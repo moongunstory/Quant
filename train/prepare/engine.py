@@ -1,3 +1,4 @@
+
 import os
 import numpy as np
 import pandas as pd
@@ -10,98 +11,98 @@ from sklearn.feature_selection import mutual_info_classif
 from .paths import RAW_DIR, OUT_DIR, REF_COLS_CANON, BASE_INTERVAL
 from .feature_engineering import get_feature_specs_for_tf, generate_feature
 
+# === रॉ डेटा लोड हो रहा है ===
+
+def load_raw(tf: str) -> pd.DataFrame:
+    """
+    지정된 시간 프레임에 대한 전체 원시 데이터 로드
+    - btc1h -> btcusdt, 나머지는 ethusdt로 매핑
+    """
+    symbol = "btcusdt" if tf == "btc1h" else "ethusdt"
+    suffix = "1h" if tf == "btc1h" else tf
+    
+    path = os.path.join(RAW_DIR, symbol, f"fut_data_{suffix}.parquet")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Raw data not found at {path}")
+    return pd.read_parquet(path)
+
+def add_y_class(df: pd.DataFrame, lookahead: int = 24, threshold: float = 0.005) -> pd.DataFrame:
+    """
+    미래 가격 변동에 기반한 목표 변수 (y_class) 생성
+    - 0: Sell (가격 하락)
+    - 1: Hold (큰 변화 없음)
+    - 2: Buy (가격 상승)
+    """
+    df = df.copy()
+    future_returns = df['Close'].pct_change(periods=lookahead, fill_method=None).shift(-lookahead)
+
+    df['y_class'] = 1  # Default to Hold
+    df.loc[future_returns > threshold, 'y_class'] = 2  # Buy
+    df.loc[future_returns < -threshold, 'y_class'] = 0  # Sell
+    
+    # Drop rows where y_class could not be calculated
+    df.dropna(subset=['y_class'], inplace=True)
+    df['y_class'] = df['y_class'].astype(int)
+
+    return df
 
 # === 유틸 함수들 ===
-def sanitize(df: pd.DataFrame, verbose: bool = False, drop_zero_std: bool = True, std_thresh: float = 1e-8) -> pd.DataFrame:
+
+def sanitize(df: pd.DataFrame, verbose: bool = False,
+             drop_zero_std: bool = True, std_thresh: float = 1e-8) -> pd.DataFrame:
+    """
+    학습에 안전한 상태로 정리:
+    - Inf/-Inf는 NaN으로 전환
+    - 완전히 NaN이거나 상수 컬럼은 제거
+    - 분산이 거의 없는 컬럼도 (원하면) 제거
+    - fillna(0)은 제거 → 왜곡 방지
+    """
     df = df.replace([np.inf, -np.inf], np.nan)
     all_nan_cols = df.columns[df.isna().all()].tolist()
     constant_cols = df.columns[df.nunique(dropna=False) <= 1].tolist()
     std = df.std(numeric_only=True)
     zero_std_cols = std[std <= std_thresh].index.tolist()
+
+    cols_to_drop = set()
     if drop_zero_std:
-        cols_to_drop = set(all_nan_cols + constant_cols + zero_std_cols)
-        df = df.drop(columns=cols_to_drop, errors="ignore")
-    else:
-        df[zero_std_cols] = 0.0
-    return df.fillna(0.0)
+        cols_to_drop.update(all_nan_cols + constant_cols + zero_std_cols)
 
-def enforce_dt_index(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        for tcol in ["Open_time", "open_time", "time"]:
-            if tcol in df.columns:
-                idx = pd.to_datetime(df[tcol], utc=True, errors="coerce")
-                if idx.notna().any():
-                    df = df.set_index(idx).drop(columns=[tcol])
-                    break
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-    df.index = pd.to_datetime(df.index, utc=True)
-    if df.index.tz is None:
-        print(f"[WARNING] Timezone info missing, assuming UTC")
-    elif str(df.index.tz) != 'UTC':
-        print(f"[WARNING] Non-UTC timezone detected: {df.index.tz}")
-    df = df.sort_index()
-    df.index.name = "time"
-    return df
+    if verbose and cols_to_drop:
+        print(f"[sanitize] Dropping columns: {cols_to_drop}")
 
-def zscore(s: pd.Series, win: Optional[int] = None) -> pd.Series:
-    if win is None:
-        mu, sd = s.mean(), s.std()
-        return ((s - mu) / (sd or 1e-9)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    mu = s.rolling(win, min_periods=win).mean()
-    sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
-    return ((s - mu) / sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    df = df.drop(columns=cols_to_drop, errors="ignore")
+    return df  # 더 이상 fillna 처리 없슴
 
-def pct_slope(x: pd.Series, win: int) -> pd.Series:
-    return x.pct_change(fill_method=None).rolling(win, min_periods=win).mean().fillna(0.0)
+def analyze_features(df: pd.DataFrame, prefix: str = "f_") -> pd.DataFrame:
+    """
+    피처별 통계 진단:
+    - 평균, 표준, 최소/최댓값, NaN/Inf 개수, 1%, 99% quantile
+    -> 문제 컬럼 식별 용도
+    """
+    result = []
+    for col in df.columns:
+        if not col.startswith(prefix):
+            continue
+        s = df[col]
+        result.append({
+            "feature": col,
+            "mean": s.mean(),
+            "std": s.std(),
+            "min": s.min(),
+            "max": s.max(),
+            "is_inf": np.isinf(s).sum(),
+            "is_nan": s.isna().sum(),
+            "q01": s.quantile(0.01),
+            "q99": s.quantile(0.99),
+        })
+    return pd.DataFrame(result).sort_values("std", ascending=False)
 
-# === 데이터 로딩 ===
-def load_raw(split: str, interval: str) -> pd.DataFrame:
-    if interval == "btc1h":
-        path = os.path.join(RAW_DIR, "btcusdt", f"fut_{split}_data_1h.parquet")
-    else:
-        path = os.path.join(RAW_DIR, "ethusdt", f"fut_{split}_data_{interval}.parquet")
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Raw data not found: {path}")
-
-    df = pd.read_parquet(path)
-    for col in ["open", "high", "low", "close", "volume"]:
-        real = next((c for c in df.columns if c.lower() == col), None)
-        if real:
-            df[real] = pd.to_numeric(df[real], errors="coerce")
-
-    if "FundingRate" not in df.columns:
-        if "funding_rate" in df.columns:
-            df.rename(columns={"funding_rate": "FundingRate"}, inplace=True)
-        else:
-            df["FundingRate"] = 0.0
-    df["FundingRate"] = pd.to_numeric(df["FundingRate"], errors="coerce").fillna(0.0)
-
-    for col in ["Volume", "Quote_asset_volume", "Taker_buy_base", "Taker_buy_quote"]:
-        if col in df.columns:
-            base = pd.to_numeric(df[col], errors="coerce")
-            df[f"{col}Raw"] = base
-            df[f"{col}Log"] = np.log1p(np.clip(base, 0, None))
-    if "VolumeRaw" in df.columns:
-        df["Volume"] = df["VolumeRaw"]
-
-    df = enforce_dt_index(df)
-
-    for c in REF_COLS_CANON:
-        if c not in df.columns:
-            df[c] = 0.0
-
-    if interval == BASE_INTERVAL:
-        df["FundingSettle"] = (((df.index.hour % 8 == 0) & (df.index.minute == 0))).astype("int8")
-
-    if "Close" in df.columns:
-        df["y_class"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-
-    return df
-
-# === 기술 지표 ===
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    기술지표 생성:
+    - NaN이 생기더라도 유지
+    - bfill(), ffill() 제거 → 초기 결측 왜곡 방지
+    """
     df = df.copy()
     close, high, low, open_, volume = df["Close"], df["High"], df["Low"], df["Open"], df.get("Volume", None)
 
@@ -109,29 +110,35 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_std"] = close.rolling(20).std()
     df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
     df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+
     for period in [5, 10, 20, 60, 120]:
         df[f"ema_{period}"] = talib.EMA(close, timeperiod=period)
 
     df["rsi_14"] = talib.RSI(close, timeperiod=14)
     macd, macd_signal, macd_hist = talib.MACD(close, 12, 26, 9)
     df["macd"], df["macd_signal"], df["macd_hist"] = macd, macd_signal, macd_hist
+
     k, d = talib.STOCH(high, low, close, 14, 3, 0, 3, 0)
     df["stoch_k"], df["stoch_d"] = k, d
     df["cci_20"] = talib.CCI(high, low, close, 20)
+
     ha_close = (open_ + high + low + close) / 4
     ha_open = (open_.shift(1) + ha_close.shift(1)) / 2
     df["ha_close"], df["ha_open"] = ha_close, ha_open
     df["ha_high"] = pd.concat([high, ha_open, ha_close], axis=1).max(axis=1)
     df["ha_low"] = pd.concat([low, ha_open, ha_close], axis=1).min(axis=1)
+
     period1 = (high.rolling(9).max() + low.rolling(9).min()) / 2
     period2 = (high.rolling(26).max() + low.rolling(26).min()) / 2
     df["tenkan_sen"], df["kijun_sen"] = period1, period2
     df["senkou_a"] = ((period1 + period2) / 2).shift(26)
     df["senkou_b"] = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
     df["chikou_span"] = close.shift(-26)
+
     df["adx_14"] = talib.ADX(high, low, close, timeperiod=14)
     df["aroondown"], df["aroonup"] = talib.AROON(high, low, timeperiod=14)
     df["aroon_osc"] = talib.AROONOSC(high, low, timeperiod=14)
+
     df["apo"] = talib.APO(close, fastperiod=12, slowperiod=26, matype=0)
     df["ppo"] = talib.PPO(close, fastperiod=12, slowperiod=26, matype=0)
     df["ultosc"] = talib.ULTOSC(high, low, close, timeperiod1=7, timeperiod2=14, timeperiod3=28)
@@ -145,10 +152,13 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["adosc"] = talib.ADOSC(high, low, close, volume, fastperiod=3, slowperiod=10)
 
     df["psar"] = talib.SAR(high, low, acceleration=0.02, maximum=0.2)
-    return df.bfill().ffill()
 
-# === 개선된 HPO 피처 생성 ===
-def add_hpo_candidates(df: pd.DataFrame, interval: str, top_k: int = 300) -> Tuple[pd.DataFrame, List[str]]:
+    return df  # no ffill/bfill
+
+# === HPO용 피처 생성 및 피처 진단 통합 ===
+
+def add_hpo_candidates(df: pd.DataFrame, interval: str,
+                       top_k: int = 300, verbose: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     df = df.copy()
     y = df["y_class"]
     ref_cols = df[REF_COLS_CANON].copy()
@@ -161,13 +171,13 @@ def add_hpo_candidates(df: pd.DataFrame, interval: str, top_k: int = 300) -> Tup
     batch_size = 1000
     for i in range(0, len(specs), batch_size):
         batch = {}
-        for spec in specs[i:i+batch_size]:
+        for spec in specs[i:i + batch_size]:
             name, series = generate_feature(df, spec)
             batch[name] = series
 
-        X = pd.DataFrame(batch).fillna(0).astype(np.float32)
+        X = pd.DataFrame(batch)  # 더 이상 fillna(0) 하지 않음
         try:
-            mi_scores = mutual_info_classif(X, y, discrete_features=False)
+            mi_scores = mutual_info_classif(X.fillna(0), y, discrete_features=False)
         except ValueError:
             continue
 
@@ -182,15 +192,39 @@ def add_hpo_candidates(df: pd.DataFrame, interval: str, top_k: int = 300) -> Tup
     feat_data = {f[1]: f[2] for f in selected_feats}
 
     df_selected = pd.concat([df, pd.DataFrame(feat_data, index=df.index)], axis=1)
-    df_selected = sanitize(df_selected)
+    df_selected = sanitize(df_selected, verbose=verbose)
 
     for col in REF_COLS_CANON:
         if col not in df_selected.columns:
-            df_selected[col] = ref_cols[col] if col in ref_cols.columns else 0.0
+            df_selected[col] = ref_cols.get(col, 0.0)
 
     return df_selected, feat_names
 
-# === 결과 로딩 및 유니버스 ===
+# === 통합 전처리 파이프라인 함수 ===
+
+def generate_clean_features(df: pd.DataFrame, interval: str,
+                            top_k: int = 300, verbose: bool = True) -> pd.DataFrame:
+    df = df.copy()
+    ref_cols = df[REF_COLS_CANON].copy()
+
+    df, feat_names = add_hpo_candidates(df, interval, top_k=top_k, verbose=verbose)
+
+    if verbose:
+        print("Feature diagnostics (top issue features):")
+        print(analyze_features(df).head(30))
+
+    # df = df.dropna()  # <--- 이 부분이 너무 많은 데이터를 삭제하므로 주석 처리
+
+    df = sanitize(df, verbose=verbose)
+
+    for col in REF_COLS_CANON:
+        if col not in df.columns:
+            df[col] = ref_cols.get(col, 0.0)
+
+    return df
+
+# === 결과 로딩 & 유니버스 관련 함수 ===
+
 def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:
     base_p = os.path.join(OUT_DIR, f"fe_{split}_{tf}.parquet")
     hpo_p = os.path.join(OUT_DIR, f"feHPO_{split}_{tf}.parquet")
@@ -198,7 +232,7 @@ def load_processed(split: str, tf: str, mode: str = "auto") -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Processed file not found: {path}")
     df = pd.read_parquet(path)
-    float_cols = df.select_dtypes(include=['float64']).columns
+    float_cols = df.select_dtypes(include=["float64"]).columns
     df[float_cols] = df[float_cols].astype(np.float32)
     return df
 

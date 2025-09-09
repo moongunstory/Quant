@@ -17,13 +17,14 @@ def zscore(s: pd.Series, win: Optional[int] = None) -> pd.Series:
     sd = s.rolling(win, min_periods=win).std().replace(0, np.nan)
     return ((s - mu) / sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
+def safe_log(s: pd.Series) -> pd.Series:
+    return (np.sign(s) * np.log1p(np.abs(s))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+def clip_series(s: pd.Series, min_val=-10, max_val=10) -> pd.Series:
+    return s.clip(lower=min_val, upper=max_val)
 
 # === 개선된 HPO 방식: 피처 조합 정의 ===
 def get_feature_specs_for_tf(tf: str) -> List[Tuple[str, str]]:
-    """
-    타임프레임별 사용할 피처 정의
-    각 튜플은 (피처타입, 컬럼명 또는 조합명)
-    """
     numeric_cols = {
         "5m": ["Close", "Volume", "rsi_14", "macd", "ema_20", "adx_14", "bb_mid"],
         "15m": ["Close", "Volume", "rsi_14", "macd", "ema_20", "adx_14", "bb_mid"],
@@ -53,9 +54,6 @@ def get_feature_specs_for_tf(tf: str) -> List[Tuple[str, str]]:
 
 
 def generate_feature(df: pd.DataFrame, spec: Tuple[str, str]) -> Tuple[str, pd.Series]:
-    """
-    개별 피처 생성기
-    """
     kind, arg = spec
 
     if kind in ["diff", "ratio", "mul"]:
@@ -66,7 +64,8 @@ def generate_feature(df: pd.DataFrame, spec: Tuple[str, str]) -> Tuple[str, pd.S
             return name, (s1 - s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
         elif kind == "ratio":
             name = f"f_ratio_{col1}_{col2}"
-            return name, (s1 / (s2 + 1e-9)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            ratio = s1 / (s2 + 1e-9)
+            return name, clip_series(ratio.replace([np.inf, -np.inf], 0.0).fillna(0.0))
         elif kind == "mul":
             name = f"f_mul_{col1}_{col2}"
             return name, (s1 * s2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -76,10 +75,10 @@ def generate_feature(df: pd.DataFrame, spec: Tuple[str, str]) -> Tuple[str, pd.S
         s = df[col]
         if kind == "sq":
             name = f"f_sq_{col}"
-            return name, (s ** 2).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            return name, clip_series((s ** 2).replace([np.inf, -np.inf], 0.0).fillna(0.0))
         elif kind == "log":
             name = f"f_log_{col}"
-            return name, np.log1p(np.abs(s)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            return name, clip_series(safe_log(s))
         elif kind == "zscore":
             name = f"f_zscore_{col}"
             return name, zscore(s)
@@ -106,13 +105,11 @@ def filter_features(df: pd.DataFrame, target: pd.Series, top_k: int = 300, vif_t
     X = df[features].fillna(0.0)
     y = target.loc[X.index]
 
-    # Mutual Information 기반 필터링
     mi = mutual_info_classif(X, y, discrete_features=False)
     top_idx = np.argsort(mi)[::-1][:top_k]
     selected = X.columns[top_idx].tolist()
     X = X[selected]
 
-    # VIF 기반 다중공선성 제거
     X_const = add_constant(X)
     keep_cols = X.columns.tolist()
 

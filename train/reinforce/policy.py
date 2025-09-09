@@ -25,7 +25,6 @@ class MultiTimeframeLSTMPolicy(nn.Module):
         self.timeframes = list(obs_dims.keys())
         self.lstm_hidden_dim = lstm_hidden_dim
 
-        # Projections + LSTMs per timeframe
         self.projs = nn.ModuleDict({
             tf: nn.Linear(obs_dims[tf], lstm_hidden_dim) for tf in self.timeframes
         })
@@ -36,7 +35,6 @@ class MultiTimeframeLSTMPolicy(nn.Module):
 
         fusion_dim = lstm_hidden_dim * len(self.timeframes)
 
-        # Policy network
         self.policy_net = nn.Sequential(
             nn.Linear(fusion_dim, mlp_hidden_dims[0]),
             nn.ReLU(),
@@ -45,7 +43,6 @@ class MultiTimeframeLSTMPolicy(nn.Module):
             nn.Linear(mlp_hidden_dims[1], action_dim),
         )
 
-        # Value network
         self.value_net = nn.Sequential(
             nn.Linear(fusion_dim, mlp_hidden_dims[0]),
             nn.ReLU(),
@@ -54,7 +51,6 @@ class MultiTimeframeLSTMPolicy(nn.Module):
             nn.Linear(mlp_hidden_dims[1], 1),
         )
 
-        # Trend head uses only 1h and 4h features
         self.trend_head = nn.Sequential(
             nn.Linear(lstm_hidden_dim * 2, 128),
             nn.ReLU(),
@@ -63,23 +59,72 @@ class MultiTimeframeLSTMPolicy(nn.Module):
 
         self.aux_optimizer = th.optim.Adam(self.trend_head.parameters(), lr=aux_lr)
 
+        self._init_weights()  # ✅ 추가된 가중치 초기화 호출
         self.to(self.device)
 
+    def _init_weights(self):
+        for tf in self.projs:
+            nn.init.xavier_uniform_(self.projs[tf].weight)
+            if self.projs[tf].bias is not None:
+                nn.init.zeros_(self.projs[tf].bias)
+
+        for tf in self.lstms:
+            for name, param in self.lstms[tf].named_parameters():
+                if 'weight' in name:
+                    nn.init.xavier_uniform_(param)
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+
     def encode(self, x: th.Tensor, tf: str) -> th.Tensor:
+        # 입력 확인
+        if th.isnan(x).any() or th.isinf(x).any():
+            print(f"[ERROR] NaN or Inf in input to encode({tf})")
+
+        print(f"[{tf}] input stats — mean: {x.mean().item():.6f}, std: {x.std().item():.6f}, min: {x.min().item():.6f}, max: {x.max().item():.6f}")
+
+        # weight/bias 확인
+        w = self.projs[tf].weight
+        print(f"[{tf}] weight stats — mean: {w.mean().item():.6f}, std: {w.std().item():.6f}")
+
+        b = self.projs[tf].bias
+        if b is not None:
+            print(f"[{tf}] bias stats — mean: {b.mean().item():.6f}, std: {b.std().item():.6f}")
+        else:
+            print(f"[{tf}] bias is None")
+
+        # 프로젝션
         x_proj = self.projs[tf](x)
+        if th.isnan(x_proj).any() or th.isinf(x_proj).any():
+            print(f"[ERROR] NaN after projection in {tf} — input shape: {x.shape}, x_proj shape: {x_proj.shape}")
+            print("x_proj sample:", x_proj[0, :5])
+
+        # LSTM
         _, (h_n, _) = self.lstms[tf](x_proj)
+        if th.isnan(h_n).any() or th.isinf(h_n).any():
+            print(f"[ERROR] NaN in LSTM output h_n in {tf} — h_n shape: {h_n.shape}")
+            print("h_n sample:", h_n[:, :5])
+
         return h_n[-1]  # (B, H)
 
     def forward(self, obs_5m, obs_15m, obs_1h, obs_4h):
-        # Encode all timeframes
-        feats = {
-            tf: self.encode(eval(f"obs_{tf}"), tf)
-            for tf in self.timeframes
-        }
+        inputs = {"5m": obs_5m, "15m": obs_15m, "1h": obs_1h, "4h": obs_4h}
+        for tf, x in inputs.items():
+            if th.isnan(x).any() or th.isinf(x).any():
+                print(f"[ERROR] NaN or Inf in input {tf}: min={x.min().item():.4f}, max={x.max().item():.4f}")
 
-        # Combine all features for policy/value
-        z = th.cat([feats[tf] for tf in self.timeframes], dim=-1)  # (B, H*4)
+        feats = {tf: self.encode(x, tf) for tf, x in inputs.items()}
+        for tf, f in feats.items():
+            if th.isnan(f).any() or th.isinf(f).any():
+                print(f"[ERROR] NaN or Inf in encoded feature {tf}: min={f.min().item():.4f}, max={f.max().item():.4f}")
+
+        z = th.cat([feats[tf] for tf in self.timeframes], dim=-1)
+        if th.isnan(z).any() or th.isinf(z).any():
+            print("[ERROR] NaN or Inf in concatenated features z")
+
         logits = self.policy_net(z)
+        if th.isnan(logits).any() or th.isinf(logits).any():
+            print("[ERROR] NaN or Inf in final logits (forward)")
+
         value = self.value_net(z).squeeze(-1)
         return logits, value
 
