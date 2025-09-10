@@ -55,7 +55,6 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
                 log = (step % ppo_log_interval == 0) and (i == 0)
                 ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=log)
 
-        print(f"[Step {step}] Current LR: {scheduler.get_last_lr()[0]:.6f}")
         scheduler.step()
 
         if hasattr(policy, "aux_train_step"):
