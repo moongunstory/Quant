@@ -130,14 +130,21 @@ class MultiTimeframeLSTMPolicy(nn.Module):
         value = self.value_net(z).squeeze(-1)
         return logits, value
 
-    def get_action(self, obs_5m, obs_15m, obs_1h, obs_4h, deterministic=False, action_mask=None):
+    def get_action(self, obs: Dict[str, th.Tensor], deterministic=False, action_mask=None):
+        obs_5m = obs["5m"]
+        obs_15m = obs["15m"]
+        obs_1h = obs["1h"]
+        obs_4h = obs["4h"]
         logits, value = self.forward(obs_5m, obs_15m, obs_1h, obs_4h)
+
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask.bool(), float("-inf"))
+
         dist = th.distributions.Categorical(logits=logits)
         action = dist.probs.argmax(dim=-1) if deterministic else dist.sample()
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
+
         return action, log_prob, entropy, value
 
     def compute_trend_logits(self, obs_1h, obs_4h):

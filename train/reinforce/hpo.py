@@ -34,16 +34,21 @@ def run_hpo(
     """
     Runs Hyperparameter Optimization.
     """
+    FIXED_LR = 3e-4  # Cosine scheduler will decay from here
+
     search_space = [
         {
-            "learning_rate": lr,
+            "learning_rate": FIXED_LR,
             "batch_size": bs,
             "ent_coef": ent,
+            "vf_coef": vf,
+            "clip_range": clip,
             "net_arch": [h],
         }
-        for lr in [3e-4, 1e-4]
         for bs in [256, 512]
         for ent in [0.01, 0.03]
+        for vf in [0.4, 0.5, 0.6]
+        for clip in [0.1, 0.2, 0.3]
         for h in [128, 256]
     ]
 

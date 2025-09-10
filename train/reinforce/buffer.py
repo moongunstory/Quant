@@ -61,12 +61,12 @@ class RolloutBuffer:
             }
 
     def clear(self):
-        for tf in self.obs:
-            self.obs[tf].clear()
-        self.actions.clear()
-        self.log_probs.clear()
-        self.rewards.clear()
-        self.values.clear()
-        self.dones.clear()
-        self.infos.clear()
+        tf_keys = list(self.obs.keys())
+        self.obs = {tf: [] for tf in tf_keys}
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+        self.infos = []
         self._is_tensorized = False
