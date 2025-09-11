@@ -35,6 +35,7 @@ class Portfolio:
     def open_position(self, price: float, direction: int):
         size = abs(self.cash / price)
         cost = self._apply_costs(price, size)
+        self.cash -= cost
         
         # LONG
         if direction == 1:
@@ -43,7 +44,6 @@ class Portfolio:
         elif direction == -1:
             self.cash += size * price
 
-        self.equity -= cost
         self.position = direction
         self.position_size = size
         self.entry_price = price
@@ -55,7 +55,7 @@ class Portfolio:
         pnl = self.position * self.position_size * price
         cost = self._apply_costs(price, self.position_size)
         self.cash += pnl
-        self.equity = self.cash - cost
+        self.cash -= cost
         self.position = 0
         self.position_size = 0.0
         self.entry_price = np.nan
@@ -63,8 +63,9 @@ class Portfolio:
 
     def step(self, price: float, funding: float = 0.0):
         if self.position != 0:
+            self.cash -= funding
             pos_val = self.position * self.position_size * price
-            self.equity = self.cash + pos_val - funding
+            self.equity = self.cash + pos_val
             self.holding = int(self.holding) + 1
         else:
             self.equity = self.cash

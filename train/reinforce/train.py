@@ -21,7 +21,6 @@ np.random.seed(SEED)
 th.manual_seed(SEED)
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
-CONFIG_PATH = os.path.join(DATA_DIR, "hpo", "best_config.json")
 
 
 def main():
@@ -30,14 +29,33 @@ def main():
     tf_val = _load_all_timeframes("val")
 
     # 2. config 로드
-    if not os.path.exists(CONFIG_PATH):
-        print("[info] No best_config.json found. Running HPO...")
-        best_config = run_hpo(save_path=CONFIG_PATH)
-    else:
-        print("[info] Loading best config...")
-        with open(CONFIG_PATH, "r") as f:
-            loaded = json.load(f)
-        best_config = loaded["best_config"]
+    hpo_dir = os.path.join(DATA_DIR, "hpo")
+    top5_path = os.path.join(hpo_dir, "hpo_top5.json")
+    best_config_path = os.path.join(hpo_dir, "best_config.json")
+    best_config = None
+
+    if os.path.exists(top5_path):
+        print(f"[info] Found {top5_path}. Loading best config from it...")
+        with open(top5_path, "r", encoding="utf-8") as f:
+            top5_results = json.load(f)
+        
+        if top5_results:
+            best_result = top5_results[0]
+            best_config = best_result["config"]
+            print(f"[info] Using config from trial {best_result.get('trial', 'N/A')} with sharpe {best_result.get('sharpe', 0.0):.4f}")
+            
+            print("[info] Injecting feature set information...")
+            best_config["features"] = {tf: list(df.columns) for tf, df in tf_train.items()}
+    
+    if best_config is None:
+        if os.path.exists(best_config_path):
+            print(f"[info] No top5 file found. Loading best config from {best_config_path}...")
+            with open(best_config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            best_config = loaded["best_config"]
+        else:
+            print("[info] No config file found. Running HPO...")
+            best_config = run_hpo(save_path=best_config_path)
 
     print(f"[config] Using config: {best_config}")
 
