@@ -109,7 +109,9 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
         print(f"[PPO] loss={loss.item():.4f}, policy={policy_loss.item():.4f}, value={value_loss.item():.4f}, entropy={entropy.mean().item():.4f}, value_mean={new_values.mean().item():.4f}")
 
 
-def evaluate(env, policy, n_steps=288) -> tuple:
+def evaluate(env, policy, n_steps: int | None = None) -> tuple:
+    if n_steps is None:
+        n_steps = len(env.common_index) - max(env.seq_lens.values()) - 1
     obs, _ = env.reset()
     device = policy.device
     rewards, equity_curve, actions = [], [], []
