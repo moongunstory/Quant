@@ -69,6 +69,8 @@ def run_hpo(
     best_score = -np.inf
     best_config = None
     all_results = []
+    top_5_results = []
+    save_path_top5 = os.path.join(os.path.dirname(save_path), "hpo_top5.json")
 
     for i, config in enumerate(search_space):
         print(f"\n[HPO] Trial {i+1}/{len(search_space)} — config: {config}")
@@ -114,6 +116,26 @@ def run_hpo(
             "mdd": mdd,
             "tpd": tpd
         })
+
+        # --- Top 5 logic start ---
+        previous_top_scores = [res.get('sharpe', -np.inf) for res in top_5_results]
+        current_trial_result = {
+            "trial": i + 1,
+            "config": config,
+            "sharpe": sharpe,
+            "mdd": mdd,
+            "tpd": tpd
+        }
+        top_5_results.append(current_trial_result)
+        top_5_results = sorted(top_5_results, key=lambda x: x['sharpe'], reverse=True)[:5]
+        new_top_scores = [res.get('sharpe', -np.inf) for res in top_5_results]
+
+        if previous_top_scores != new_top_scores:
+            print(f"Top 5 results updated. Saving to {save_path_top5}")
+            os.makedirs(os.path.dirname(save_path_top5), exist_ok=True)
+            with open(save_path_top5, "w", encoding="utf-8") as f:
+                json.dump(top_5_results, f, ensure_ascii=False, indent=2)
+        # --- Top 5 logic end ---
 
         if sharpe > best_score:
             best_score = sharpe

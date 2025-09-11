@@ -45,6 +45,11 @@ class MultiTimeframeTradingEnv(gym.Env):
             }
         else:
             self.obs_cols = obs_cols
+            # Verify that all obs_cols exist in the dataframes
+            for tf, cols in obs_cols.items():
+                missing_cols = set(cols) - set(tf_data[tf].columns)
+                if missing_cols:
+                    raise ValueError(f"Missing columns in {tf} data: {missing_cols}")
 
         # Sync index
         all_indices = [df.index for df in tf_data.values()]

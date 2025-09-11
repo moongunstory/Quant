@@ -36,16 +36,23 @@ def main():
     else:
         print("[info] Loading best config...")
         with open(CONFIG_PATH, "r") as f:
-            best_config = json.load(f)
+            loaded = json.load(f)
+        best_config = loaded["best_config"]
 
     print(f"[config] Using config: {best_config}")
 
     # 3. obs_dims
-    obs_dim = {tf: tf_train[tf].shape[1] for tf in ["5m", "15m", "1h", "4h"]}
+    obs_dim = {tf: len(cols) for tf, cols in best_config["features"].items()}
 
     # 4. 환경 생성
-    env = MultiTimeframeTradingEnv(tf_train)
-    eval_env = MultiTimeframeTradingEnv(tf_val)
+    env = MultiTimeframeTradingEnv(
+        tf_train,
+        obs_cols=best_config["features"]
+    )
+    eval_env = MultiTimeframeTradingEnv(
+        tf_val,
+        obs_cols=best_config["features"]
+    )
 
     # 5. 정책 생성
     policy = MultiTimeframeLSTMPolicy(
