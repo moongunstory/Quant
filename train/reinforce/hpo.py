@@ -4,17 +4,18 @@ import random
 import numpy as np
 import torch as th
 import pandas as pd
-from typing import Dict
+from typing import Dict, Any
+import optuna
 
-from env import MultiTimeframeTradingEnv
-from policy import MultiTimeframeLSTMPolicy
-from ppo import train_with_config
+from ai_binance.train.reinforce.env import MultiTimeframeTradingEnv
+from ai_binance.train.reinforce.policy import MultiTimeframeLSTMPolicy
+from ai_binance.train.reinforce.ppo import train_with_config
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed"))
 ETH_TFS = ["5m", "15m", "1h", "4h"]
+FIXED_LR = 3e-4
 
 def _load_all_timeframes(split: str) -> Dict[str, pd.DataFrame]:
-    """Loads all processed ETH dataframes for a given split into a dictionary."""
     dfs = {}
     for tf in ETH_TFS:
         path = os.path.join(DATA_DIR, f"feHPO_{split}_{tf}.parquet")
@@ -25,135 +26,114 @@ def _load_all_timeframes(split: str) -> Dict[str, pd.DataFrame]:
     return dfs
 
 def run_hpo(
-    save_path: str = "best_candidate.json",
-    train_tag: str = "train",
-    val_tag: str = "val",
+    save_path: str,
+    n_trials: int = 100,
     train_steps: int = 100_000,
     seed: int = 42,
 ) -> dict:
-    """
-    Runs Hyperparameter Optimization.
-    """
-    FIXED_LR = 3e-4  # Cosine scheduler will decay from here
-
-    search_space = [
-        {
-            "learning_rate": FIXED_LR,
-            "batch_size": bs,
-            "ent_coef": ent,
-            "vf_coef": vf,
-            "clip_range": clip,
-            "net_arch": [h],
-        }
-        for bs in [256, 512]
-        for ent in [0.01, 0.03]
-        for vf in [0.4, 0.5, 0.6]
-        for clip in [0.1, 0.2, 0.3]
-        for h in [128, 256]
-    ]
-
-    tf_train = _load_all_timeframes(train_tag)
-    tf_val = _load_all_timeframes(val_tag)
+    tf_train = _load_all_timeframes("train")
+    tf_val = _load_all_timeframes("val")
 
     if not tf_train or not tf_val:
-        raise ValueError("Could not load training or validation data. Please run prepare scripts.")
+        raise ValueError("Could not load training or validation data. Please prepare data first.")
 
-    # 1. 환경 먼저 생성
-    env = MultiTimeframeTradingEnv(tf_train, price_col="Close")
+    all_available_features = {tf: [c for c in df.columns if c.startswith('f_')] for tf, df in tf_train.items()}
 
-    # 2. 실제 obs 기준으로 obs_dims 자동 결정
-    sample_obs, _ = env.reset()
-    obs_dims = {tf: sample_obs[tf].shape[1] for tf in sample_obs}
-    print(f"[HPO] Fixed obs_dims = {obs_dims}")
-
-    best_score = -np.inf
-    best_config = None
-    all_results = []
-    top_5_results = []
-    save_path_top5 = os.path.join(os.path.dirname(save_path), "hpo_top5.json")
-
-    for i, config in enumerate(search_space):
-        print(f"\n[HPO] Trial {i+1}/{len(search_space)} — config: {config}")
-
+    def objective(trial: optuna.trial.Trial) -> float:
         random.seed(seed)
         np.random.seed(seed)
         th.manual_seed(seed)
 
-        # The env now takes a dictionary of dataframes.
-        env = MultiTimeframeTradingEnv(tf_train, price_col="Close")
-        eval_env = MultiTimeframeTradingEnv(tf_val, price_col="Close")
+        features = {}
+        for tf, available in all_available_features.items():
+            n_features = trial.suggest_int(f"n_features_{tf}", 20, len(available))
+            features[tf] = random.sample(available, n_features)
+        trial.set_user_attr("features", features)
 
-        # The policy now needs a dictionary of observation dimensions.
+        # Hyperparameter search space
+        config = {
+            "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),
+            "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
+            "n_epochs": trial.suggest_int("n_epochs", 5, 20),
+            "ent_coef": trial.suggest_float("ent_coef", 1e-8, 0.05, log=True),
+            "vf_coef": trial.suggest_float("vf_coef", 0.3, 0.7),
+            "clip_range": trial.suggest_float("clip_range", 0.1, 0.4),
+            "gae_lambda": trial.suggest_float("gae_lambda", 0.9, 0.99),
+            "gamma": trial.suggest_float("gamma", 0.95, 0.999),
+            "net_arch": [trial.suggest_categorical("net_arch", [64, 128, 256, 512])],
+            "trend_dim": trial.suggest_categorical("trend_dim", [2, 3, 4]),
+            "aux_coeff": trial.suggest_float("aux_coeff", 0.0, 0.5),
+            "lstm_hidden_dim": trial.suggest_categorical("lstm_hidden_dim", [64, 128, 256]),
+            "num_lstm_layers": trial.suggest_int("num_lstm_layers", 1, 3),
+            "features": features,
+        }
+
+        obs_dims = {tf: len(cols) for tf, cols in config["features"].items()}
+        env = MultiTimeframeTradingEnv(tf_train, obs_cols=config["features"])
+        eval_env = MultiTimeframeTradingEnv(tf_val, obs_cols=config["features"])
+
         policy = MultiTimeframeLSTMPolicy(
             obs_dims=obs_dims,
             action_dim=env.action_space.n,
-            trend_dim=3,
-            aux_coeff=0.1,
-            lstm_hidden_dim=128,
-            num_lstm_layers=1,
+            trend_dim=config["trend_dim"],
+            aux_coeff=config["aux_coeff"],
+            lstm_hidden_dim=config["lstm_hidden_dim"],
+            num_lstm_layers=config["num_lstm_layers"],
             mlp_hidden_dims=tuple(config["net_arch"] + [64]),
             device="cuda" if th.cuda.is_available() else "cpu"
         )
 
-        result = train_with_config(
-            env=env,
-            eval_env=eval_env,
-            policy=policy,
-            config=config,
-            train_steps=train_steps,
-        )
+        try:
+            result = train_with_config(
+                env=env,
+                eval_env=eval_env,
+                policy=policy,
+                config=config,
+                train_steps=train_steps,
+                learning_rate=FIXED_LR,
+                trial=trial
+            )
+            return result.get("sharpe", 0.0)
+        except optuna.exceptions.TrialPruned as e:
+            print(f"Trial pruned: {e}")
+            raise
+        except Exception as e:
+            print(f"[Error] Trial failed with exception: {e}")
+            return -1.0
 
-        sharpe = result.get("sharpe", 0.0)
-        mdd = result.get("mdd", 0.0)
-        tpd = result.get("trades_per_day", 0.0)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    study = optuna.create_study(direction="maximize", pruner=pruner)
 
-        print(f"[HPO] Result: Sharpe={sharpe:.4f}, MDD={mdd:.4f}, TPD={tpd:.1f}")
+    try:
+        study.optimize(objective, n_trials=n_trials, timeout=3600 * 6)
+    except KeyboardInterrupt:
+        print("HPO interrupted. Saving current results...")
 
-        all_results.append({
-            "trial": i + 1,
-            "config": config,
-            "sharpe": sharpe,
-            "mdd": mdd,
-            "tpd": tpd
-        })
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-        # --- Top 5 logic start ---
-        previous_top_scores = [res.get('sharpe', -np.inf) for res in top_5_results]
-        current_trial_result = {
-            "trial": i + 1,
-            "config": config,
-            "sharpe": sharpe,
-            "mdd": mdd,
-            "tpd": tpd
-        }
-        top_5_results.append(current_trial_result)
-        top_5_results = sorted(top_5_results, key=lambda x: x['sharpe'], reverse=True)[:5]
-        new_top_scores = [res.get('sharpe', -np.inf) for res in top_5_results]
+    # Save top 5 trials
+    top5_trials = sorted(study.trials, key=lambda t: t.value or -1, reverse=True)[:5]
+    top5_results = [{
+        "trial": t.number,
+        "sharpe": t.value,
+        "config": t.params
+    } for t in top5_trials]
+    with open(os.path.join(os.path.dirname(save_path), "hpo_top5.json"), "w", encoding="utf-8") as f:
+        json.dump(top5_results, f, indent=2, ensure_ascii=False)
+    print(f"Top 5 trials saved.")
 
-        if previous_top_scores != new_top_scores:
-            print(f"Top 5 results updated. Saving to {save_path_top5}")
-            os.makedirs(os.path.dirname(save_path_top5), exist_ok=True)
-            with open(save_path_top5, "w", encoding="utf-8") as f:
-                json.dump(top_5_results, f, ensure_ascii=False, indent=2)
-        # --- Top 5 logic end ---
-
-        if sharpe > best_score:
-            best_score = sharpe
-            best_config = config
-
-    print(f"\n✅ Best Config: {best_config} (Sharpe={best_score:.4f})")
-
-    # Save features for main training
-    best_config["features"] = {tf: list(df.columns) for tf, df in tf_train.items()}
+    # Save best trial
+    best_trial = study.best_trial
+    best_config = best_trial.params
+    best_config["features"] = best_trial.user_attrs.get("features", {})
 
     out = {
         "best_config": best_config,
-        "best_score": best_score,
-        "results": all_results
+        "best_score": best_trial.value,
+        "results": [{"trial": t.number, "sharpe": t.value, "config": t.params} for t in study.trials]
     }
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f"Best trial saved to {save_path}")
 
     return best_config

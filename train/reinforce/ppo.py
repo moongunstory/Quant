@@ -1,17 +1,26 @@
 import torch as th
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import optuna
 from buffer import RolloutBuffer
 
-
-def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps: int) -> Dict[str, float]:
+def train_with_config(
+    env,
+    eval_env,
+    policy,
+    config: Dict[str, Any],
+    train_steps: int,
+    learning_rate: float,
+    trial: Optional[optuna.trial.Trial] = None,
+) -> Dict[str, float]:
     device = policy.device
     policy.train()
 
-    optimizer = th.optim.Adam(policy.parameters(), lr=config["learning_rate"])
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_steps, eta_min=config["learning_rate"] * 0.1)
+    optimizer = th.optim.Adam(policy.parameters(), lr=learning_rate)
+    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_steps, eta_min=learning_rate * 0.1)
 
-    gamma, lam = 0.99, 0.95
+    gamma = config.get("gamma", 0.99)
+    lam = config.get("gae_lambda", 0.95)
     rollout_steps = config.get("n_steps", 2048)
     batch_size = config["batch_size"]
     ent_coef = config["ent_coef"]
@@ -22,17 +31,13 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
     buffer = RolloutBuffer(rollout_steps, env.observation_space, device=device)
     obs, _ = env.reset()
 
-    # ✅ 로그 출력 주기 설정
     ppo_log_interval = 10000
 
     for step in range(0, train_steps, rollout_steps):
         episodic_rewards = []
 
         for _ in range(rollout_steps):
-            obs_tensor = {
-                tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
-                for tf in obs
-            }
+            obs_tensor = {tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0) for tf in obs}
             action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)
 
             action, log_prob, entropy, value = policy.get_action(obs_tensor, action_mask=action_mask)
@@ -51,8 +56,7 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
 
         for epoch in range(n_epochs):
             for i, batch in enumerate(buffer.get_batches(batch_size)):
-                # ✅ PPO 로그 출력 조건
-                log = (step % ppo_log_interval == 0) and (i == 0)
+                log = (step % ppo_log_interval == 0 and i == 0)
                 ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=log)
 
         scheduler.step()
@@ -63,11 +67,17 @@ def train_with_config(env, eval_env, policy, config: Dict[str, Any], train_steps
             labels = th.tensor([info.get("trend_label", 1) for info in buffer.infos], dtype=th.long, device=device)
             policy.aux_train_step(obs_1h, obs_4h, labels)
 
+        # --- Pruning ---
+        if trial is not None:
+            intermediate_sharpe, _, _ = evaluate(eval_env, policy, n_steps=288*7)
+            trial.report(intermediate_sharpe, step)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
         buffer.clear()
 
     sharpe, mdd, tpd = evaluate(eval_env, policy)
     return {"sharpe": sharpe, "mdd": mdd, "trades_per_day": tpd}
-
 
 def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=False):
     obs = batch["obs"]
@@ -77,15 +87,14 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
     returns = batch["returns"]
     values = batch["values"]
 
-    obs_inputs = {
-        f"obs_{tf}": obs[tf].to(policy.device) for tf in obs
-    }
+    # Normalize advantages
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+    obs_inputs = {f"obs_{tf}": obs[tf].to(policy.device) for tf in obs}
     logits, new_values = policy.forward(
         obs_inputs["obs_5m"], obs_inputs["obs_15m"], obs_inputs["obs_1h"], obs_inputs["obs_4h"]
     )
 
-    # 최소한의 안정성 체크
     if th.isnan(logits).any() or th.isinf(logits).any():
         print("[ERROR] NaN or Inf detected in logits!")
 
@@ -94,9 +103,15 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
     entropy = dist.entropy()
 
     ratio = th.exp(new_log_probs - old_log_probs)
-    clipped = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-    policy_loss = -th.min(ratio * advantages, clipped * advantages).mean()
-    value_loss = th.nn.functional.mse_loss(new_values, returns)
+    clipped_ratio = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+    policy_loss = -th.min(ratio * advantages, clipped_ratio * advantages).mean()
+
+    # Value clipping
+    value_pred_clipped = values + (new_values - values).clamp(-clip_range, clip_range)
+    value_loss_unclipped = (new_values - returns).pow(2)
+    value_loss_clipped = (value_pred_clipped - returns).pow(2)
+    value_loss = 0.5 * th.max(value_loss_unclipped, value_loss_clipped).mean()
+
     loss = policy_loss + vf_coef * value_loss - ent_coef * entropy.mean()
 
     optimizer.zero_grad()
@@ -104,10 +119,8 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
     th.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
     optimizer.step()
 
-    # 🎯 log=True인 경우에만 출력
     if log:
         print(f"[PPO] loss={loss.item():.4f}, policy={policy_loss.item():.4f}, value={value_loss.item():.4f}, entropy={entropy.mean().item():.4f}, value_mean={new_values.mean().item():.4f}")
-
 
 def evaluate(env, policy, n_steps: int | None = None) -> tuple:
     if n_steps is None:
@@ -118,14 +131,10 @@ def evaluate(env, policy, n_steps: int | None = None) -> tuple:
     initial_eq = env.portfolio.initial_equity
 
     for _ in range(n_steps):
-        obs_tensor = {
-            tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0)
-            for tf in obs
-        }
+        obs_tensor = {tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0) for tf in obs}
         action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)
 
         action, _, _, _ = policy.get_action(obs_tensor, deterministic=True, action_mask=action_mask)
-
         obs, reward, done, truncated, info = env.step(action.item())
 
         rewards.append(reward)
@@ -143,7 +152,6 @@ def evaluate(env, policy, n_steps: int | None = None) -> tuple:
     tpd = (np.array(actions) != 0).mean() * 288
 
     return sharpe, mdd, tpd
-
 
 def max_drawdown(equity: np.ndarray) -> float:
     peak = np.maximum.accumulate(equity)
