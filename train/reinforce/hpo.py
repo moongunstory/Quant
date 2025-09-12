@@ -30,12 +30,12 @@ def run_hpo(
     n_trials: int = 100,
     train_steps: int = 100_000,
     seed: int = 42,
-) -> dict:
+) -> None:
     tf_train = _load_all_timeframes("train")
     tf_val = _load_all_timeframes("val")
 
     if not tf_train or not tf_val:
-        raise ValueError("Could not load training or validation data. Please prepare data first.")
+        raise ValueError("Could not load training or validation data.")
 
     all_features = {tf: [c for c in df.columns if c.startswith('f_')] for tf, df in tf_train.items()}
 
@@ -44,15 +44,12 @@ def run_hpo(
         np.random.seed(seed)
         th.manual_seed(seed)
 
-        # Feature selection via individual binary masks
+        # Feature selection
         features = {}
         for tf, feature_list in all_features.items():
-            selected = []
-            for feat in feature_list:
-                if trial.suggest_int(f"use_{tf}_{feat}", 0, 1):
-                    selected.append(feat)
+            selected = [feat for feat in feature_list if trial.suggest_int(f"use_{tf}_{feat}", 0, 1)]
             if not selected:
-                selected = feature_list[:1]  # Ensure at least 1 feature to avoid error
+                selected = feature_list[:1]
             features[tf] = selected
         trial.set_user_attr("features", features)
 
@@ -102,7 +99,6 @@ def run_hpo(
             )
 
             if result is None:
-                print("[warn] Received None result from training.")
                 return -1.0, -1.0, 1.0
 
             sharpe = result.get("sharpe", -1.0)
@@ -110,19 +106,16 @@ def run_hpo(
             mdd = result.get("mdd", 1.0)
 
             if any(np.isnan([sharpe, ret, mdd])):
-                print("[warn] NaN detected in result metrics.")
                 return -1.0, -1.0, 1.0
 
             return sharpe, ret, mdd
 
         except optuna.exceptions.TrialPruned:
             raise
-        except Exception as e:
-            print("[Error] Trial failed due to exception:")
+        except Exception:
             traceback.print_exc()
-            return -1.0, -1.0, 1.0  # worst-case defaults
+            return -1.0, -1.0, 1.0
 
-    # Multi-objective optimization
     study = optuna.create_study(
         directions=["maximize", "maximize", "minimize"],
         sampler=optuna.samplers.NSGAIISampler()
@@ -133,9 +126,17 @@ def run_hpo(
     except KeyboardInterrupt:
         print("Interrupted. Saving partial results...")
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # 유효한 trial만 필터링
+    def is_valid(t):
+        return t.values is not None and t.values[0] > 0 and t.values[1] > 0
 
-    top_trials = study.best_trials[:5]
+    def score_fn(t):
+        sharpe, ret, mdd = t.values
+        return sharpe - 2 * mdd + 1.5 * ret
+
+    valid_trials = [t for t in study.trials if is_valid(t)]
+    top_trials = sorted(valid_trials, key=score_fn, reverse=True)[:5]
+
     top_results = []
     for t in top_trials:
         top_results.append({
@@ -143,26 +144,13 @@ def run_hpo(
             "sharpe": t.values[0],
             "return": t.values[1],
             "mdd": t.values[2],
-            "config": t.params
+            "config": t.params,
+            "features": t.user_attrs.get("features", {})
         })
-    with open(os.path.join(os.path.dirname(save_path), "hpo_top5.json"), "w") as f:
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    top5_path = os.path.join(os.path.dirname(save_path), "hpo_top5.json")
+    with open(top5_path, "w") as f:
         json.dump(top_results, f, indent=2)
 
-    best_trial = study.best_trials[0]
-    best_config = best_trial.params
-    best_config["features"] = best_trial.user_attrs.get("features", {})
-
-    out = {
-        "best_config": best_config,
-        "best_score": {
-            "sharpe": best_trial.values[0],
-            "return": best_trial.values[1],
-            "mdd": best_trial.values[2]
-        },
-        "results": top_results
-    }
-    with open(save_path, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"[done] Best config saved to {save_path}")
-
-    return best_config
+    print(f"[done] Top 5 trials saved to {top5_path}")
