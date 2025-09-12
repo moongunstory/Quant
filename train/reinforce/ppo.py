@@ -84,8 +84,6 @@ def train_with_config(
 
         if trial is not None:
             sharpe, mdd, total_return = evaluate(eval_env, policy, n_steps=288*7)
-            # Early stopping은 필요할 때만 사용 (예: performance threshold 기준)
-            trial.report(sharpe, step)
             return {"sharpe": sharpe, "mdd": mdd, "return": total_return}
 
         buffer.clear()
