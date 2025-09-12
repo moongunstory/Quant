@@ -6,6 +6,7 @@ import torch as th
 import pandas as pd
 from typing import Dict, Any
 import optuna
+import traceback
 
 from ai_binance.train.reinforce.env import MultiTimeframeTradingEnv
 from ai_binance.train.reinforce.policy import MultiTimeframeLSTMPolicy
@@ -99,14 +100,29 @@ def run_hpo(
                 learning_rate=config["learning_rate"],
                 trial=trial
             )
-            return result["sharpe"], result["return"], result["mdd"]
+
+            if result is None:
+                print("[warn] Received None result from training.")
+                return -1.0, -1.0, 1.0
+
+            sharpe = result.get("sharpe", -1.0)
+            ret = result.get("return", -1.0)
+            mdd = result.get("mdd", 1.0)
+
+            if any(np.isnan([sharpe, ret, mdd])):
+                print("[warn] NaN detected in result metrics.")
+                return -1.0, -1.0, 1.0
+
+            return sharpe, ret, mdd
+
         except optuna.exceptions.TrialPruned:
             raise
         except Exception as e:
-            print(f"[Error] Trial failed: {e}")
+            print("[Error] Trial failed due to exception:")
+            traceback.print_exc()
             return -1.0, -1.0, 1.0  # worst-case defaults
 
-    # Multi-objective: Sharpe ↑, Return ↑, MDD ↓
+    # Multi-objective optimization
     study = optuna.create_study(
         directions=["maximize", "maximize", "minimize"],
         sampler=optuna.samplers.NSGAIISampler()

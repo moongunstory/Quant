@@ -89,7 +89,14 @@ def main():
     )
 
     # 6. 학습
-    result = train_with_config(env, eval_env, policy, config=best_config, train_steps=1_000_000)
+    result = train_with_config(
+        env,
+        eval_env,
+        policy,
+        config=best_config,
+        train_steps=1_000_000,
+        learning_rate=best_config["learning_rate"]
+    )
     print(f"[done] result: {result}")
 
 
