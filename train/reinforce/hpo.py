@@ -13,7 +13,6 @@ from ai_binance.train.reinforce.ppo import train_with_config
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed"))
 ETH_TFS = ["5m", "15m", "1h", "4h"]
-FIXED_LR = 3e-4
 
 def _load_all_timeframes(split: str) -> Dict[str, pd.DataFrame]:
     dfs = {}
@@ -37,27 +36,34 @@ def run_hpo(
     if not tf_train or not tf_val:
         raise ValueError("Could not load training or validation data. Please prepare data first.")
 
-    all_available_features = {tf: [c for c in df.columns if c.startswith('f_')] for tf, df in tf_train.items()}
+    all_features = {tf: [c for c in df.columns if c.startswith('f_')] for tf, df in tf_train.items()}
 
-    def objective(trial: optuna.trial.Trial) -> float:
+    def objective(trial: optuna.trial.Trial):
         random.seed(seed)
         np.random.seed(seed)
         th.manual_seed(seed)
 
+        # Feature selection via individual binary masks
         features = {}
-        for tf, available in all_available_features.items():
-            n_features = trial.suggest_int(f"n_features_{tf}", 20, len(available))
-            features[tf] = random.sample(available, n_features)
+        for tf, feature_list in all_features.items():
+            selected = []
+            for feat in feature_list:
+                if trial.suggest_int(f"use_{tf}_{feat}", 0, 1):
+                    selected.append(feat)
+            if not selected:
+                selected = feature_list[:1]  # Ensure at least 1 feature to avoid error
+            features[tf] = selected
         trial.set_user_attr("features", features)
 
-        # Hyperparameter search space
         config = {
             "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),
             "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
             "n_epochs": trial.suggest_int("n_epochs", 5, 20),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+            "lr_scheduler": trial.suggest_categorical("lr_scheduler", ["cosine", "linear"]),
             "ent_coef": trial.suggest_float("ent_coef", 1e-8, 0.05, log=True),
-            "vf_coef": trial.suggest_float("vf_coef", 0.3, 0.7),
-            "clip_range": trial.suggest_float("clip_range", 0.1, 0.4),
+            "vf_coef": trial.suggest_float("vf_coef", 0.0, 1.0),
+            "clip_range": trial.suggest_float("clip_range", 0.05, 0.5),
             "gae_lambda": trial.suggest_float("gae_lambda", 0.9, 0.99),
             "gamma": trial.suggest_float("gamma", 0.95, 0.999),
             "net_arch": [trial.suggest_categorical("net_arch", [64, 128, 256, 512])],
@@ -68,9 +74,9 @@ def run_hpo(
             "features": features,
         }
 
-        obs_dims = {tf: len(cols) for tf, cols in config["features"].items()}
-        env = MultiTimeframeTradingEnv(tf_train, obs_cols=config["features"])
-        eval_env = MultiTimeframeTradingEnv(tf_val, obs_cols=config["features"])
+        obs_dims = {tf: len(cols) for tf, cols in features.items()}
+        env = MultiTimeframeTradingEnv(tf_train, obs_cols=features)
+        eval_env = MultiTimeframeTradingEnv(tf_val, obs_cols=features)
 
         policy = MultiTimeframeLSTMPolicy(
             obs_dims=obs_dims,
@@ -90,50 +96,57 @@ def run_hpo(
                 policy=policy,
                 config=config,
                 train_steps=train_steps,
-                learning_rate=FIXED_LR,
+                learning_rate=config["learning_rate"],
                 trial=trial
             )
-            return result.get("sharpe", 0.0)
-        except optuna.exceptions.TrialPruned as e:
-            print(f"Trial pruned: {e}")
+            return result["sharpe"], result["return"], result["mdd"]
+        except optuna.exceptions.TrialPruned:
             raise
         except Exception as e:
-            print(f"[Error] Trial failed with exception: {e}")
-            return -1.0
+            print(f"[Error] Trial failed: {e}")
+            return -1.0, -1.0, 1.0  # worst-case defaults
 
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
-    study = optuna.create_study(direction="maximize", pruner=pruner)
+    # Multi-objective: Sharpe ↑, Return ↑, MDD ↓
+    study = optuna.create_study(
+        directions=["maximize", "maximize", "minimize"],
+        sampler=optuna.samplers.NSGAIISampler()
+    )
 
     try:
-        study.optimize(objective, n_trials=n_trials, timeout=3600 * 6)
+        study.optimize(objective, n_trials=n_trials, timeout=3600*6)
     except KeyboardInterrupt:
-        print("HPO interrupted. Saving current results...")
+        print("Interrupted. Saving partial results...")
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    # Save top 5 trials
-    top5_trials = sorted(study.trials, key=lambda t: t.value or -1, reverse=True)[:5]
-    top5_results = [{
-        "trial": t.number,
-        "sharpe": t.value,
-        "config": t.params
-    } for t in top5_trials]
-    with open(os.path.join(os.path.dirname(save_path), "hpo_top5.json"), "w", encoding="utf-8") as f:
-        json.dump(top5_results, f, indent=2, ensure_ascii=False)
-    print(f"Top 5 trials saved.")
+    top_trials = study.best_trials[:5]
+    top_results = []
+    for t in top_trials:
+        top_results.append({
+            "trial": t.number,
+            "sharpe": t.values[0],
+            "return": t.values[1],
+            "mdd": t.values[2],
+            "config": t.params
+        })
+    with open(os.path.join(os.path.dirname(save_path), "hpo_top5.json"), "w") as f:
+        json.dump(top_results, f, indent=2)
 
-    # Save best trial
-    best_trial = study.best_trial
+    best_trial = study.best_trials[0]
     best_config = best_trial.params
     best_config["features"] = best_trial.user_attrs.get("features", {})
 
     out = {
         "best_config": best_config,
-        "best_score": best_trial.value,
-        "results": [{"trial": t.number, "sharpe": t.value, "config": t.params} for t in study.trials]
+        "best_score": {
+            "sharpe": best_trial.values[0],
+            "return": best_trial.values[1],
+            "mdd": best_trial.values[2]
+        },
+        "results": top_results
     }
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-    print(f"Best trial saved to {save_path}")
+    with open(save_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"[done] Best config saved to {save_path}")
 
     return best_config

@@ -4,6 +4,18 @@ from typing import Dict, Any, Optional
 import optuna
 from buffer import RolloutBuffer
 
+class LinearDecayLR:
+    def __init__(self, optimizer, total_steps):
+        self.optimizer = optimizer
+        self.total_steps = total_steps
+        self.step_count = 0
+
+    def step(self):
+        self.step_count += 1
+        lr_scale = max(1.0 - self.step_count / self.total_steps, 0.1)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = param_group['initial_lr'] * lr_scale
+
 def train_with_config(
     env,
     eval_env,
@@ -17,7 +29,13 @@ def train_with_config(
     policy.train()
 
     optimizer = th.optim.Adam(policy.parameters(), lr=learning_rate)
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_steps, eta_min=learning_rate * 0.1)
+    for g in optimizer.param_groups:
+        g["initial_lr"] = learning_rate
+
+    if config.get("lr_scheduler") == "linear":
+        scheduler = LinearDecayLR(optimizer, total_steps=train_steps)
+    else:
+        scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_steps, eta_min=learning_rate * 0.1)
 
     gamma = config.get("gamma", 0.99)
     lam = config.get("gae_lambda", 0.95)
@@ -30,8 +48,6 @@ def train_with_config(
 
     buffer = RolloutBuffer(rollout_steps, env.observation_space, device=device)
     obs, _ = env.reset()
-
-    ppo_log_interval = 10000
 
     for step in range(0, train_steps, rollout_steps):
         episodic_rewards = []
@@ -55,9 +71,8 @@ def train_with_config(
         buffer.compute_returns_and_advantages(gamma=gamma, lam=lam)
 
         for epoch in range(n_epochs):
-            for i, batch in enumerate(buffer.get_batches(batch_size)):
-                log = (step % ppo_log_interval == 0 and i == 0)
-                ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=log)
+            for batch in buffer.get_batches(batch_size):
+                ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=False)
 
         scheduler.step()
 
@@ -67,17 +82,14 @@ def train_with_config(
             labels = th.tensor([info.get("trend_label", 1) for info in buffer.infos], dtype=th.long, device=device)
             policy.aux_train_step(obs_1h, obs_4h, labels)
 
-        # --- Pruning ---
         if trial is not None:
-            intermediate_sharpe, _, _ = evaluate(eval_env, policy, n_steps=288*7)
-            trial.report(intermediate_sharpe, step)
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+            sharpe, mdd, total_return = evaluate(eval_env, policy, n_steps=288*7)
+            raise optuna.exceptions.TrialPruned()
 
         buffer.clear()
 
-    sharpe, mdd, tpd = evaluate(eval_env, policy)
-    return {"sharpe": sharpe, "mdd": mdd, "trades_per_day": tpd}
+    sharpe, mdd, total_return = evaluate(eval_env, policy)
+    return {"sharpe": sharpe, "mdd": mdd, "return": total_return}
 
 def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=False):
     obs = batch["obs"]
@@ -87,16 +99,12 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
     returns = batch["returns"]
     values = batch["values"]
 
-    # Normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs_inputs = {f"obs_{tf}": obs[tf].to(policy.device) for tf in obs}
     logits, new_values = policy.forward(
         obs_inputs["obs_5m"], obs_inputs["obs_15m"], obs_inputs["obs_1h"], obs_inputs["obs_4h"]
     )
-
-    if th.isnan(logits).any() or th.isinf(logits).any():
-        print("[ERROR] NaN or Inf detected in logits!")
 
     dist = th.distributions.Categorical(logits=logits)
     new_log_probs = dist.log_prob(actions)
@@ -106,11 +114,8 @@ def ppo_update(policy, optimizer, batch, clip_range, ent_coef, vf_coef, log=Fals
     clipped_ratio = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
     policy_loss = -th.min(ratio * advantages, clipped_ratio * advantages).mean()
 
-    # Value clipping
     value_pred_clipped = values + (new_values - values).clamp(-clip_range, clip_range)
-    value_loss_unclipped = (new_values - returns).pow(2)
-    value_loss_clipped = (value_pred_clipped - returns).pow(2)
-    value_loss = 0.5 * th.max(value_loss_unclipped, value_loss_clipped).mean()
+    value_loss = 0.5 * th.max((new_values - returns).pow(2), (value_pred_clipped - returns).pow(2)).mean()
 
     loss = policy_loss + vf_coef * value_loss - ent_coef * entropy.mean()
 
@@ -133,7 +138,6 @@ def evaluate(env, policy, n_steps: int | None = None) -> tuple:
     for _ in range(n_steps):
         obs_tensor = {tf: th.tensor(obs[tf], dtype=th.float32, device=device).unsqueeze(0) for tf in obs}
         action_mask = th.tensor(env._action_mask(), dtype=th.bool, device=device).unsqueeze(0)
-
         action, _, _, _ = policy.get_action(obs_tensor, deterministic=True, action_mask=action_mask)
         obs, reward, done, truncated, info = env.step(action.item())
 
@@ -146,12 +150,11 @@ def evaluate(env, policy, n_steps: int | None = None) -> tuple:
 
     rewards = np.nan_to_num(np.array(rewards, dtype=np.float32))
     equity_curve = np.nan_to_num(np.array(equity_curve, dtype=np.float32))
+    total_return = equity_curve[-1] - 1.0 if equity_curve.size > 0 else 0.0
 
     sharpe = np.mean(rewards) / (np.std(rewards) + 1e-8) * np.sqrt(288 * 252)
     mdd = max_drawdown(equity_curve)
-    tpd = (np.array(actions) != 0).mean() * 288
-
-    return sharpe, mdd, tpd
+    return sharpe, mdd, total_return
 
 def max_drawdown(equity: np.ndarray) -> float:
     peak = np.maximum.accumulate(equity)

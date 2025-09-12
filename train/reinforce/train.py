@@ -73,14 +73,18 @@ def main():
     )
 
     # 5. 정책 생성
+    net_arch = best_config.get("net_arch", [256])
+    if isinstance(net_arch, int):
+        net_arch = [net_arch]
+
     policy = MultiTimeframeLSTMPolicy(
         obs_dims=obs_dim,
         action_dim=4,
-        trend_dim=3,
-        aux_coeff=0.1,
-        lstm_hidden_dim=128,
-        num_lstm_layers=1,
-        mlp_hidden_dims=tuple(best_config["net_arch"] + [64]),
+        trend_dim=best_config.get("trend_dim", 3),
+        aux_coeff=best_config.get("aux_coeff", 0.1),
+        lstm_hidden_dim=best_config.get("lstm_hidden_dim", 128),
+        num_lstm_layers=best_config.get("num_lstm_layers", 1),
+        mlp_hidden_dims=tuple(net_arch + [64]),
         device="cuda" if th.cuda.is_available() else "cpu"
     )
 
