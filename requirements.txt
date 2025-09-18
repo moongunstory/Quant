@@ -1,0 +1,5 @@
+pandas
+dune-client
+ta
+python-dotenv
+tabulate

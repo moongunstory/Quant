@@ -1,0 +1,23 @@
+# config/settings.py
+
+SYMBOLS = ["ETHUSDT", "BTCUSDT"]
+DEFAULT_INTERVAL = "5m"
+
+# 수집 대상 기간
+DEFAULT_START_DATE = "2023-06-24"
+DEFAULT_END_DATE = "2025-09-02"
+
+# DUNE 쿼리 IDs
+DUNE_QUERY_IDS = [
+    5287867,
+    5287868,
+    5287869,
+    5287870,
+    5287871,
+    5287872,
+    5287873,
+    5773177
+]
+
+# DUNE 쿼리 실행 시 batch size
+DUNE_QUERY_BATCH_SIZE = 3
