@@ -58,14 +58,18 @@ class SequenceReplayBuffer:
         done_list = []
 
         for idx in indices:
+            # 모든 그룹이 동일한 종료 시점(last_idx)을 바라보도록 정렬
+            last_idx = idx + self.seq_len_max - 1
+
             # State는 시퀀스로 반환 (LSTM용)
             for k in self.obs_buf:
                 seq_len = self.seq_lens[k]
-                obs_seqs[k].append(self.obs_buf[k][idx:idx + seq_len])
-                next_obs_seqs[k].append(self.next_obs_buf[k][idx:idx + seq_len])
+                start_idx = idx + (self.seq_len_max - seq_len)
+                end_idx = start_idx + seq_len
+                obs_seqs[k].append(self.obs_buf[k][start_idx:end_idx])
+                next_obs_seqs[k].append(self.next_obs_buf[k][start_idx:end_idx])
 
             # Action/Reward/Done은 모든 그룹 중 가장 긴 시퀀스의 마지막 시점 기준
-            last_idx = idx + self.seq_len_max - 1
             action_list.append(self.action_buf[last_idx])
             reward_list.append(self.reward_buf[last_idx])
             done_list.append(self.done_buf[last_idx])

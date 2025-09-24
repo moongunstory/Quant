@@ -59,11 +59,14 @@ tunable_features = {
 
 # RL 하이퍼파라미터 튜닝 범위
 rl_hparams = {
-    "actor_lr":  {"type": "float", "min": 1e-4, "max": 1e-3, "log": True},
-    "critic_lr": {"type": "float", "min": 1e-4, "max": 1e-3, "log": True},
+    "actor_lr":  {"type": "float", "min": 5e-5, "max": 5e-4, "log": True},
+    "critic_lr": {"type": "float", "min": 5e-5, "max": 5e-4, "log": True},
     "gamma": {"type": "float", "min": 0.9, "max": 0.999},
-    "tau": {"type": "float", "min": 0.008, "max": 0.05},
-    "alpha": {"type": "float", "min": 0.05, "max": 0.5},
+    "tau": {"type": "float", "min": 0.02, "max": 0.1},
+    "alpha": {"type": "float", "min": 0.1, "max": 0.8},
+    "clip_grad": {"type": "float", "min": 1.0, "max": 3.0},
+    "action_threshold_close": {"type": "float", "min": 0.2, "max": 0.4},
+    "min_hold_bars": {"type": "int", "min": 8, "max": 15},
     "hidden_dim": {"type": "categorical", "choices": [64, 128, 256, 512]},
     "lstm_layers": {"type": "categorical", "choices": [1, 2]},
 }

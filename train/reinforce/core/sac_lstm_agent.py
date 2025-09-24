@@ -21,9 +21,9 @@ class SACLSTMAgent:
         lstm_layers=1,
         *,
         actor_lr=3e-4,
-        critic_lr=3e-4,
+        critic_lr=1e-4,
         gamma=0.99,
-        tau=0.01,
+        tau=0.03,
         alpha: float | None = None,
         total_steps=1_000_000,
         use_scheduler=True,
@@ -192,7 +192,7 @@ class SACLSTMAgent:
 
         current_q1, _ = self.critic_1(state_seq, action)
         current_q2, _ = self.critic_2(state_seq, action)
-        critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+        critic_loss = F.smooth_l1_loss(current_q1, target) + F.smooth_l1_loss(current_q2, target)
 
         for opt in self.critic_opts:
             opt.zero_grad(set_to_none=True)

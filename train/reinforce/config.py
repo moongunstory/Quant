@@ -10,9 +10,9 @@ class TrainingConfig:
 
     log_std_min: float = -1.0
     log_std_max: float = 0.0
-    alpha_min: float = 0.05
-    alpha_max: float = 0.3
-    grad_clip_norm: float = 5.0
+    alpha_min: float = 0.10
+    alpha_max: float = 0.8
+    grad_clip_norm: float = 2.0
     reward_scale: float = 1.0
     target_entropy_scale: float = -0.5
     initial_alpha: float = 0.2
@@ -41,11 +41,11 @@ class EnvConfig:
     """Environment specific thresholds and trade management settings."""
 
     action_threshold_open: float = 0.30
-    action_threshold_close: float = 0.15
+    action_threshold_close: float = 0.25
     action_threshold_flip: float = 0.45
     take_profit_pct: float = 0.02
     stop_loss_pct: float = 0.01
-    min_hold_bars: int = 6
+    min_hold_bars: int = 10
     flip_penalty: float = 0.0014
     ohlcv_close_idx: int = 3
     ohlcv_high_idx: int = 1
