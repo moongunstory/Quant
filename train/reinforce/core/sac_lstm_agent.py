@@ -1,11 +1,13 @@
 # train/reinforce/core/sac_lstm_agent.py
 from __future__ import annotations
 
+import math
+from copy import deepcopy
+
 import torch
 import torch.nn.functional as F
-from copy import deepcopy
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ai_binance.train.reinforce.config import TrainingConfig
 from ai_binance.train.reinforce.core.lstm_actor_critic import LSTMActor, LSTMCritic
@@ -20,14 +22,14 @@ class SACLSTMAgent:
         hidden_dim=128,
         lstm_layers=1,
         *,
-        actor_lr=3e-4,
-        critic_lr=1e-4,
+        actor_lr: float | None = None,
+        critic_lr: float | None = None,
         gamma=0.99,
         tau=0.03,
         alpha: float | None = None,
         total_steps=1_000_000,
-        use_scheduler=True,
-        eta_min=3e-5,
+        use_scheduler: bool | None = None,
+        eta_min: float | None = None,
         target_entropy_scale: float | None = None,
         alpha_min: float | None = None,
         alpha_max: float | None = None,
@@ -36,23 +38,43 @@ class SACLSTMAgent:
         training_config: TrainingConfig | None = None,
         use_fixed_alpha=False,
         fixed_alpha: float | None = None,
+        cfg: dict | None = None,
     ):
+        cfg = cfg or {}
         self.action_dim = int(action_dim)
         self.device = device
-        self.gamma = gamma
+        self.gamma = float(cfg.get("gamma", gamma))
+        tau = float(cfg.get("tau", tau))
         self.tau = tau
-        self.total_steps = int(total_steps)
+        self.total_steps = int(cfg.get("total_steps", total_steps))
         self.config = training_config or TrainingConfig()
         self.alpha_min = float(alpha_min if alpha_min is not None else self.config.alpha_min)
         self.alpha_max = float(alpha_max if alpha_max is not None else self.config.alpha_max)
         if self.alpha_min > self.alpha_max:
             raise ValueError("alpha_min must be less than or equal to alpha_max.")
-        self.clip_grad = float(clip_grad if clip_grad is not None else self.config.grad_clip_norm)
-        self.reward_scale = float(reward_scale if reward_scale is not None else self.config.reward_scale)
-        self.target_entropy_scale = float(
-            target_entropy_scale if target_entropy_scale is not None else self.config.target_entropy_scale
+        self.clip_grad = float(
+            cfg.get(
+                "clip_grad",
+                clip_grad if clip_grad is not None else self.config.grad_clip_norm,
+            )
         )
-        self.target_entropy = self.target_entropy_scale * self.action_dim
+        self.reward_scale = float(
+            cfg.get(
+                "reward_scale",
+                reward_scale if reward_scale is not None else self.config.reward_scale,
+            )
+        )
+        target_entropy_scale = cfg.get(
+            "target_entropy_scale",
+            target_entropy_scale if target_entropy_scale is not None else 1.0,
+        )
+        self.target_entropy_scale = float(target_entropy_scale)
+        self.target_entropy = -float(self.action_dim) * self.target_entropy_scale
+        self.log_std_min = float(cfg.get("log_std_min", -2.5))
+        self.log_std_max = float(cfg.get("log_std_max", -0.5))
+        if self.log_std_min >= self.log_std_max:
+            raise ValueError("log_std_min must be less than log_std_max.")
+        self.init_log_std = float(cfg.get("init_log_std", -1.5))
         self.use_fixed_alpha = bool(use_fixed_alpha)
         default_fixed_alpha = self.config.fixed_alpha
         self.fixed_alpha = float(fixed_alpha if fixed_alpha is not None else default_fixed_alpha)
@@ -62,7 +84,7 @@ class SACLSTMAgent:
             else None
         )
 
-        init_alpha = float(alpha if alpha is not None else self.config.initial_alpha)
+        init_alpha = float(cfg.get("alpha_init", alpha if alpha is not None else self.config.initial_alpha))
         if init_alpha <= 0:
             raise ValueError("alpha must be positive.")
 
@@ -73,13 +95,21 @@ class SACLSTMAgent:
             hidden_dim,
             lstm_layers,
             training_config=self.config,
+            log_std_min=self.log_std_min,
+            log_std_max=self.log_std_max,
         ).to(device)
         self.critic_1 = LSTMCritic(input_dims, action_dim, hidden_dim, lstm_layers).to(device)
         self.critic_2 = LSTMCritic(input_dims, action_dim, hidden_dim, lstm_layers).to(device)
         self.critic_target_1 = deepcopy(self.critic_1).to(device)
         self.critic_target_2 = deepcopy(self.critic_2).to(device)
 
+        if hasattr(self.actor, "fc_log_std"):
+            with torch.no_grad():
+                self.actor.fc_log_std.bias.fill_(self.init_log_std)
+
         # --- Optimizers ---
+        actor_lr = float(cfg.get("actor_lr", actor_lr if actor_lr is not None else 1e-4))
+        critic_lr = float(cfg.get("critic_lr", critic_lr if critic_lr is not None else 1e-4))
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_opts = [
             torch.optim.Adam(self.critic_1.parameters(), lr=critic_lr),
@@ -87,10 +117,16 @@ class SACLSTMAgent:
         ]
 
         # --- scheduler: keep it but don't kill learning too early ---
-        if use_scheduler:
-            self.actor_scheduler = CosineAnnealingLR(self.actor_opt, T_max=4 * self.total_steps, eta_min=eta_min)
+        scheduler_flag = cfg.get("use_scheduler", use_scheduler)
+        if scheduler_flag is None:
+            scheduler_flag = False
+        self.use_scheduler = bool(scheduler_flag)
+        if self.use_scheduler:
+            eta_min_value = float(cfg.get("eta_min", eta_min if eta_min is not None else 1e-4))
+            eta_min_value = max(eta_min_value, 1e-4)
+            self.actor_scheduler = CosineAnnealingLR(self.actor_opt, T_max=self.total_steps, eta_min=eta_min_value)
             self.critic_schedulers = [
-                CosineAnnealingLR(opt, T_max=2 * self.total_steps, eta_min=eta_min)
+                CosineAnnealingLR(opt, T_max=self.total_steps, eta_min=eta_min_value)
                 for opt in self.critic_opts
             ]
         else:
@@ -102,9 +138,12 @@ class SACLSTMAgent:
         self.r_std = 1.0
 
         # --- entropy target & alpha autotune ---
-        log_alpha_init = torch.log(torch.tensor(init_alpha, device=self.device, dtype=torch.float32))
-        self.log_alpha = torch.nn.Parameter(log_alpha_init)
-        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=3e-4)
+        log_alpha_init = math.log(init_alpha)
+        self.log_alpha = torch.nn.Parameter(
+            torch.tensor(log_alpha_init, device=self.device, dtype=torch.float32)
+        )
+        alpha_lr = float(cfg.get("alpha_lr", 3e-4))
+        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
     # ===== Alpha helpers =====
     @property
@@ -262,10 +301,12 @@ class SACLSTMAgent:
     def set_target_entropy_scale(self, scale: float):
         """Update the entropy target multiplier and recompute the target entropy."""
         self.target_entropy_scale = float(scale)
-        self.target_entropy = self.target_entropy_scale * self.action_dim
+        self.target_entropy = -float(self.action_dim) * self.target_entropy_scale
 
     # 런타임에서 정책 분산 범위를 조절할 수 있게 훅 제공
     @torch.no_grad()
     def set_log_std_bounds(self, min_v: float, max_v: float):
+        self.log_std_min = float(min_v)
+        self.log_std_max = float(max_v)
         if hasattr(self.actor, "set_log_std_bounds"):
             self.actor.set_log_std_bounds(min_v, max_v)
