@@ -36,9 +36,9 @@ class CryptoTradingEnv:
         take_profit_pct: float | None = None,
         stop_loss_pct: float | None = None,
         # OHLCV 인덱스
-        ohlcv_close_idx=None,
-        ohlcv_high_idx=None,
-        ohlcv_low_idx=None,
+        ohlcv_close_idx: int | None = None,
+        ohlcv_high_idx: int | None = None,
+        ohlcv_low_idx: int | None = None,
         enforce_hl: bool = True,   # True면 HL 미지정 시 에러
         # funding 첫 컬럼 인덱스
         funding_col_idx=0,
@@ -48,8 +48,8 @@ class CryptoTradingEnv:
         idle_lambda=0.0010,
         ewma_beta=0.9,
         # (옵션) 채터링 억제
-        min_hold_bars: int = 0,    # 최소 보유 바(0이면 비활성)
-        flip_penalty: float = 0.0,  # 플립 시 추가 패널티(곱셈 반영, 예: 0.001 = 0.1%)
+        min_hold_bars: int | None = None,    # 최소 보유 바(0이면 비활성)
+        flip_penalty: float | None = None,  # 플립 시 추가 패널티(곱셈 반영, 예: 0.001 = 0.1%)
         *,
         env_config: EnvConfig | None = None,
         action_threshold_open: float | None = None,
@@ -88,9 +88,15 @@ class CryptoTradingEnv:
             raise ValueError("Invalid action hysteresis thresholds provided.")
 
         # --- OHLCV idx sanity check ---
-        self.ohlcv_close_idx = ohlcv_close_idx
-        self.ohlcv_high_idx = ohlcv_high_idx
-        self.ohlcv_low_idx = ohlcv_low_idx
+        self.ohlcv_close_idx = (
+            ohlcv_close_idx if ohlcv_close_idx is not None else self.env_config.ohlcv_close_idx
+        )
+        self.ohlcv_high_idx = (
+            ohlcv_high_idx if ohlcv_high_idx is not None else self.env_config.ohlcv_high_idx
+        )
+        self.ohlcv_low_idx = (
+            ohlcv_low_idx if ohlcv_low_idx is not None else self.env_config.ohlcv_low_idx
+        )
         if enforce_hl:
             if self.ohlcv_close_idx is None or self.ohlcv_high_idx is None or self.ohlcv_low_idx is None:
                 raise ValueError(
@@ -103,8 +109,10 @@ class CryptoTradingEnv:
         self.idle_kappa = idle_kappa
         self.idle_lambda = idle_lambda
         self.ewma_beta = ewma_beta
-        self.min_hold_bars = int(min_hold_bars) if min_hold_bars else 0
-        self.flip_penalty = max(0.0, float(flip_penalty))
+        hold_bars = self.env_config.min_hold_bars if min_hold_bars is None else min_hold_bars
+        penalty = self.env_config.flip_penalty if flip_penalty is None else flip_penalty
+        self.min_hold_bars = int(hold_bars) if hold_bars else 0
+        self.flip_penalty = max(0.0, float(penalty))
 
         self.length = len(next(iter(data.values())))
         self.init_cash = 1.0
