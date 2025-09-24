@@ -1,8 +1,12 @@
 # train/reinforce/core/crypto_trading_env.py
 
+from __future__ import annotations
+
 import numpy as np
 import gymnasium as gym
 from collections import deque
+
+from ai_binance.train.reinforce.config import EnvConfig
 
 # ---- simple rolling buffer over steps ----
 class Rolling:
@@ -29,8 +33,8 @@ class CryptoTradingEnv:
         seq_lens: dict,
         maker_fee=0.0002,
         taker_fee=0.0005,
-        take_profit_pct=0.02,
-        stop_loss_pct=0.01,
+        take_profit_pct: float | None = None,
+        stop_loss_pct: float | None = None,
         # OHLCV 인덱스
         ohlcv_close_idx=None,
         ohlcv_high_idx=None,
@@ -45,14 +49,43 @@ class CryptoTradingEnv:
         ewma_beta=0.9,
         # (옵션) 채터링 억제
         min_hold_bars: int = 0,    # 최소 보유 바(0이면 비활성)
-        flip_penalty: float = 0.0  # 플립 시 추가 패널티(곱셈 반영, 예: 0.001 = 0.1%)
+        flip_penalty: float = 0.0,  # 플립 시 추가 패널티(곱셈 반영, 예: 0.001 = 0.1%)
+        *,
+        env_config: EnvConfig | None = None,
+        action_threshold_open: float | None = None,
+        action_threshold_close: float | None = None,
+        action_threshold_flip: float | None = None,
     ):
         self.data = data
         self.seq_lens = seq_lens
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
-        self.take_profit_pct = take_profit_pct
-        self.stop_loss_pct = stop_loss_pct
+        self.env_config = env_config or EnvConfig()
+        self.take_profit_pct = float(
+            take_profit_pct if take_profit_pct is not None else self.env_config.take_profit_pct
+        )
+        self.stop_loss_pct = float(
+            stop_loss_pct if stop_loss_pct is not None else self.env_config.stop_loss_pct
+        )
+        self.action_threshold_open = float(
+            action_threshold_open
+            if action_threshold_open is not None
+            else self.env_config.action_threshold_open
+        )
+        self.action_threshold_close = float(
+            action_threshold_close
+            if action_threshold_close is not None
+            else self.env_config.action_threshold_close
+        )
+        self.action_threshold_flip = float(
+            action_threshold_flip
+            if action_threshold_flip is not None
+            else self.env_config.action_threshold_flip
+        )
+        if not (
+            0.0 <= self.action_threshold_close <= self.action_threshold_open <= self.action_threshold_flip <= 1.0
+        ):
+            raise ValueError("Invalid action hysteresis thresholds provided.")
 
         # --- OHLCV idx sanity check ---
         self.ohlcv_close_idx = ohlcv_close_idx
@@ -112,12 +145,12 @@ class CryptoTradingEnv:
 
     def _quantize_action(self, a: float) -> int:
         """
-        Hysteresis:
-        - Open:   |a| > 0.30
-        - Close:  |a| < 0.15  (when already holding)
-        - Flip:   cross to opposite with |a| > 0.45
+        Hysteresis thresholds are driven by the configuration object to keep the
+        environment and agent in sync.
         """
-        th_open, th_close, th_flip = 0.30, 0.15, 0.45
+        th_open = self.action_threshold_open
+        th_close = self.action_threshold_close
+        th_flip = self.action_threshold_flip
 
         pos = int(getattr(self, "position", 0))
 

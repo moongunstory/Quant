@@ -1,47 +1,79 @@
 # train/reinforce/core/sac_lstm_agent.py
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from copy import deepcopy
-import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.utils import clip_grad_norm_
+
+from ai_binance.train.reinforce.config import TrainingConfig
 from ai_binance.train.reinforce.core.lstm_actor_critic import LSTMActor, LSTMCritic
 
 
 class SACLSTMAgent:
-    def __init__(self,
-                 input_dims: dict,
-                 action_dim,
-                 device="cpu",
-                 hidden_dim=128,
-                 lstm_layers=1,
-                 actor_lr=3e-4,
-                 critic_lr=3e-4,
-                 gamma=0.99,
-                 tau=0.01,
-                 alpha=0.2,
-                 total_steps=1_000_000,
-                 use_scheduler=True,
-                 eta_min=3e-5,
-                 target_entropy_scale = 1.0,     
-                 alpha_min = 0.02,
-                 alpha_max = 0.12,          
-                 clip_grad=5.0,
-                 use_fixed_alpha=False,
-                 fixed_alpha=0.10):
+    def __init__(
+        self,
+        input_dims: dict,
+        action_dim,
+        device="cpu",
+        hidden_dim=128,
+        lstm_layers=1,
+        *,
+        actor_lr=3e-4,
+        critic_lr=3e-4,
+        gamma=0.99,
+        tau=0.01,
+        alpha: float | None = None,
+        total_steps=1_000_000,
+        use_scheduler=True,
+        eta_min=3e-5,
+        target_entropy_scale: float | None = None,
+        alpha_min: float | None = None,
+        alpha_max: float | None = None,
+        clip_grad: float | None = None,
+        reward_scale: float | None = None,
+        training_config: TrainingConfig | None = None,
+        use_fixed_alpha=False,
+        fixed_alpha: float | None = None,
+    ):
         self.action_dim = int(action_dim)
         self.device = device
         self.gamma = gamma
         self.tau = tau
         self.total_steps = int(total_steps)
-        self.alpha_min = float(alpha_min)
-        self.alpha_max = float(alpha_max)
-        self.clip_grad = float(clip_grad)
+        self.config = training_config or TrainingConfig()
+        self.alpha_min = float(alpha_min if alpha_min is not None else self.config.alpha_min)
+        self.alpha_max = float(alpha_max if alpha_max is not None else self.config.alpha_max)
+        if self.alpha_min > self.alpha_max:
+            raise ValueError("alpha_min must be less than or equal to alpha_max.")
+        self.clip_grad = float(clip_grad if clip_grad is not None else self.config.grad_clip_norm)
+        self.reward_scale = float(reward_scale if reward_scale is not None else self.config.reward_scale)
+        self.target_entropy_scale = float(
+            target_entropy_scale if target_entropy_scale is not None else self.config.target_entropy_scale
+        )
+        self.target_entropy = self.target_entropy_scale * self.action_dim
         self.use_fixed_alpha = bool(use_fixed_alpha)
-        self.fixed_alpha = float(fixed_alpha)
+        default_fixed_alpha = self.config.fixed_alpha
+        self.fixed_alpha = float(fixed_alpha if fixed_alpha is not None else default_fixed_alpha)
+        self._fixed_alpha_tensor = (
+            torch.tensor(self.fixed_alpha, device=self.device, dtype=torch.float32)
+            if self.use_fixed_alpha
+            else None
+        )
+
+        init_alpha = float(alpha if alpha is not None else self.config.initial_alpha)
+        if init_alpha <= 0:
+            raise ValueError("alpha must be positive.")
 
         # --- 네트워크 ---
-        self.actor = LSTMActor(input_dims, action_dim, hidden_dim, lstm_layers).to(device)
+        self.actor = LSTMActor(
+            input_dims,
+            action_dim,
+            hidden_dim,
+            lstm_layers,
+            training_config=self.config,
+        ).to(device)
         self.critic_1 = LSTMCritic(input_dims, action_dim, hidden_dim, lstm_layers).to(device)
         self.critic_2 = LSTMCritic(input_dims, action_dim, hidden_dim, lstm_layers).to(device)
         self.critic_target_1 = deepcopy(self.critic_1).to(device)
@@ -55,33 +87,40 @@ class SACLSTMAgent:
         ]
 
         # --- scheduler: keep it but don't kill learning too early ---
-        self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.actor_opt, T_max=4*self.total_steps, eta_min=1e-4  # 더 천천히 감소
-        )
-        self.critic_schedulers = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2*self.total_steps, eta_min=1e-4)
-            for opt in getattr(self, "critic_opts", [])
-        ]
+        if use_scheduler:
+            self.actor_scheduler = CosineAnnealingLR(self.actor_opt, T_max=4 * self.total_steps, eta_min=eta_min)
+            self.critic_schedulers = [
+                CosineAnnealingLR(opt, T_max=2 * self.total_steps, eta_min=eta_min)
+                for opt in self.critic_opts
+            ]
+        else:
+            self.actor_scheduler = None
+            self.critic_schedulers = []
 
         # --- reward running stats (for TD only) ---
-        self.r_mu  = 0.0
+        self.r_mu = 0.0
         self.r_std = 1.0
-        self.reward_scale = 200.0  # gradient magnitude only, optimal policy 불변
 
         # --- entropy target & alpha autotune ---
-        self.target_entropy = -0.5 * action_dim  # 더 높은 엔트로피로 탐험 장려
-        self.log_alpha = torch.nn.Parameter(torch.log(torch.tensor(0.2, device=self.device)))
+        log_alpha_init = torch.log(torch.tensor(init_alpha, device=self.device, dtype=torch.float32))
+        self.log_alpha = torch.nn.Parameter(log_alpha_init)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=3e-4)
 
     # ===== Alpha helpers =====
     @property
     def alpha(self) -> float:
-        return float(self.log_alpha.exp().clamp(0.05, 0.3))
+        if self.use_fixed_alpha:
+            return float(self.fixed_alpha)
+        return float(self.log_alpha.exp().clamp(self.alpha_min, self.alpha_max))
 
     def _alpha_value(self) -> torch.Tensor:
         if self.use_fixed_alpha:
-            return torch.tensor(self.fixed_alpha, device=self.device)
-        return self.log_alpha.exp().clamp(0.05, 0.3)  # 통일된 범위
+            if self._fixed_alpha_tensor is None:
+                self._fixed_alpha_tensor = torch.tensor(
+                    self.fixed_alpha, device=self.device, dtype=torch.float32
+                )
+            return self._fixed_alpha_tensor
+        return self.log_alpha.exp().clamp(self.alpha_min, self.alpha_max)
 
     # ===== Utils =====
     def _to_tensor(self, batch_dict):
@@ -149,11 +188,6 @@ class SACLSTMAgent:
 
             # r: raw env reward (그대로 받아옴)
             r = reward
-
-            # 보상 정규화 완전 제거 - 원본 보상 그대로 사용
-            r = reward
-            target = r + (1.0 - done) * self.gamma * target_q
-
             target = r + (1.0 - done) * self.gamma * target_q
 
         current_q1, _ = self.critic_1(state_seq, action)
@@ -163,7 +197,9 @@ class SACLSTMAgent:
         for opt in self.critic_opts:
             opt.zero_grad(set_to_none=True)
         critic_loss.backward()
-        clip_grad_norm_(list(self.critic_1.parameters()) + list(self.critic_2.parameters()), max_norm=5.0)
+        clip_grad_norm_(
+            list(self.critic_1.parameters()) + list(self.critic_2.parameters()), max_norm=self.clip_grad
+        )
         for opt in self.critic_opts:
             opt.step()
 
@@ -188,7 +224,7 @@ class SACLSTMAgent:
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
+        clip_grad_norm_(self.actor.parameters(), max_norm=self.clip_grad)
         self.actor_opt.step()
 
         # --- Alpha 자동 튜닝(고정 모드면 skip) ---
@@ -224,8 +260,9 @@ class SACLSTMAgent:
             target_param.data.copy_(self.tau * source_param.data + (1.0 - self.tau) * target_param.data)
 
     def set_target_entropy_scale(self, scale: float):
-        """Scale ∈ [0.6, 1.0]; target entropy = base * scale."""
-        self.target_entropy_scale = float(np.clip(scale, 0.6, 1.0))
+        """Update the entropy target multiplier and recompute the target entropy."""
+        self.target_entropy_scale = float(scale)
+        self.target_entropy = self.target_entropy_scale * self.action_dim
 
     # 런타임에서 정책 분산 범위를 조절할 수 있게 훅 제공
     @torch.no_grad()
