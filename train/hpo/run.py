@@ -19,6 +19,7 @@ from ai_binance.config.paths import (
     get_train_parquet_path,
     HPO_DIR,  # 베이스만 import, 나머지는 런타임에 버전별로 생성
 )
+from ai_binance.train.reinforce.config import TrainingConfig, EnvConfig
 
 # === 실행마다 버전 자동 분리 토글 ===
 SPLIT_RUN = True  # True: 새 버전(1,2,3,...) 생성 / False: 가장 최근 버전에 이어서
@@ -42,6 +43,9 @@ def _resolve_hpo_paths(split_run: bool):
 
 VERSION, HPO_VERSION_DIR, HPO_LOGS_DIR, OPTUNA_DB_PATH, TOP_N_PARAMS_PATH = _resolve_hpo_paths(SPLIT_RUN)
 
+TRAINING_CONFIG = TrainingConfig()
+ENV_CONFIG = EnvConfig()
+
 from ai_binance.train.hpo.core.feature_selector import select_features_from_trial
 from ai_binance.train.hpo.core.feature_builder import build_feature_dfs
 from ai_binance.train.prepare.process.feature_registry import rl_hparams
@@ -50,16 +54,18 @@ from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
 from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
 from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
 
-
-# --- OHLCV 인덱스 (env가 참조) ---
-CLOSE_IDX = 3  # [open, high, low, close] 순서 기준
-HIGH_IDX  = 1
-LOW_IDX   = 2
-
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
 def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
     sym_suffix = "_eth" if symbol == "ethusdt" else "_btc"
     return [c for c in df.columns if c.startswith("funding") and c.endswith(sym_suffix)]
+
+
+def _resolve_seq_lens(data_dict: dict[str, np.ndarray], env_config: EnvConfig) -> dict[str, int]:
+    """Derive sequence lengths for the groups present in ``data_dict``."""
+
+    base = env_config.seq_lens
+    default_len = base.get("ohlcv", max(base.values()))
+    return {group: base.get(group, default_len) for group in data_dict}
 
 
 def _merge_features(dfs: dict, ohlcv_df: pd.DataFrame):
@@ -164,7 +170,21 @@ def _prepare_data_for_env(df: pd.DataFrame, symbol_hint: str = None):
     return data_dict
 
 
-def _evaluate_agent(agent, env, eval_steps=1000, mdd_penalty=1.0):
+def _evaluate_agent(
+    agent,
+    env,
+    eval_steps: int = 1000,
+    mdd_penalty: float | None = None,
+    risk_free_rate: float | None = None,
+    training_config: TrainingConfig | None = None,
+):
+    config = training_config or TRAINING_CONFIG
+    penalty = config.evaluation_mdd_penalty if mdd_penalty is None else mdd_penalty
+    rf_rate = config.risk_free_rate if risk_free_rate is None else risk_free_rate
+    sharpe_weight = config.evaluation_sharpe_weight
+    calmar_weight = config.evaluation_calmar_weight
+    periods_per_year = config.periods_per_year
+
     obs = env.reset()
     done, steps = False, 0
     rets = []
@@ -190,12 +210,30 @@ def _evaluate_agent(agent, env, eval_steps=1000, mdd_penalty=1.0):
     values = np.insert(values, 0, 1.0)  # start NAV=1.0
 
     returns = np.diff(values) / values[:-1]
-    sharpe = returns.mean() / (returns.std() + 1e-8)
+    if returns.size == 0:
+        return -np.inf
+
+    per_period_rf = rf_rate / periods_per_year if periods_per_year else 0.0
+    excess_returns = returns - per_period_rf
+    vol = returns.std(ddof=0)
+    if vol > 0:
+        annual_sharpe = (excess_returns.mean() / vol) * np.sqrt(periods_per_year)
+    else:
+        annual_sharpe = 0.0
 
     peak = np.maximum.accumulate(values)
-    max_dd = np.max((peak - values) / (peak + 1e-8))
+    drawdowns = (peak - values) / (peak + 1e-8)
+    max_dd = float(drawdowns.max()) if drawdowns.size else 0.0
 
-    score = sharpe - mdd_penalty * max_dd
+    periods = returns.size
+    if periods > 0 and values[0] > 0 and values[-1] > 0:
+        total_return = values[-1] / values[0]
+        cagr = total_return ** (periods_per_year / periods) - 1.0 if total_return > 0 else 0.0
+    else:
+        cagr = 0.0
+    calmar_ratio = cagr / max_dd if max_dd > 0 else 0.0
+
+    score = sharpe_weight * annual_sharpe + calmar_weight * calmar_ratio - penalty * max_dd
     return float(score)
 
 
@@ -256,11 +294,26 @@ def run_hpo(
         cols_to_use = ["timestamp"] + base_cols + selected_feats + mandatory_cols
         cols_to_use = list(dict.fromkeys(cols_to_use))
         merged_df = df_ohlcv[cols_to_use]
-        if merged_df.empty or len(merged_df) < (hpo_train_steps + hpo_eval_steps):
-            raise optuna.exceptions.TrialPruned("Insufficient data.")
+        if merged_df.empty:
+            raise optuna.exceptions.TrialPruned("No data available after feature merge.")
 
-        train_df = merged_df.iloc[:-(hpo_eval_steps + 100)]
-        eval_df = merged_df.iloc[-(hpo_eval_steps + 100):]
+        total_len = len(merged_df)
+        max_seq_len = max(ENV_CONFIG.seq_lens.values())
+        min_train_len = hpo_train_steps + max_seq_len
+        min_eval_len = hpo_eval_steps + max_seq_len
+
+        if total_len < (min_train_len + min_eval_len):
+            raise optuna.exceptions.TrialPruned("Insufficient data for requested horizons.")
+
+        proposed_split = int(total_len * TRAINING_CONFIG.train_split_ratio)
+        lower_bound = min_train_len
+        upper_bound = total_len - min_eval_len
+        if upper_bound < lower_bound:
+            raise optuna.exceptions.TrialPruned("Unable to allocate disjoint train/eval windows.")
+
+        split_idx = min(max(proposed_split, lower_bound), upper_bound)
+        train_df = merged_df.iloc[:split_idx]
+        eval_df = merged_df.iloc[split_idx:]
 
         # ----- 여기서부터: data_dict 구성 시 OHLCV 4열 선두 배치 -----
         train_data_dict = _prepare_data_for_env(train_df, symbol_hint=symbol)
@@ -269,54 +322,65 @@ def run_hpo(
         if "ohlcv" not in train_data_dict or "ohlcv" not in eval_data_dict:
             raise optuna.exceptions.TrialPruned("No ohlcv group found.")
 
-        params = {"input_dims": {k: v.shape[1] for k, v in train_data_dict.items()}}
+        agent_params = {"input_dims": {k: v.shape[1] for k, v in train_data_dict.items()}}
         for name, cfg in rl_hparams.items():
             if cfg["type"] == "categorical":
-                params[name] = trial.suggest_categorical(name, cfg["choices"])
+                agent_params[name] = trial.suggest_categorical(name, cfg["choices"])
             else:
-                params[name] = trial.suggest_float(name, cfg["min"], cfg["max"], log=cfg.get("log", False))
-        
+                agent_params[name] = trial.suggest_float(
+                    name,
+                    cfg["min"],
+                    cfg["max"],
+                    log=cfg.get("log", False),
+                )
+
         # guard
-        if params.get("critic_lr", 1e-3) < 1e-4 or params.get("actor_lr", 1e-3) < 1e-4:
+        if agent_params.get("critic_lr", 1e-3) < 1e-4 or agent_params.get("actor_lr", 1e-3) < 1e-4:
             raise optuna.exceptions.TrialPruned("lr too low")
 
         action_dim = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        group_seq_lens = {"ohlcv": 48, "index": 48, "funding": 7, "dune": 7}
-        if 'other' in train_data_dict:
-            group_seq_lens['other'] = 48
+        group_seq_lens = _resolve_seq_lens(train_data_dict, ENV_CONFIG)
+        max_seq_from_groups = max(group_seq_lens.values())
+        if len(train_df) - max_seq_from_groups < hpo_train_steps:
+            raise optuna.exceptions.TrialPruned("Training window shorter than training horizon.")
+        if len(eval_df) - max_seq_from_groups < hpo_eval_steps:
+            raise optuna.exceptions.TrialPruned("Evaluation window shorter than evaluation horizon.")
 
         # --- Env: HL 인덱스 반드시 지정 + 채터링 억제 옵션 ---
         env_kwargs = dict(
             seq_lens=group_seq_lens,
-            ohlcv_close_idx=CLOSE_IDX,
-            ohlcv_high_idx=HIGH_IDX,
-            ohlcv_low_idx=LOW_IDX,
+            env_config=ENV_CONFIG,
             enforce_hl=True,
-            min_hold_bars=6,        # ~30min on 5m bars
-            flip_penalty=0.0014,    # ≈ 2*(taker 0.0005 + slippage 0.0002)
         )
         train_env = CryptoTradingEnv(train_data_dict, **env_kwargs)
-        eval_env  = CryptoTradingEnv(eval_data_dict,  **env_kwargs)
+        eval_env = CryptoTradingEnv(eval_data_dict, **env_kwargs)
 
         agent = SACLSTMAgent(
             action_dim=action_dim,
             device=device,
             total_steps=hpo_train_steps,
             use_scheduler=False,           # ← 고정
-            **params
+            training_config=TRAINING_CONFIG,
+            **agent_params,
         )
         # 정책 분산 범위 고정(네트워크 기본과 동일하지만 명시)
         if hasattr(agent, "set_log_std_bounds"):
             agent.set_log_std_bounds(-1.2, 0.2)
 
         # HPO(5k) 기준: 업데이트 구간을 확실히 확보
-        hpo_batch_size = 256
-        learning_starts = max(10_000, int(0.2 * hpo_train_steps))  # 깊은 버퍼 확보
+        hpo_batch_size = TRAINING_CONFIG.hpo_batch_size
+        learning_starts = TRAINING_CONFIG.compute_learning_starts(hpo_train_steps)
+        learning_starts = max(learning_starts, hpo_batch_size)
+        max_available_steps = len(train_df) - max_seq_from_groups
+        if learning_starts >= hpo_train_steps:
+            learning_starts = max(group_seq_lens.get("ohlcv", 1), hpo_train_steps // 2)
+        learning_starts = min(learning_starts, max_available_steps - 1)
+        learning_starts = max(0, learning_starts)
 
         replay_buffer = SequenceReplayBuffer(
             max_size=50_000,
-            input_dims=params["input_dims"],
+            input_dims=agent_params["input_dims"],
             action_dim=action_dim,
             seq_lens=group_seq_lens,
             batch_size=hpo_batch_size
@@ -351,14 +415,21 @@ def run_hpo(
                 m = train_env.tb_metrics()
                 trades_1k = m.get("trades_per_1k", 0.0)
                 hold_mean = m.get("holding_bars_mean", 0.0)
-                if trades_1k < 20 or hold_mean == 0:
+                min_trades = TRAINING_CONFIG.min_trades_per_1k
+                max_trades = TRAINING_CONFIG.max_trades_per_1k
+                if trades_1k < min_trades or hold_mean == 0:
                     raise optuna.exceptions.TrialPruned("no trading")
-                if trades_1k > 150:
+                if trades_1k > max_trades:
                     raise optuna.exceptions.TrialPruned("too much turnover")
 
             obs = next_obs if not done else train_env.reset()
 
-        score = _evaluate_agent(agent, eval_env, hpo_eval_steps)
+        score = _evaluate_agent(
+            agent,
+            eval_env,
+            hpo_eval_steps,
+            training_config=TRAINING_CONFIG,
+        )
 
         top_n_trials = study.user_attrs.get('top_n_trials', {})
         worst_score = min(top_n_trials.values()) if len(top_n_trials) == top_n else -float("inf")

@@ -153,7 +153,11 @@ def main(args):
     action_dim = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    group_seq_lens = {"ohlcv": 64, "index": 64, "funding": 64, "dune": 64}
+    default_seq_len = env_config.seq_lens.get("ohlcv", max(env_config.seq_lens.values()))
+    group_seq_lens = {
+        group: env_config.seq_lens.get(group, default_seq_len)
+        for group in data_dict
+    }
 
     env = CryptoTradingEnv(data_dict, seq_lens=group_seq_lens, env_config=env_config)
     agent = SACLSTMAgent(action_dim=action_dim, device=device, **rl_params)
