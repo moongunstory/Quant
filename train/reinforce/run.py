@@ -18,6 +18,7 @@ from ai_binance.train.hpo.core.feature_builder import build_feature_dfs
 from ai_binance.train.hpo.run import _merge_features, _prepare_data_for_env
 
 # RL 관련 모듈 임포트
+from ai_binance.train.reinforce.config import EnvConfig, TrainingConfig
 from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
 from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
 from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
@@ -115,18 +116,46 @@ def main(args):
     # 새 학습 세팅 파라미터 전달 (에이전트 쪽에 추가된 인자)
     rl_params.setdefault("use_scheduler", True)
     rl_params.setdefault("eta_min", 3e-5)
-    rl_params.setdefault("target_entropy_scale", 0.75)
-    rl_params.setdefault("alpha_min", 1e-4)
-    rl_params.setdefault("alpha_max", 10.0)
-    rl_params.setdefault("clip_grad", 5.0)
+
+    default_training_config = TrainingConfig()
+    training_config_kwargs = {}
+
+    if "log_std_min" in rl_params:
+        training_config_kwargs["log_std_min"] = rl_params.pop("log_std_min")
+    if "log_std_max" in rl_params:
+        training_config_kwargs["log_std_max"] = rl_params.pop("log_std_max")
+    if "alpha_min" in rl_params:
+        training_config_kwargs["alpha_min"] = rl_params.pop("alpha_min")
+    if "alpha_max" in rl_params:
+        training_config_kwargs["alpha_max"] = rl_params.pop("alpha_max")
+    if "clip_grad" in rl_params:
+        training_config_kwargs["grad_clip_norm"] = rl_params.pop("clip_grad")
+    if "reward_scale" in rl_params:
+        training_config_kwargs["reward_scale"] = rl_params.pop("reward_scale")
+    if "initial_alpha" in rl_params:
+        training_config_kwargs["initial_alpha"] = rl_params.pop("initial_alpha")
+    if "fixed_alpha" in rl_params:
+        training_config_kwargs["fixed_alpha"] = rl_params.pop("fixed_alpha")
+    if "target_entropy_scale" in rl_params:
+        te_scale = rl_params.pop("target_entropy_scale")
+        if te_scale > 0:
+            training_config_kwargs["target_entropy_scale"] = (
+                default_training_config.target_entropy_scale * te_scale
+            )
+        else:
+            training_config_kwargs["target_entropy_scale"] = te_scale
+
+    training_config = TrainingConfig(**training_config_kwargs)
+    env_config = EnvConfig()
 
     rl_params["input_dims"] = {k: v.shape[1] for k, v in data_dict.items()}
+    rl_params["training_config"] = training_config
     action_dim = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     group_seq_lens = {"ohlcv": 64, "index": 64, "funding": 64, "dune": 64}
 
-    env = CryptoTradingEnv(data_dict, seq_lens=group_seq_lens)
+    env = CryptoTradingEnv(data_dict, seq_lens=group_seq_lens, env_config=env_config)
     agent = SACLSTMAgent(action_dim=action_dim, device=device, **rl_params)
     replay_buffer = SequenceReplayBuffer(
         max_size=args.buffer_size,

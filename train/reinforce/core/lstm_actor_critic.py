@@ -1,16 +1,25 @@
 # train/reinforce/networks/lstm_actor_critic.py
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
-LOG_STD_MIN = -1.0   # σ ≈ 0.37
-LOG_STD_MAX = 0.0    # σ ≈ 1.0
+from ai_binance.train.reinforce.config import TrainingConfig
 
 
 class LSTMActor(nn.Module):
-    def __init__(self, input_dims, action_dim, hidden_dim=128, lstm_layers=1,
-                 log_std_min: float = LOG_STD_MIN,
-                 log_std_max: float = LOG_STD_MAX):
+    def __init__(
+        self,
+        input_dims,
+        action_dim,
+        hidden_dim=128,
+        lstm_layers=1,
+        *,
+        training_config: TrainingConfig | None = None,
+        log_std_min: float | None = None,
+        log_std_max: float | None = None,
+    ):
         """
         input_dims: {"ohlcv": 8, "funding": 4, "dune": 3}
         """
@@ -18,9 +27,11 @@ class LSTMActor(nn.Module):
         self.lstm_modules = nn.ModuleDict()
         self.hidden_dim = hidden_dim
 
+        config = training_config or TrainingConfig()
+
         # log-std 범위(런타임에 조절 가능)
-        self.log_std_min = float(log_std_min)
-        self.log_std_max = float(log_std_max)
+        self.log_std_min = float(log_std_min if log_std_min is not None else config.log_std_min)
+        self.log_std_max = float(log_std_max if log_std_max is not None else config.log_std_max)
 
         for name, dim in input_dims.items():
             self.lstm_modules[name] = nn.LSTM(
