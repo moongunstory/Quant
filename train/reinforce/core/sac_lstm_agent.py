@@ -66,15 +66,17 @@ class SACLSTMAgent:
         )
         target_entropy_scale = cfg.get(
             "target_entropy_scale",
-            target_entropy_scale if target_entropy_scale is not None else 1.0,
+            target_entropy_scale if target_entropy_scale is not None else 0.7,
         )
         self.target_entropy_scale = float(target_entropy_scale)
+        if self.target_entropy_scale <= 0:
+            raise ValueError("target_entropy_scale must be positive.")
         self.target_entropy = -float(self.action_dim) * self.target_entropy_scale
-        self.log_std_min = float(cfg.get("log_std_min", -2.5))
-        self.log_std_max = float(cfg.get("log_std_max", -0.5))
+        self.log_std_min = float(cfg.get("log_std_min", -2.8))
+        self.log_std_max = float(cfg.get("log_std_max", -0.8))
         if self.log_std_min >= self.log_std_max:
             raise ValueError("log_std_min must be less than log_std_max.")
-        self.init_log_std = float(cfg.get("init_log_std", -1.5))
+        self.init_log_std = float(cfg.get("init_log_std", -1.6))
         self.use_fixed_alpha = bool(use_fixed_alpha)
         default_fixed_alpha = self.config.fixed_alpha
         self.fixed_alpha = float(fixed_alpha if fixed_alpha is not None else default_fixed_alpha)
@@ -105,7 +107,10 @@ class SACLSTMAgent:
 
         if hasattr(self.actor, "fc_log_std"):
             with torch.no_grad():
-                self.actor.fc_log_std.bias.fill_(self.init_log_std)
+                init_log_std = float(
+                    max(self.log_std_min, min(self.init_log_std, self.log_std_max))
+                )
+                self.actor.fc_log_std.bias.fill_(init_log_std)
 
         # --- Optimizers ---
         actor_lr = float(cfg.get("actor_lr", actor_lr if actor_lr is not None else 1e-4))
@@ -300,7 +305,10 @@ class SACLSTMAgent:
 
     def set_target_entropy_scale(self, scale: float):
         """Update the entropy target multiplier and recompute the target entropy."""
-        self.target_entropy_scale = float(scale)
+        scale_value = float(scale)
+        if scale_value <= 0:
+            raise ValueError("target_entropy_scale must be positive.")
+        self.target_entropy_scale = scale_value
         self.target_entropy = -float(self.action_dim) * self.target_entropy_scale
 
     # 런타임에서 정책 분산 범위를 조절할 수 있게 훅 제공

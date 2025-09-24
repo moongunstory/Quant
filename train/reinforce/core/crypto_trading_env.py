@@ -25,7 +25,7 @@ class CryptoTradingEnv:
     텐서보드 지표(Trade/*):
         trades_per_1k, tp_hit_rate_1k, sl_hit_rate_1k, forced_exit_rate_1k,
         avg_R, holding_bars_mean, funding_cost_mean(부호 포함), reward_mean,
-        equity(순자산, NET), turnover, action_flat_rate_1k, action_flip_rate_1k
+        equity(순자산, NET), turnover, flat_rate_1k, flip_rate_1k
     """
     def __init__(
         self,
@@ -69,9 +69,9 @@ class CryptoTradingEnv:
         self.stop_loss_pct = float(
             stop_loss_pct if stop_loss_pct is not None else self.env_config.stop_loss_pct
         )
-        base_th_open = 0.45 if action_threshold_open is None else float(action_threshold_open)
-        base_th_close = 0.20 if action_threshold_close is None else float(action_threshold_close)
-        base_th_flip = 0.70 if action_threshold_flip is None else float(action_threshold_flip)
+        base_th_open = 0.38 if action_threshold_open is None else float(action_threshold_open)
+        base_th_close = 0.18 if action_threshold_close is None else float(action_threshold_close)
+        base_th_flip = 0.60 if action_threshold_flip is None else float(action_threshold_flip)
 
         self.th_open = float(cfg.get("th_open", base_th_open))
         self.th_close = float(cfg.get("th_close", base_th_close))
@@ -112,9 +112,13 @@ class CryptoTradingEnv:
         self.use_idle_penalty = bool(cfg.get("use_idle_penalty", use_idle_penalty)) and self.idle_penalty > 0
         self.idle_lambda = self.idle_penalty
 
-        hold_bars_default = self.env_config.min_hold_bars
+        hold_bars_default = self.env_config.min_hold_bars or 0
         if min_hold_bars is not None:
             hold_bars_default = min_hold_bars
+        if hold_bars_default:
+            hold_bars_default = int(max(8, min(10, hold_bars_default)))
+        else:
+            hold_bars_default = 9
         self.min_hold_bars = int(cfg.get("min_hold_bars", hold_bars_default)) if hold_bars_default else 0
 
         flip_penalty_default = self.env_config.flip_penalty if flip_penalty is None else flip_penalty
@@ -151,6 +155,8 @@ class CryptoTradingEnv:
         self._roll_reward  = Rolling(1000)   # per-step net return
         self._roll_funding = Rolling(1000)   # pos * funding_rate (부호 포함)
         self._roll_turnover= Rolling(1000)   # |pos_t - pos_{t-1}|
+        self._roll_abs_pos = Rolling(1000)
+        self._roll_dpos    = Rolling(1000)
 
         self.reset()
 
@@ -207,7 +213,7 @@ class CryptoTradingEnv:
             self._roll_trade_close, self._roll_tp_close, self._roll_sl_close,
             self._roll_forced_close, self._roll_action_flat, self._roll_action_flip,
             self._roll_R, self._roll_hold_bars, self._roll_reward,
-            self._roll_funding, self._roll_turnover
+            self._roll_funding, self._roll_turnover, self._roll_abs_pos, self._roll_dpos
         ):
             r.buf.clear()
 
@@ -349,7 +355,8 @@ class CryptoTradingEnv:
             self._roll_tp_close.add(0.0)
             self._roll_sl_close.add(0.0)
             self._roll_forced_close.add(0.0)
-            # action_* are per-closure stats; no need to record zeros here
+            self._roll_action_flat.add(0.0)
+            self._roll_action_flip.add(0.0)
 
         # turnover 기록 및 빈도 비용 적용
         pos_now = int(self.position)
@@ -357,6 +364,8 @@ class CryptoTradingEnv:
         if self.turnover_penalty > 0 and turn_units > 0:
             self.portfolio_value *= max(1.0 - self.turnover_penalty * turn_units, 1e-12)
         self._roll_turnover.add(turn_units)
+        self._roll_dpos.add(float(turn_units))
+        self._roll_abs_pos.add(abs(pos_now))
 
         # --- 보상 계산: step 순수익률 (PV 일치) ---
         reward = np.log(self.portfolio_value / nav_before)
@@ -385,6 +394,8 @@ class CryptoTradingEnv:
         tp_rate = self._roll_tp_close.sum() / completed
         sl_rate = self._roll_sl_close.sum() / completed
         forced_rate = self._roll_forced_close.sum() / completed
+        flip_rate_1k = 1000.0 * self._roll_action_flip.mean()
+        flat_rate_1k = 1000.0 * self._roll_action_flat.mean()
 
         return {
             "trades_per_1k": trades_per_1k,
@@ -397,8 +408,10 @@ class CryptoTradingEnv:
             "reward_mean": self._roll_reward.mean(),
             "equity": float(self.portfolio_history[-1]) if self.portfolio_history else 0.0,
             "turnover": self._roll_turnover.mean(),
-            "action_flat_rate_1k": self._roll_action_flat.sum() / completed,
-            "action_flip_rate_1k": self._roll_action_flip.sum() / completed,
+            "flip_rate_1k": flip_rate_1k,
+            "flat_rate_1k": flat_rate_1k,
+            "abs_pos": self._roll_abs_pos.mean(),
+            "dpos": self._roll_dpos.mean(),
         }
 
     def render(self):

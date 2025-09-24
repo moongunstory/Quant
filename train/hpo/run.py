@@ -52,6 +52,11 @@ from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
 from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
 from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
 
+HEALTH_CHECK_INTERVAL = 1_000
+HEALTH_STAGE1_STEP = 8_000
+HEALTH_STAGE2_STEP = 22_000
+CRITIC_LOSS_LIMIT = 0.2
+
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
 def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
     sym_suffix = "_eth" if symbol == "ethusdt" else "_btc"
@@ -252,11 +257,25 @@ def run_hpo(
     # Windows 안전 SQLite URI
     storage_uri = "sqlite:///" + OPTUNA_DB_PATH.as_posix()
 
+    sampler = optuna.samplers.TPESampler(
+        consider_endpoints=True,
+        multivariate=True,
+        group=True,
+        seed=42,
+    )
+    pruner = optuna.pruners.HyperbandPruner(
+        min_resource=HEALTH_STAGE1_STEP,
+        max_resource=hpo_train_steps,
+        reduction_factor=3,
+    )
+
     study = optuna.create_study(
         direction="maximize",
         load_if_exists=True,
         storage=storage_uri,
         study_name=study_name,
+        sampler=sampler,
+        pruner=pruner,
     )
 
     print(f"[HPO] version={VERSION} dir={HPO_VERSION_DIR} db={OPTUNA_DB_PATH} study={study.study_name}")
@@ -273,6 +292,51 @@ def run_hpo(
         log_dir = HPO_LOGS_DIR / f"hpo_trial_{trial.number:03d}"
         log_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(log_dir))
+
+        last_critic_loss: float | None = None
+        last_log_std_mean: float | None = None
+        last_policy_entropy: float | None = None
+        last_metrics: dict[str, float] = {}
+
+        def _log_health_event(message: str, step_idx: int) -> None:
+            msg = f"[HPO][Trial {trial.number}] {message}"
+            print(msg)
+            try:
+                writer.add_text("Health/events", msg, int(step_idx))
+            except Exception:
+                pass
+
+        def _prune(reason: str, step_idx: int) -> None:
+            _log_health_event(f"PRUNE step={step_idx}: {reason}", step_idx)
+            raise optuna.exceptions.TrialPruned(reason)
+
+        def _run_health_checks(step_idx: int, metrics: dict[str, float] | None) -> None:
+            metrics_local = metrics or {}
+            if last_critic_loss is not None:
+                if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
+                    _prune(f"critic_loss={last_critic_loss:.4f}", step_idx)
+            if step_idx >= HEALTH_STAGE1_STEP:
+                trades = metrics_local.get("trades_per_1k")
+                if trades is not None:
+                    if not np.isfinite(trades):
+                        _prune("trades_per_1k not finite", step_idx)
+                    if trades < 3.0 or trades > 120.0:
+                        _prune(f"trades_per_1k={trades:.2f}", step_idx)
+                if last_log_std_mean is not None:
+                    if (not np.isfinite(last_log_std_mean)) or not (-3.2 <= last_log_std_mean <= -0.3):
+                        _prune(f"log_std_mean={last_log_std_mean:.3f}", step_idx)
+            if step_idx >= HEALTH_STAGE2_STEP:
+                avg_r = metrics_local.get("avg_R")
+                equity_val = metrics_local.get("equity")
+                if (
+                    avg_r is not None
+                    and equity_val is not None
+                    and np.isfinite(avg_r)
+                    and np.isfinite(equity_val)
+                    and avg_r < -0.06
+                    and equity_val < 0.90
+                ):
+                    _prune(f"avg_R={avg_r:.4f}, equity={equity_val:.4f}", step_idx)
 
         selected_feats = select_features_from_trial(trial, available_features)
         if not selected_feats:
@@ -323,10 +387,10 @@ def run_hpo(
         input_dims = {k: v.shape[1] for k, v in train_data_dict.items()}
 
         agent_cfg = {
-            "target_entropy_scale": trial.suggest_float("target_entropy_scale", 0.7, 1.3),
-            "init_log_std": trial.suggest_float("init_log_std", -2.0, -1.0),
-            "log_std_min": trial.suggest_float("log_std_min", -3.0, -2.0),
-            "log_std_max": trial.suggest_float("log_std_max", -0.7, -0.3),
+            "target_entropy_scale": trial.suggest_float("target_entropy_scale", 0.5, 1.5),
+            "init_log_std": trial.suggest_float("init_log_std", -2.5, -0.8),
+            "log_std_min": trial.suggest_float("log_std_min", -3.5, -1.5),
+            "log_std_max": trial.suggest_float("log_std_max", -1.2, -0.3),
             "alpha_init": trial.suggest_float("alpha_init", 0.10, 0.30),
             "alpha_lr": trial.suggest_categorical("alpha_lr", [1e-4, 3e-4]),
             "actor_lr": trial.suggest_categorical("actor_lr", [1e-4, 3e-4]),
@@ -336,12 +400,12 @@ def run_hpo(
         }
 
         env_cfg = {
-            "th_open": trial.suggest_float("th_open", 0.35, 0.55),
-            "th_close": trial.suggest_float("th_close", 0.15, 0.30),
-            "th_flip": trial.suggest_float("th_flip", 0.55, 0.80),
-            "min_hold_bars": trial.suggest_categorical("min_hold_bars", [8, 10, 12]),
-            "turnover_penalty": trial.suggest_float("turnover_penalty", 0.0000, 0.0100),
-            "flip_penalty": trial.suggest_float("flip_penalty", 0.0010, 0.0040),
+            "th_open": trial.suggest_float("th_open", 0.25, 0.60),
+            "th_close": trial.suggest_float("th_close", 0.10, 0.30),
+            "th_flip": trial.suggest_float("th_flip", 0.45, 0.85),
+            "min_hold_bars": trial.suggest_int("min_hold_bars", 6, 14),
+            "turnover_penalty": trial.suggest_float("turnover_penalty", 0.0000, 0.0200),
+            "flip_penalty": trial.suggest_float("flip_penalty", 0.0000, 0.0050),
             "reward_scale": trial.suggest_categorical("reward_scale", [100, 300, 1000]),
             "idle_penalty": 0.0,
         }
@@ -396,73 +460,78 @@ def run_hpo(
             batch_size=hpo_batch_size
         )
 
-        last_critic_loss: float | None = None
         obs = train_env.reset()
-        for step in range(hpo_train_steps):
-            action = agent.select_action(obs)  # 학습은 확률 정책
-            next_obs, reward, done, _ = train_env.step(action)
-            replay_buffer.add(obs, action, reward, next_obs, done)
 
-            # 업데이트 & Loss 로깅
-            if len(replay_buffer) >= learning_starts:
-                losses = agent.update(replay_buffer, batch_size=replay_buffer.batch_size)
-                if losses:
-                    for k, v in losses.items():
-                        writer.add_scalar(f"Loss/{k}", v, step)
-                    if "critic_loss" in losses:
-                        last_critic_loss = float(losses["critic_loss"])
+        try:
+            for step in range(hpo_train_steps):
+                metrics_snapshot = None
+                action = agent.select_action(obs)  # 학습은 확률 정책
+                next_obs, reward, done, _ = train_env.step(action)
+                replay_buffer.add(obs, action, reward, next_obs, done)
 
-            # (A) 거래 지표 텐서보드 기록
-            if step % 200 == 0 and hasattr(train_env, "tb_metrics"):
-                m = train_env.tb_metrics()
-                for k, v in m.items():
-                    writer.add_scalar(f"Trade/{k}", v, step)
+                if len(replay_buffer) >= learning_starts:
+                    losses = agent.update(replay_buffer, batch_size=replay_buffer.batch_size)
+                    if losses:
+                        for k, v in losses.items():
+                            writer.add_scalar(f"Loss/{k}", v, step)
+                        critic_val = losses.get("critic_loss")
+                        if critic_val is not None:
+                            last_critic_loss = float(critic_val)
+                            if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
+                                _prune(f"critic_loss={last_critic_loss:.4f}", step)
+                        if "log_std_mean" in losses:
+                            last_log_std_mean = float(losses["log_std_mean"])
+                        if "policy_entropy" in losses:
+                            last_policy_entropy = float(losses["policy_entropy"])
 
-            # (B) 타깃 엔트로피 스케줄 (1.0 → 0.7 선형; 에이전트에서 [0.6,1.0]으로 클램프)
-            if hasattr(agent, "set_target_entropy_scale"):
-                scale = 1.0 - 0.3 * (step / hpo_train_steps)
-                agent.set_target_entropy_scale(scale)
+                if step % 200 == 0 and hasattr(train_env, "tb_metrics"):
+                    metrics_snapshot = train_env.tb_metrics()
+                    last_metrics = metrics_snapshot
+                    for k, v in metrics_snapshot.items():
+                        writer.add_scalar(f"Trade/{k}", v, step)
 
-            # (C) 10k 스텝 이후 헬스체크 프루닝
-            if step >= 10_000 and step % 1000 == 0 and hasattr(train_env, "tb_metrics"):
-                metrics = train_env.tb_metrics()
-                trades_per_1k = metrics.get("trades_per_1k", 0.0)
-                if trades_per_1k > 85.0:
-                    raise optuna.exceptions.TrialPruned("overtrading")
-                if last_critic_loss is not None and (
-                    np.isnan(last_critic_loss) or last_critic_loss > 0.2
-                ):
-                    raise optuna.exceptions.TrialPruned("critic_diverged")
+                if step and step % HEALTH_CHECK_INTERVAL == 0:
+                    if metrics_snapshot is None and hasattr(train_env, "tb_metrics"):
+                        metrics_snapshot = train_env.tb_metrics()
+                        last_metrics = metrics_snapshot
+                    _run_health_checks(step, last_metrics)
+                    if last_metrics:
+                        equity_for_report = float(last_metrics.get("equity", 0.0))
+                        if np.isfinite(equity_for_report):
+                            trial.report(equity_for_report, step)
+                            if trial.should_prune():
+                                _prune("optuna_pruner", step)
 
-            obs = next_obs if not done else train_env.reset()
+                obs = next_obs if not done else train_env.reset()
 
-        score = _evaluate_agent(
-            agent,
-            eval_env,
-            hpo_eval_steps,
-            training_config=TRAINING_CONFIG,
-        )
+            score = _evaluate_agent(
+                agent,
+                eval_env,
+                hpo_eval_steps,
+                training_config=TRAINING_CONFIG,
+            )
 
-        top_n_trials = study.user_attrs.get('top_n_trials', {})
-        worst_score = min(top_n_trials.values()) if len(top_n_trials) == top_n else -float("inf")
+            top_n_trials = study.user_attrs.get('top_n_trials', {})
+            worst_score = min(top_n_trials.values()) if len(top_n_trials) == top_n else -float("inf")
 
-        if score > worst_score or len(top_n_trials) < top_n:
-            print(f"\n🔥 Trial {trial.number} is in top {top_n}! Score: {float(score):.6f}. Saving params...\n")
-            # top-N 파라미터 저장
-            save_path = TOP_N_PARAMS_PATH / f"trial_{trial.number}_params.json"
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, 'w') as f:
-                json.dump(trial.params, f, indent=2)
+            if score > worst_score or len(top_n_trials) < top_n:
+                print(f"\n🔥 Trial {trial.number} is in top {top_n}! Score: {float(score):.6f}. Saving params...\n")
+                save_path = TOP_N_PARAMS_PATH / f"trial_{trial.number}_params.json"
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(save_path, 'w') as f:
+                    json.dump(trial.params, f, indent=2)
 
-            top_n_trials[str(trial.number)] = score
-            if len(top_n_trials) > top_n:
-                worst_trial_key = min(top_n_trials, key=top_n_trials.get)
-                del top_n_trials[worst_trial_key]
-                (TOP_N_PARAMS_PATH / f"trial_{worst_trial_key}_params.json").unlink(missing_ok=True)
-            study.set_user_attr('top_n_trials', top_n_trials)
+                top_n_trials[str(trial.number)] = score
+                if len(top_n_trials) > top_n:
+                    worst_trial_key = min(top_n_trials, key=top_n_trials.get)
+                    del top_n_trials[worst_trial_key]
+                    (TOP_N_PARAMS_PATH / f"trial_{worst_trial_key}_params.json").unlink(missing_ok=True)
+                study.set_user_attr('top_n_trials', top_n_trials)
 
-        writer.close()
-        return score
+            return score
+        finally:
+            writer.flush()
+            writer.close()
 
     study.optimize(objective, n_trials=n_trials)
 
