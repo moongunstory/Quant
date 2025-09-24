@@ -399,10 +399,27 @@ def run_hpo(
             "use_scheduler": False,
         }
 
+        if not (agent_cfg["log_std_min"] < agent_cfg["log_std_max"]):
+            _prune("invalid log_std bounds", 0)
+
+        margin = 0.02
+        th_open = trial.suggest_float("th_open", 0.25, 0.60)
+        close_high = min(0.30, th_open - margin)
+        if close_high <= 0.10:
+            _prune("invalid hysteresis close bounds", 0)
+        th_close = trial.suggest_float("th_close", 0.10, close_high)
+        flip_low = max(0.45, th_open + margin)
+        if flip_low >= 0.85:
+            _prune("invalid hysteresis flip bounds", 0)
+        th_flip = trial.suggest_float("th_flip", flip_low, 0.85)
+
+        if not (0.0 < th_close < th_open < th_flip < 1.0):
+            _prune("invalid hysteresis", 0)
+
         env_cfg = {
-            "th_open": trial.suggest_float("th_open", 0.25, 0.60),
-            "th_close": trial.suggest_float("th_close", 0.10, 0.30),
-            "th_flip": trial.suggest_float("th_flip", 0.45, 0.85),
+            "th_open": th_open,
+            "th_close": th_close,
+            "th_flip": th_flip,
             "min_hold_bars": trial.suggest_int("min_hold_bars", 6, 14),
             "turnover_penalty": trial.suggest_float("turnover_penalty", 0.0000, 0.0200),
             "flip_penalty": trial.suggest_float("flip_penalty", 0.0000, 0.0050),
@@ -412,6 +429,11 @@ def run_hpo(
 
         if agent_cfg["critic_lr"] < 5e-5 or agent_cfg["actor_lr"] < 5e-5:
             raise optuna.exceptions.TrialPruned("lr too low")
+
+        if not (0.0 < env_cfg["th_close"] < env_cfg["th_open"] < env_cfg["th_flip"] < 1.0):
+            _prune("invalid hysteresis", 0)
+        if not (agent_cfg["log_std_min"] < agent_cfg["log_std_max"]):
+            _prune("invalid log_std bounds", 0)
 
         action_dim = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
