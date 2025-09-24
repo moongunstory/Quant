@@ -6,7 +6,7 @@ import pandas as pd
 from binance.client import Client
 from dotenv import load_dotenv
 
-from config.paths import (
+from ai_binance.config.paths import (
     get_ohlcv_path,
     get_funding_rate_path,
     get_index_price_path,

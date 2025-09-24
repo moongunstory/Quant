@@ -1,5 +1,3 @@
-# config/paths.py
-
 from pathlib import Path
 
 # ------------------ 프로젝트 루트 ------------------
@@ -13,10 +11,9 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 # ------------------ 원시 데이터 경로 ------------------
 
 def get_raw_dir(symbol: str, category: str) -> Path:
+    if category == "dune":
+        return RAW_DATA_DIR / "dune"
     return RAW_DATA_DIR / category / symbol.lower()
-
-def get_symbol_dir(symbol: str) -> Path:
-    return get_raw_dir(symbol, "ohlcv")
 
 def get_ohlcv_path(symbol: str) -> Path:
     return get_raw_dir(symbol, "ohlcv") / "ohlcv.csv"
@@ -30,31 +27,32 @@ def get_funding_rate_path(symbol: str) -> Path:
 def get_dune_path(symbol: str, name: str) -> Path:
     return get_raw_dir(symbol, "dune") / f"{name}.csv"
 
-# ------------------ 가공 데이터 경로 ------------------
+# ------------------ 가공된 OHLCV 세트 경로 ------------------
 
-def get_processed_feature_path(symbol: str, category: str, name: str = None) -> Path:
-    """
-    category: ohlcv, funding_index, dune 등
-    name: 저장 파일 이름 (기본: symbol.lower()), 예: ethusdt_funding, ethusdt_index
-    """
-    file_name = f"{name or symbol.lower()}.parquet"
-    return PROCESSED_DATA_DIR / category / file_name
+def get_processed_ohlcv_dir(symbol: str) -> Path:
+    return PROCESSED_DATA_DIR / symbol.lower()
 
-# 📌 추천: 자주 쓰는 경로를 위한 헬퍼 함수
+def get_train_parquet_path(symbol: str) -> Path:
+    return get_processed_ohlcv_dir(symbol) / "train_set.parquet"
 
-def get_processed_ohlcv_path(symbol: str) -> Path:
-    return get_processed_feature_path(symbol, "ohlcv")
+def get_validation_parquet_path(symbol: str) -> Path:
+    return get_processed_ohlcv_dir(symbol) / "validation_set.parquet"
+
+def get_test_parquet_path(symbol: str) -> Path:
+    return get_processed_ohlcv_dir(symbol) / "test_set.parquet"
+
+# ------------------ 기타 피처 경로 ------------------
 
 def get_processed_funding_path(symbol: str) -> Path:
-    return get_processed_feature_path(symbol, "funding_index", f"{symbol.lower()}_funding")
+    return PROCESSED_DATA_DIR / "funding_index" / f"{symbol.lower()}_funding.parquet"
 
 def get_processed_index_path(symbol: str) -> Path:
-    return get_processed_feature_path(symbol, "funding_index", f"{symbol.lower()}_index")
+    return PROCESSED_DATA_DIR / "funding_index" / f"{symbol.lower()}_index.parquet"
 
-def get_processed_dune_path(symbol: str) -> Path:
-    return get_processed_feature_path(symbol, "dune")
+def get_processed_dune_path(symbol: str, name: str) -> Path:
+    return PROCESSED_DATA_DIR / "dune" / f"{name}.parquet"
 
-# ------------------ 기타 ------------------
+# ------------------ 기타 경로 ------------------
 
 def get_train_feature_data_path() -> Path:
     return PROCESSED_DATA_DIR / "train_features.csv"
@@ -66,6 +64,7 @@ LOGS_DIR = MODELS_DIR / "logs"
 # ------------------ HPO 관련 ------------------
 
 HPO_DIR = DATA_DIR / "hpo"
+HPO_LOGS_DIR = HPO_DIR / "logs"
 HPO_TRIALS_DIR = HPO_DIR / "trials"
 HPO_BEST_CONFIG_DIR = HPO_DIR / "best_config"
 
@@ -78,8 +77,10 @@ def get_team_trials_path(team_name: str) -> Path:
 def get_stage1_top_combinations_path() -> Path:
     return HPO_BEST_CONFIG_DIR / "stage1_top_combinations.json"
 
+# ------------------ 실시간 운영 ------------------
+
 LIVE_DIR = PROJECT_ROOT / "live"
 
-# ------------------ Optuna DB 경로 ------------------
+# ------------------ Optuna DB ------------------
 
 OPTUNA_DB_PATH = HPO_DIR / "optuna_feature_hpo.db"

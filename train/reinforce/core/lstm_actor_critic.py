@@ -3,9 +3,14 @@
 import torch
 import torch.nn as nn
 
+LOG_STD_MIN = -1.0   # σ ≈ 0.37
+LOG_STD_MAX = 0.0    # σ ≈ 1.0
+
 
 class LSTMActor(nn.Module):
-    def __init__(self, input_dims: dict, action_dim, hidden_dim=128):
+    def __init__(self, input_dims, action_dim, hidden_dim=128, lstm_layers=1,
+                 log_std_min: float = LOG_STD_MIN,
+                 log_std_max: float = LOG_STD_MAX):
         """
         input_dims: {"ohlcv": 8, "funding": 4, "dune": 3}
         """
@@ -13,45 +18,86 @@ class LSTMActor(nn.Module):
         self.lstm_modules = nn.ModuleDict()
         self.hidden_dim = hidden_dim
 
+        # log-std 범위(런타임에 조절 가능)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
+
         for name, dim in input_dims.items():
-            self.lstm_modules[name] = nn.LSTM(dim, hidden_dim, batch_first=True)
+            self.lstm_modules[name] = nn.LSTM(
+                input_size=dim,
+                hidden_size=hidden_dim,
+                num_layers=lstm_layers,
+                batch_first=True,
+            )
 
         combined_dim = hidden_dim * len(input_dims)
-        self.fc_mu = nn.Linear(combined_dim, action_dim)
-        self.fc_log_std = nn.Linear(combined_dim, action_dim)
 
-    def forward(self, state_seq_dict):  # action 파라미터 제거
+        # 비선형 레이어 추가
+        self.fc_shared = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_log_std = nn.Linear(hidden_dim, action_dim)
+
+        # 합리적 초기 σ (≈ e^{-0.5} ≈ 0.6)
+        nn.init.constant_(self.fc_log_std.bias, -0.3)
+
+    @torch.no_grad()
+    def set_log_std_bounds(self, min_v: float, max_v: float):
+        """학습 중 분산 범위를 더 조이거나 풀어줄 수 있게 함."""
+        self.log_std_min = float(min_v)
+        self.log_std_max = float(max_v)
+
+    def forward(self, state_seq_dict):
         """
         state_seq_dict: {"ohlcv": (B, T1, D1), "funding": (B, T2, D2), ...}
         """
         lstm_outputs = []
 
-        for name, lstm in self.lstm_modules.items():  # group_lstms → lstm_modules
-            x = state_seq_dict[name]  # shape: (B, T_k, D_k)
+        for name, lstm in self.lstm_modules.items():
+            x = state_seq_dict[name]          # (B, T_k, D_k)
             out, _ = lstm(x)
-            h_last = out[:, -1, :]  # 마지막 시점만 추출
+            h_last = out[:, -1, :]            # 마지막 시점
             lstm_outputs.append(h_last)
 
-        # 모든 그룹의 마지막 시점 출력을 결합
         combined_features = torch.cat(lstm_outputs, dim=-1)
-        
-        mu = self.fc_mu(combined_features)
-        log_std = self.fc_log_std(combined_features)
-        
+
+        shared_features = self.fc_shared(combined_features)
+        mu = self.fc_mu(shared_features)
+        log_std_raw = self.fc_log_std(shared_features)
+
+        # Smooth bounds: map raw -> [log_std_min, log_std_max] via tanh (better gradients than clamp)
+        log_std = torch.tanh(log_std_raw)
+        log_std = self.log_std_min + 0.5 * (log_std + 1.0) * (self.log_std_max - self.log_std_min)
+
         return mu, log_std, combined_features
 
 
 class LSTMCritic(nn.Module):
-    def __init__(self, input_dims: dict, action_dim, hidden_dim=128):
+    def __init__(self, input_dims, action_dim, hidden_dim=128, lstm_layers=1):
         super().__init__()
         self.lstm_modules = nn.ModuleDict()
         self.hidden_dim = hidden_dim
 
         for name, dim in input_dims.items():
-            self.lstm_modules[name] = nn.LSTM(dim, hidden_dim, batch_first=True)
+            self.lstm_modules[name] = nn.LSTM(
+                input_size=dim,
+                hidden_size=hidden_dim,
+                num_layers=lstm_layers,
+                batch_first=True,
+            )
 
         combined_dim = hidden_dim * len(input_dims) + action_dim
-        self.fc_q = nn.Linear(combined_dim, 1)
+
+        # 비선형 레이어 추가
+        self.fc_shared = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        self.fc_q = nn.Linear(hidden_dim, 1)
 
     def forward(self, state_seq_dict, action):
         """
@@ -59,15 +105,14 @@ class LSTMCritic(nn.Module):
         action: (B, action_dim)
         """
         lstm_outputs = []
-        
+
         for name, lstm in self.lstm_modules.items():
-            x = state_seq_dict[name]  # shape: (B, T_k, D_k)
+            x = state_seq_dict[name]          # (B, T_k, D_k)
             out, _ = lstm(x)
-            h_last = out[:, -1, :]  # 마지막 시점만 추출
+            h_last = out[:, -1, :]
             lstm_outputs.append(h_last)
 
-        # 모든 그룹의 마지막 시점 출력 + action 결합
         combined_features = torch.cat(lstm_outputs + [action], dim=-1)
-        q_value = self.fc_q(combined_features)
-        
-        return q_value, combined_features
+        shared_features = self.fc_shared(combined_features)
+        q_value = self.fc_q(shared_features)
+        return q_value, shared_features

@@ -3,7 +3,7 @@
 import numpy as np
 
 class SequenceReplayBuffer:
-    def __init__(self, max_size, input_dims, action_dim, seq_lens, batch_size=64):
+    def __init__(self, max_size, input_dims, action_dim, seq_lens, batch_size=64, burn_in=16):
         """
         input_dims: {"ohlcv": 66, "funding": 3, ...}
         seq_lens: {"ohlcv": 48, "funding": 7, ...}
@@ -12,7 +12,9 @@ class SequenceReplayBuffer:
         self.ptr = 0
         self.size = 0
         self.seq_lens = seq_lens
-        self.batch_size = batch_size 
+        self.seq_len_max = max(seq_lens.values())
+        self.batch_size = batch_size
+        self.burn_in = burn_in
         
         self.obs_buf = {
             k: np.zeros((max_size, d), dtype=np.float32)
@@ -42,10 +44,12 @@ class SequenceReplayBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     def sample(self, batch_size):
-        # 최소로 필요한 길이 확보
-        max_required_len = max(self.seq_lens.values())
-        max_start = self.size - max_required_len
-        indices = np.random.randint(0, max_start, size=batch_size)
+        # 시퀀스가 넘치지 않도록 안전 범위 계산
+        if self.size < self.seq_len_max:
+            raise ValueError(f"Buffer size {self.size} < required seq_len {self.seq_len_max}")
+        max_start = self.size - self.seq_len_max
+        start_low = 0  # (burn-in은 에이전트 학습에서 활용; 시퀀스 추출은 전체 구간 유지)
+        indices = np.random.randint(start_low, max_start + 1, size=batch_size)
 
         obs_seqs = {k: [] for k in self.obs_buf}
         next_obs_seqs = {k: [] for k in self.next_obs_buf}
@@ -60,8 +64,8 @@ class SequenceReplayBuffer:
                 obs_seqs[k].append(self.obs_buf[k][idx:idx + seq_len])
                 next_obs_seqs[k].append(self.next_obs_buf[k][idx:idx + seq_len])
 
-            # Action, Reward, Done은 마지막 시점만 (SAC용)
-            last_idx = idx + self.seq_lens["ohlcv"] - 1  # 마지막 시점
+            # Action/Reward/Done은 모든 그룹 중 가장 긴 시퀀스의 마지막 시점 기준
+            last_idx = idx + self.seq_len_max - 1
             action_list.append(self.action_buf[last_idx])
             reward_list.append(self.reward_buf[last_idx])
             done_list.append(self.done_buf[last_idx])

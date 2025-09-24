@@ -7,7 +7,7 @@ from dune_client.client import DuneClient
 from dotenv import load_dotenv
 from dune_client.query import QueryBase
 
-from config.paths import get_dune_path
+from ai_binance.config.paths import get_dune_path
 from ai_binance.config.settings import DUNE_QUERY_IDS, DUNE_QUERY_BATCH_SIZE
 
 load_dotenv()
