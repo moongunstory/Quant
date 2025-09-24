@@ -47,8 +47,6 @@ TRAINING_CONFIG = TrainingConfig()
 ENV_CONFIG = EnvConfig()
 
 from ai_binance.train.hpo.core.feature_selector import select_features_from_trial
-from ai_binance.train.hpo.core.feature_builder import build_feature_dfs
-from ai_binance.train.prepare.process.feature_registry import rl_hparams
 
 from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
 from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
@@ -322,31 +320,33 @@ def run_hpo(
         if "ohlcv" not in train_data_dict or "ohlcv" not in eval_data_dict:
             raise optuna.exceptions.TrialPruned("No ohlcv group found.")
 
-        agent_params = {"input_dims": {k: v.shape[1] for k, v in train_data_dict.items()}}
-        env_params: dict[str, float | int] = {}
-        for name, cfg in rl_hparams.items():
-            param_type = cfg["type"]
-            if param_type == "categorical":
-                value = trial.suggest_categorical(name, cfg["choices"])
-            elif param_type == "int":
-                value = trial.suggest_int(name, cfg["min"], cfg["max"])
-            else:
-                value = trial.suggest_float(
-                    name,
-                    cfg["min"],
-                    cfg["max"],
-                    log=cfg.get("log", False),
-                )
+        input_dims = {k: v.shape[1] for k, v in train_data_dict.items()}
 
-            if name == "clip_grad":
-                agent_params["clip_grad"] = float(value)
-            elif name in {"action_threshold_close", "min_hold_bars"}:
-                env_params[name] = value
-            else:
-                agent_params[name] = value
+        agent_cfg = {
+            "target_entropy_scale": trial.suggest_float("target_entropy_scale", 0.7, 1.3),
+            "init_log_std": trial.suggest_float("init_log_std", -2.0, -1.0),
+            "log_std_min": trial.suggest_float("log_std_min", -3.0, -2.0),
+            "log_std_max": trial.suggest_float("log_std_max", -0.7, -0.3),
+            "alpha_init": trial.suggest_float("alpha_init", 0.10, 0.30),
+            "alpha_lr": trial.suggest_categorical("alpha_lr", [1e-4, 3e-4]),
+            "actor_lr": trial.suggest_categorical("actor_lr", [1e-4, 3e-4]),
+            "critic_lr": trial.suggest_categorical("critic_lr", [1e-4, 3e-4]),
+            "tau": trial.suggest_categorical("tau", [0.005, 0.01, 0.02]),
+            "use_scheduler": False,
+        }
 
-        # guard
-        if agent_params.get("critic_lr", 1e-3) < 5e-5 or agent_params.get("actor_lr", 1e-3) < 5e-5:
+        env_cfg = {
+            "th_open": trial.suggest_float("th_open", 0.35, 0.55),
+            "th_close": trial.suggest_float("th_close", 0.15, 0.30),
+            "th_flip": trial.suggest_float("th_flip", 0.55, 0.80),
+            "min_hold_bars": trial.suggest_categorical("min_hold_bars", [8, 10, 12]),
+            "turnover_penalty": trial.suggest_float("turnover_penalty", 0.0000, 0.0100),
+            "flip_penalty": trial.suggest_float("flip_penalty", 0.0010, 0.0040),
+            "reward_scale": trial.suggest_categorical("reward_scale", [100, 300, 1000]),
+            "idle_penalty": 0.0,
+        }
+
+        if agent_cfg["critic_lr"] < 5e-5 or agent_cfg["actor_lr"] < 5e-5:
             raise optuna.exceptions.TrialPruned("lr too low")
 
         action_dim = 1
@@ -363,26 +363,24 @@ def run_hpo(
             seq_lens=group_seq_lens,
             env_config=ENV_CONFIG,
             enforce_hl=True,
+            cfg=env_cfg,
         )
-        env_kwargs.update(env_params)
         train_env = CryptoTradingEnv(train_data_dict, **env_kwargs)
         eval_env = CryptoTradingEnv(eval_data_dict, **env_kwargs)
 
         agent = SACLSTMAgent(
+            input_dims=input_dims,
             action_dim=action_dim,
             device=device,
             total_steps=hpo_train_steps,
             use_scheduler=False,           # ← 고정
             training_config=TRAINING_CONFIG,
-            **agent_params,
+            cfg={**agent_cfg, "total_steps": hpo_train_steps},
         )
-        # 정책 분산 범위 고정(네트워크 기본과 동일하지만 명시)
-        if hasattr(agent, "set_log_std_bounds"):
-            agent.set_log_std_bounds(-1.2, 0.2)
 
         # HPO(5k) 기준: 업데이트 구간을 확실히 확보
         hpo_batch_size = TRAINING_CONFIG.hpo_batch_size
-        learning_starts = TRAINING_CONFIG.compute_learning_starts(hpo_train_steps)
+        learning_starts = max(10_000, int(0.2 * hpo_train_steps))
         learning_starts = max(learning_starts, hpo_batch_size)
         max_available_steps = len(train_df) - max_seq_from_groups
         if learning_starts >= hpo_train_steps:
@@ -392,12 +390,13 @@ def run_hpo(
 
         replay_buffer = SequenceReplayBuffer(
             max_size=100_000,
-            input_dims=agent_params["input_dims"],
+            input_dims=input_dims,
             action_dim=action_dim,
             seq_lens=group_seq_lens,
             batch_size=hpo_batch_size
         )
 
+        last_critic_loss: float | None = None
         obs = train_env.reset()
         for step in range(hpo_train_steps):
             action = agent.select_action(obs)  # 학습은 확률 정책
@@ -410,6 +409,8 @@ def run_hpo(
                 if losses:
                     for k, v in losses.items():
                         writer.add_scalar(f"Loss/{k}", v, step)
+                    if "critic_loss" in losses:
+                        last_critic_loss = float(losses["critic_loss"])
 
             # (A) 거래 지표 텐서보드 기록
             if step % 200 == 0 and hasattr(train_env, "tb_metrics"):
@@ -422,17 +423,16 @@ def run_hpo(
                 scale = 1.0 - 0.3 * (step / hpo_train_steps)
                 agent.set_target_entropy_scale(scale)
 
-            # (C) 프룬(워밍업 이후): 무거래 또는 과도한 턴오버 컷
-            if step > learning_starts and step % 1000 == 0 and hasattr(train_env, "tb_metrics"):
-                m = train_env.tb_metrics()
-                trades_1k = m.get("trades_per_1k", 0.0)
-                hold_mean = m.get("holding_bars_mean", 0.0)
-                min_trades = TRAINING_CONFIG.min_trades_per_1k
-                max_trades = TRAINING_CONFIG.max_trades_per_1k
-                if trades_1k < min_trades or hold_mean == 0:
-                    raise optuna.exceptions.TrialPruned("no trading")
-                if trades_1k > max_trades:
-                    raise optuna.exceptions.TrialPruned("too much turnover")
+            # (C) 10k 스텝 이후 헬스체크 프루닝
+            if step >= 10_000 and step % 1000 == 0 and hasattr(train_env, "tb_metrics"):
+                metrics = train_env.tb_metrics()
+                trades_per_1k = metrics.get("trades_per_1k", 0.0)
+                if trades_per_1k > 85.0:
+                    raise optuna.exceptions.TrialPruned("overtrading")
+                if last_critic_loss is not None and (
+                    np.isnan(last_critic_loss) or last_critic_loss > 0.2
+                ):
+                    raise optuna.exceptions.TrialPruned("critic_diverged")
 
             obs = next_obs if not done else train_env.reset()
 

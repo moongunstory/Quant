@@ -55,37 +55,35 @@ class CryptoTradingEnv:
         action_threshold_open: float | None = None,
         action_threshold_close: float | None = None,
         action_threshold_flip: float | None = None,
+        cfg: dict | None = None,
     ):
         self.data = data
         self.seq_lens = seq_lens
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.env_config = env_config or EnvConfig()
+        cfg = cfg or {}
         self.take_profit_pct = float(
             take_profit_pct if take_profit_pct is not None else self.env_config.take_profit_pct
         )
         self.stop_loss_pct = float(
             stop_loss_pct if stop_loss_pct is not None else self.env_config.stop_loss_pct
         )
-        self.action_threshold_open = float(
-            action_threshold_open
-            if action_threshold_open is not None
-            else self.env_config.action_threshold_open
-        )
-        self.action_threshold_close = float(
-            action_threshold_close
-            if action_threshold_close is not None
-            else self.env_config.action_threshold_close
-        )
-        self.action_threshold_flip = float(
-            action_threshold_flip
-            if action_threshold_flip is not None
-            else self.env_config.action_threshold_flip
-        )
-        if not (
-            0.0 <= self.action_threshold_close <= self.action_threshold_open <= self.action_threshold_flip <= 1.0
-        ):
+        base_th_open = 0.45 if action_threshold_open is None else float(action_threshold_open)
+        base_th_close = 0.20 if action_threshold_close is None else float(action_threshold_close)
+        base_th_flip = 0.70 if action_threshold_flip is None else float(action_threshold_flip)
+
+        self.th_open = float(cfg.get("th_open", base_th_open))
+        self.th_close = float(cfg.get("th_close", base_th_close))
+        self.th_flip = float(cfg.get("th_flip", base_th_flip))
+
+        if not (0.0 <= self.th_close <= self.th_open <= self.th_flip <= 1.0):
             raise ValueError("Invalid action hysteresis thresholds provided.")
+
+        # Backwards compatibility for legacy attribute names
+        self.action_threshold_open = self.th_open
+        self.action_threshold_close = self.th_close
+        self.action_threshold_flip = self.th_flip
 
         # --- OHLCV idx sanity check ---
         self.ohlcv_close_idx = (
@@ -105,14 +103,27 @@ class CryptoTradingEnv:
                 )
 
         self.funding_col_idx = funding_col_idx
-        self.use_idle_penalty = use_idle_penalty
         self.idle_kappa = idle_kappa
-        self.idle_lambda = idle_lambda
         self.ewma_beta = ewma_beta
-        hold_bars = self.env_config.min_hold_bars if min_hold_bars is None else min_hold_bars
-        penalty = self.env_config.flip_penalty if flip_penalty is None else flip_penalty
-        self.min_hold_bars = int(hold_bars) if hold_bars else 0
-        self.flip_penalty = max(0.0, float(penalty))
+
+        base_idle_penalty = float(idle_lambda if use_idle_penalty else 0.0)
+        idle_penalty_cfg = cfg.get("idle_penalty")
+        self.idle_penalty = max(0.0, float(idle_penalty_cfg if idle_penalty_cfg is not None else base_idle_penalty))
+        self.use_idle_penalty = bool(cfg.get("use_idle_penalty", use_idle_penalty)) and self.idle_penalty > 0
+        self.idle_lambda = self.idle_penalty
+
+        hold_bars_default = self.env_config.min_hold_bars
+        if min_hold_bars is not None:
+            hold_bars_default = min_hold_bars
+        self.min_hold_bars = int(cfg.get("min_hold_bars", hold_bars_default)) if hold_bars_default else 0
+
+        flip_penalty_default = self.env_config.flip_penalty if flip_penalty is None else flip_penalty
+        self.flip_penalty = max(0.0, float(cfg.get("flip_penalty", flip_penalty_default)))
+
+        self.turnover_penalty = max(0.0, float(cfg.get("turnover_penalty", 0.0)))
+        self.reward_scale = float(cfg.get("reward_scale", 300.0))
+
+        self.holding_bars_running = 0
 
         self.length = len(next(iter(data.values())))
         self.init_cash = 1.0
@@ -156,29 +167,26 @@ class CryptoTradingEnv:
         Hysteresis thresholds are driven by the configuration object to keep the
         environment and agent in sync.
         """
-        th_open = self.action_threshold_open
-        th_close = self.action_threshold_close
-        th_flip = self.action_threshold_flip
+        th_open = self.th_open
+        th_close = self.th_close
+        th_flip = self.th_flip
 
         pos = int(getattr(self, "position", 0))
 
-        # no position -> need strong signal to open
-        if pos == 0:
-            if a >  th_open: return  1
-            if a < -th_open: return -1
+        if abs(a) < th_close:
             return 0
 
-        # holding long
-        if pos > 0:
-            if a < -th_flip: return -1     # strong opposite -> flip
-            if a <  th_close: return  0    # weak/neutral -> close
-            return 1                       # otherwise hold
-
-        # holding short
-        if pos < 0:
-            if a >  th_flip: return  1
-            if a > -th_close: return 0
+        if pos > 0 and a < -th_flip:
             return -1
+        if pos < 0 and a > th_flip:
+            return 1
+
+        if a > th_open:
+            return 1
+        if a < -th_open:
+            return -1
+
+        return pos
 
     # ------------- env core -------------
     def reset(self):
@@ -301,7 +309,7 @@ class CryptoTradingEnv:
         if self.use_idle_penalty:
             sigma = self.ewma_abs_r
             if sigma > 0 and abs(r_step) > self.idle_kappa * sigma and pos_prev == 0:
-                pen = min(self.idle_lambda, 1.0 * self.taker_fee)  # 3.0에서 1.0으로 완화
+                pen = min(self.idle_penalty, self.taker_fee)
                 self.portfolio_value *= (1.0 - pen)
 
         # --- 액션 적용 ---
@@ -343,12 +351,16 @@ class CryptoTradingEnv:
             self._roll_forced_close.add(0.0)
             # action_* are per-closure stats; no need to record zeros here
 
-        # turnover 기록
+        # turnover 기록 및 빈도 비용 적용
         pos_now = int(self.position)
-        self._roll_turnover.add(abs(pos_now - pos_prev))
+        turn_units = abs(pos_now - pos_prev)
+        if self.turnover_penalty > 0 and turn_units > 0:
+            self.portfolio_value *= max(1.0 - self.turnover_penalty * turn_units, 1e-12)
+        self._roll_turnover.add(turn_units)
 
         # --- 보상 계산: step 순수익률 (PV 일치) ---
         reward = np.log(self.portfolio_value / nav_before)
+        reward *= self.reward_scale
         self._roll_reward.add(reward)
 
         # --- 시간 전진 & 기록 ---
