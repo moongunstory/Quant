@@ -323,19 +323,30 @@ def run_hpo(
             raise optuna.exceptions.TrialPruned("No ohlcv group found.")
 
         agent_params = {"input_dims": {k: v.shape[1] for k, v in train_data_dict.items()}}
+        env_params: dict[str, float | int] = {}
         for name, cfg in rl_hparams.items():
-            if cfg["type"] == "categorical":
-                agent_params[name] = trial.suggest_categorical(name, cfg["choices"])
+            param_type = cfg["type"]
+            if param_type == "categorical":
+                value = trial.suggest_categorical(name, cfg["choices"])
+            elif param_type == "int":
+                value = trial.suggest_int(name, cfg["min"], cfg["max"])
             else:
-                agent_params[name] = trial.suggest_float(
+                value = trial.suggest_float(
                     name,
                     cfg["min"],
                     cfg["max"],
                     log=cfg.get("log", False),
                 )
 
+            if name == "clip_grad":
+                agent_params["clip_grad"] = float(value)
+            elif name in {"action_threshold_close", "min_hold_bars"}:
+                env_params[name] = value
+            else:
+                agent_params[name] = value
+
         # guard
-        if agent_params.get("critic_lr", 1e-3) < 1e-4 or agent_params.get("actor_lr", 1e-3) < 1e-4:
+        if agent_params.get("critic_lr", 1e-3) < 5e-5 or agent_params.get("actor_lr", 1e-3) < 5e-5:
             raise optuna.exceptions.TrialPruned("lr too low")
 
         action_dim = 1
@@ -353,6 +364,7 @@ def run_hpo(
             env_config=ENV_CONFIG,
             enforce_hl=True,
         )
+        env_kwargs.update(env_params)
         train_env = CryptoTradingEnv(train_data_dict, **env_kwargs)
         eval_env = CryptoTradingEnv(eval_data_dict, **env_kwargs)
 
@@ -379,7 +391,7 @@ def run_hpo(
         learning_starts = max(0, learning_starts)
 
         replay_buffer = SequenceReplayBuffer(
-            max_size=50_000,
+            max_size=100_000,
             input_dims=agent_params["input_dims"],
             action_dim=action_dim,
             seq_lens=group_seq_lens,
