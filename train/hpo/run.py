@@ -2,8 +2,8 @@
 
 import sys
 import json
-import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.append(str(PROJECT_ROOT))
@@ -52,10 +52,16 @@ from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
 from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
 from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
 
-HEALTH_CHECK_INTERVAL = 1_000
-HEALTH_STAGE1_STEP = 8_000
-HEALTH_STAGE2_STEP = 22_000
-CRITIC_LOSS_LIMIT = 0.2
+HEALTH = SimpleNamespace(
+    check_interval=1_000,
+    stage1_step=8_000,
+    stage2_step=22_000,
+    prune_min_step=15_000,
+    critic_loss_limit=0.2,
+    trades_bounds=(3.0, 120.0),
+    log_std_bounds=(-3.2, -0.3),
+    drawdown_guard=(-0.06, 0.90),
+)
 
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
 def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
@@ -69,36 +75,6 @@ def _resolve_seq_lens(data_dict: dict[str, np.ndarray], env_config: EnvConfig) -
     base = env_config.seq_lens
     default_len = base.get("ohlcv", max(base.values()))
     return {group: base.get(group, default_len) for group in data_dict}
-
-
-def _merge_features(dfs: dict, ohlcv_df: pd.DataFrame):
-    if not dfs:
-        return pd.DataFrame()
-
-    for name in dfs:
-        if "timestamp" in dfs[name].columns:
-            dfs[name] = dfs[name].sort_values("timestamp").dropna(subset=["timestamp"])
-
-    df_5min_list = list(dfs.values())
-    df_8hour = None
-    df_daily = None
-
-    if not df_5min_list:
-        return pd.DataFrame()
-    
-    merged_df = df_5min_list[0]
-    for i in range(1, len(df_5min_list)):
-        merged_df = pd.merge(merged_df, df_5min_list[i], on="timestamp", how="inner")
-
-    if df_8hour is not None and not df_8hour.empty:
-        df_8hour_resampled = df_8hour.set_index('timestamp').resample('8h').ffill().reset_index()
-        merged_df = pd.merge_asof(merged_df.sort_values('timestamp'), df_8hour_resampled.sort_values('timestamp'), on="timestamp", direction="backward")
-
-    if df_daily is not None and not df_daily.empty:
-        merged_df = pd.merge_asof(merged_df.sort_values('timestamp'), df_daily.sort_values('timestamp'), on="timestamp", direction="backward")
-
-    final_df = pd.merge(ohlcv_df, merged_df, on="timestamp", how="inner").dropna()
-    return final_df
 
 
 def _pick_first_existing(df: pd.DataFrame, candidates, used):
@@ -251,8 +227,7 @@ def run_hpo(
 ):
     # 스터디 이름에 버전 접미사 부여
     study_name = kwargs.get("study_name", f"feature_and_rl_hpo_{symbol}")
-    if not study_name.endswith(f"_v{VERSION}"):
-        study_name = f"{study_name}_v{VERSION}"
+    study_name += "" if study_name.endswith(f"_v{VERSION}") else f"_v{VERSION}"
 
     # Windows 안전 SQLite URI
     storage_uri = "sqlite:///" + OPTUNA_DB_PATH.as_posix()
@@ -264,7 +239,7 @@ def run_hpo(
         seed=42,
     )
     pruner = optuna.pruners.HyperbandPruner(
-        min_resource=HEALTH_STAGE1_STEP,
+        min_resource=HEALTH.stage1_step,
         max_resource=hpo_train_steps,
         reduction_factor=3,
     )
@@ -295,37 +270,41 @@ def run_hpo(
 
         last_critic_loss: float | None = None
         last_log_std_mean: float | None = None
-        last_policy_entropy: float | None = None
-        last_metrics: dict[str, float] = {}
-
-        def _log_health_event(message: str, step_idx: int) -> None:
+        def _log(tag: str, message: str, step_idx: int | None = None) -> None:
             msg = f"[HPO][Trial {trial.number}] {message}"
             print(msg)
-            try:
-                writer.add_text("Health/events", msg, int(step_idx))
-            except Exception:
-                pass
+            if step_idx is not None:
+                try:
+                    writer.add_text(tag, msg, int(step_idx))
+                except Exception:
+                    pass
 
         def _prune(reason: str, step_idx: int) -> None:
-            _log_health_event(f"PRUNE step={step_idx}: {reason}", step_idx)
+            _log("Health/events", f"PRUNE step={step_idx}: {reason}", step_idx)
             raise optuna.exceptions.TrialPruned(reason)
 
         def _run_health_checks(step_idx: int, metrics: dict[str, float] | None) -> None:
             metrics_local = metrics or {}
+
             if last_critic_loss is not None:
-                if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
-                    _prune(f"critic_loss={last_critic_loss:.4f}", step_idx)
-            if step_idx >= HEALTH_STAGE1_STEP:
+                critic_val = float(last_critic_loss)
+                if (not np.isfinite(critic_val)) or critic_val > HEALTH.critic_loss_limit:
+                    _prune(f"critic_loss={critic_val:.4f}", step_idx)
+
+            if step_idx >= HEALTH.stage1_step:
                 trades = metrics_local.get("trades_per_1k")
                 if trades is not None:
-                    if not np.isfinite(trades):
-                        _prune("trades_per_1k not finite", step_idx)
-                    if trades < 3.0 or trades > 120.0:
-                        _prune(f"trades_per_1k={trades:.2f}", step_idx)
+                    low, high = HEALTH.trades_bounds
+                    if (not np.isfinite(trades)) or not (low <= trades <= high):
+                        _prune(f"trades_per_1k={trades}", step_idx)
+
                 if last_log_std_mean is not None:
-                    if (not np.isfinite(last_log_std_mean)) or not (-3.2 <= last_log_std_mean <= -0.3):
-                        _prune(f"log_std_mean={last_log_std_mean:.3f}", step_idx)
-            if step_idx >= HEALTH_STAGE2_STEP:
+                    log_std = float(last_log_std_mean)
+                    low, high = HEALTH.log_std_bounds
+                    if (not np.isfinite(log_std)) or not (low <= log_std <= high):
+                        _prune(f"log_std_mean={log_std:.3f}", step_idx)
+
+            if step_idx >= HEALTH.stage2_step:
                 avg_r = metrics_local.get("avg_R")
                 equity_val = metrics_local.get("equity")
                 if (
@@ -333,10 +312,10 @@ def run_hpo(
                     and equity_val is not None
                     and np.isfinite(avg_r)
                     and np.isfinite(equity_val)
-                    and avg_r < -0.06
-                    and equity_val < 0.90
                 ):
-                    _prune(f"avg_R={avg_r:.4f}, equity={equity_val:.4f}", step_idx)
+                    avg_floor, equity_floor = HEALTH.drawdown_guard
+                    if avg_r < avg_floor and equity_val < equity_floor:
+                        _prune(f"avg_R={avg_r:.4f}, equity={equity_val:.4f}", step_idx)
 
         selected_feats = select_features_from_trial(trial, available_features)
         if not selected_feats:
@@ -399,9 +378,6 @@ def run_hpo(
             "use_scheduler": False,
         }
 
-        if not (agent_cfg["log_std_min"] < agent_cfg["log_std_max"]):
-            _prune("invalid log_std bounds", 0)
-
         margin = 0.02
         th_open = trial.suggest_float("th_open", 0.25, 0.60)
         close_high = min(0.30, th_open - margin)
@@ -412,9 +388,6 @@ def run_hpo(
         if flip_low >= 0.85:
             _prune("invalid hysteresis flip bounds", 0)
         th_flip = trial.suggest_float("th_flip", flip_low, 0.85)
-
-        if not (0.0 < th_close < th_open < th_flip < 1.0):
-            _prune("invalid hysteresis", 0)
 
         env_cfg = {
             "th_open": th_open,
@@ -486,7 +459,6 @@ def run_hpo(
 
         try:
             for step in range(hpo_train_steps):
-                metrics_snapshot = None
                 action = agent.select_action(obs)  # 학습은 확률 정책
                 next_obs, reward, done, _ = train_env.step(action)
                 replay_buffer.add(obs, action, reward, next_obs, done)
@@ -499,30 +471,20 @@ def run_hpo(
                         critic_val = losses.get("critic_loss")
                         if critic_val is not None:
                             last_critic_loss = float(critic_val)
-                            if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
-                                _prune(f"critic_loss={last_critic_loss:.4f}", step)
                         if "log_std_mean" in losses:
                             last_log_std_mean = float(losses["log_std_mean"])
-                        if "policy_entropy" in losses:
-                            last_policy_entropy = float(losses["policy_entropy"])
-
-                if step % 200 == 0 and hasattr(train_env, "tb_metrics"):
-                    metrics_snapshot = train_env.tb_metrics()
-                    last_metrics = metrics_snapshot
-                    for k, v in metrics_snapshot.items():
+                if step and step % HEALTH.check_interval == 0:
+                    metrics = train_env.tb_metrics() if hasattr(train_env, "tb_metrics") else {}
+                    for k, v in metrics.items():
                         writer.add_scalar(f"Trade/{k}", v, step)
 
-                if step and step % HEALTH_CHECK_INTERVAL == 0:
-                    if metrics_snapshot is None and hasattr(train_env, "tb_metrics"):
-                        metrics_snapshot = train_env.tb_metrics()
-                        last_metrics = metrics_snapshot
-                    _run_health_checks(step, last_metrics)
-                    if last_metrics:
-                        equity_for_report = float(last_metrics.get("equity", 0.0))
-                        if np.isfinite(equity_for_report):
-                            trial.report(equity_for_report, step)
-                            if trial.should_prune():
-                                _prune("optuna_pruner", step)
+                    _run_health_checks(step, metrics)
+
+                    equity_val = metrics.get("equity") if metrics else None
+                    if equity_val is not None and np.isfinite(equity_val):
+                        trial.report(float(equity_val), step)
+                        if step >= HEALTH.prune_min_step and trial.should_prune():
+                            _prune("optuna_pruner", step)
 
                 obs = next_obs if not done else train_env.reset()
 
