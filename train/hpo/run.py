@@ -82,9 +82,34 @@ CRITIC_LOSS_LIMIT = 0.35         # 초반 수렴 여지
 PRUNER_ENABLE_STEP = 15_000      # Optuna should_prune() 호출 가드
 
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
+def _order_funding_columns(cols: list[str], sym_suffix: str) -> list[str]:
+    """Ensure the raw funding rate is the first column consumed by the env."""
+
+    preferred = [
+        f"funding_fundingRate{sym_suffix}",
+        f"funding_rate{sym_suffix}",
+        f"fundingFundingRate{sym_suffix}",
+        "funding_fundingRate",
+        "funding_rate",
+    ]
+
+    ordered = []
+    seen = set()
+    for cand in preferred:
+        if cand in cols and cand not in seen:
+            ordered.append(cand)
+            seen.add(cand)
+
+    ordered.extend([c for c in cols if c not in seen])
+    return ordered
+
+
 def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
     sym_suffix = "_eth" if symbol == "ethusdt" else "_btc"
-    return [c for c in df.columns if c.startswith("funding") and c.endswith(sym_suffix)]
+    cols = [c for c in df.columns if c.startswith("funding") and c.endswith(sym_suffix)]
+    if not cols:
+        return []
+    return _order_funding_columns(cols, sym_suffix)
 
 
 def _resolve_seq_lens(data_dict: dict[str, np.ndarray], env_config: EnvConfig) -> dict[str, int]:
@@ -189,6 +214,8 @@ def _prepare_data_for_env(df: pd.DataFrame, symbol_hint: str = None):
     for group in ['funding', 'dune', 'index']:
         group_cols = [c for c in main_symbol_features if c.startswith(group)]
         if group_cols:
+            if group == 'funding':
+                group_cols = _order_funding_columns(group_cols, sym_suffix)
             data_dict[group] = df[group_cols].to_numpy()
             
     if other_symbol_features:
@@ -233,10 +260,14 @@ def _evaluate_agent(
     rets = np.asarray(rets, dtype=np.float64)
     if rets.size == 0:
         return -np.inf
-    values = np.cumprod(1.0 + rets)
+
+    reward_scale = float(getattr(env, "reward_scale", 1.0))
+    log_returns = rets if reward_scale == 0 else rets / reward_scale
+    step_returns = np.expm1(log_returns)
+    values = np.cumprod(1.0 + step_returns)
     values = np.insert(values, 0, 1.0)  # start NAV=1.0
 
-    returns = np.diff(values) / values[:-1]
+    returns = step_returns
     if returns.size == 0:
         return -np.inf
 

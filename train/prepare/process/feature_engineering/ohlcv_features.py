@@ -108,7 +108,7 @@ def compute_ohlcv_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
             ichimoku.ichimoku_base_line().rename("ohlcv_ichimoku_kijun"),
             ichimoku.ichimoku_a().shift(26).rename("ohlcv_ichimoku_span_a"),   # 선행 스팬 A
             ichimoku.ichimoku_b().shift(26).rename("ohlcv_ichimoku_span_b"),   # 선행 스팬 B
-            close.shift(-26).rename("ohlcv_ichimoku_chikou")                   # ✅ Chikou Span (지표 시프트)
+            close.shift(26).rename("ohlcv_ichimoku_chikou")                    # Chikou Span — 과거 26스텝으로 정렬
         ])
 
     # 원본 데이터프레임의 이름을 규칙에 맞게 변경
