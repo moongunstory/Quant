@@ -53,9 +53,10 @@ from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
 from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
 
 HEALTH_CHECK_INTERVAL = 1_000
-HEALTH_STAGE1_STEP = 8_000
+HEALTH_STAGE1_STEP = 12_000      # 학습 업데이트 시작(learning_starts=10k) 이후로 프룬 지연
 HEALTH_STAGE2_STEP = 22_000
-CRITIC_LOSS_LIMIT = 0.2
+CRITIC_LOSS_LIMIT = 0.35         # 초반 수렴 여지
+PRUNER_ENABLE_STEP = 15_000      # Optuna should_prune() 호출 가드
 
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
 def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
@@ -312,7 +313,7 @@ def run_hpo(
 
         def _run_health_checks(step_idx: int, metrics: dict[str, float] | None) -> None:
             metrics_local = metrics or {}
-            if last_critic_loss is not None:
+            if last_critic_loss is not None and step_idx >= HEALTH_STAGE1_STEP:
                 if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
                     _prune(f"critic_loss={last_critic_loss:.4f}", step_idx)
             if step_idx >= HEALTH_STAGE1_STEP:
@@ -320,10 +321,10 @@ def run_hpo(
                 if trades is not None:
                     if not np.isfinite(trades):
                         _prune("trades_per_1k not finite", step_idx)
-                    if trades < 3.0 or trades > 120.0:
+                    if trades < 1.0 or trades > 120.0:
                         _prune(f"trades_per_1k={trades:.2f}", step_idx)
                 if last_log_std_mean is not None:
-                    if (not np.isfinite(last_log_std_mean)) or not (-3.2 <= last_log_std_mean <= -0.3):
+                    if (not np.isfinite(last_log_std_mean)) or not (-3.3 <= last_log_std_mean <= -0.2):
                         _prune(f"log_std_mean={last_log_std_mean:.3f}", step_idx)
             if step_idx >= HEALTH_STAGE2_STEP:
                 avg_r = metrics_local.get("avg_R")
@@ -498,9 +499,7 @@ def run_hpo(
                             writer.add_scalar(f"Loss/{k}", v, step)
                         critic_val = losses.get("critic_loss")
                         if critic_val is not None:
-                            last_critic_loss = float(critic_val)
-                            if (not np.isfinite(last_critic_loss)) or last_critic_loss > CRITIC_LOSS_LIMIT:
-                                _prune(f"critic_loss={last_critic_loss:.4f}", step)
+                            last_critic_loss = float(critic_val)  # 프루닝 판단은 헬스체크에서만
                         if "log_std_mean" in losses:
                             last_log_std_mean = float(losses["log_std_mean"])
                         if "policy_entropy" in losses:
@@ -521,7 +520,7 @@ def run_hpo(
                         equity_for_report = float(last_metrics.get("equity", 0.0))
                         if np.isfinite(equity_for_report):
                             trial.report(equity_for_report, step)
-                            if trial.should_prune():
+                            if step >= PRUNER_ENABLE_STEP and trial.should_prune():
                                 _prune("optuna_pruner", step)
 
                 obs = next_obs if not done else train_env.reset()
