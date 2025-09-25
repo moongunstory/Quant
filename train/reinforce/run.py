@@ -13,7 +13,13 @@ import pandas as pd
 import torch
 import optuna
 
-from ai_binance.config.paths import HPO_DIR, get_train_parquet_path, MODELS_DIR, OPTUNA_DB_PATH
+from ai_binance.config.paths import (
+    get_train_parquet_path,
+    MODELS_DIR,
+    get_hpo_params_dir,
+    get_latest_hpo_version,
+    get_optuna_db_path_for_version,
+)
 from ai_binance.train.hpo.core.feature_builder import build_feature_dfs
 from ai_binance.train.hpo.run import _merge_features, _prepare_data_for_env
 
@@ -25,22 +31,32 @@ from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceRepla
 from ai_binance.train.reinforce.sac.trainer import Trainer
 
 
-def get_best_hpo_trial_path(symbol: str) -> Path:
-    """지정된 심볼에 대한 Optuna DB에서 최고 성능 trial의 파라미터 파일 경로를 찾습니다."""
-    study_name = f"feature_and_rl_hpo_{symbol.lower()}"
-    storage_path = f"sqlite:///{OPTUNA_DB_PATH}"
+def get_best_hpo_trial_path(symbol: str, version: int | None = None) -> Path:
+    """Optuna DB에서 최고 성능 trial의 파라미터 파일 경로를 찾습니다."""
 
-    print(f"[INFO] Loading study '{study_name}' from '{storage_path}'")
+    if version is None:
+        version = get_latest_hpo_version()
+        if version is None:
+            raise RuntimeError("No HPO runs found. Please execute HPO before training.")
+
+    db_path = get_optuna_db_path_for_version(version)
+    study_name = f"feature_and_rl_hpo_{symbol.lower()}_v{version}"
+    storage_path = f"sqlite:///{db_path.as_posix()}"
+
+    print(f"[INFO] Loading study '{study_name}' (version {version}) from '{storage_path}'")
     try:
         study = optuna.load_study(study_name=study_name, storage=storage_path)
-    except KeyError:
-        raise RuntimeError(f"Study '{study_name}' not found in the database. Please run HPO first.")
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Study '{study_name}' not found in the database '{db_path}'."
+        ) from exc
 
     best_trial = study.best_trial
     print(f"[INFO] Best trial found: #{best_trial.number} with value: {best_trial.value:.4f}")
 
     trial_file_name = f"trial_{best_trial.number}_params.json"
-    hpo_params_path = HPO_DIR / trial_file_name
+    params_dir = get_hpo_params_dir(version)
+    hpo_params_path = params_dir / trial_file_name
 
     if not hpo_params_path.exists():
         raise FileNotFoundError(

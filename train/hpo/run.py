@@ -18,28 +18,51 @@ from ai_binance.config.paths import (
     get_validation_parquet_path,
     get_train_parquet_path,
     HPO_DIR,  # 베이스만 import, 나머지는 런타임에 버전별로 생성
+    ensure_hpo_version_artifacts,
+    list_hpo_versions,
+    set_latest_hpo_version,
 )
 from ai_binance.train.reinforce.config import TrainingConfig, EnvConfig
 
 # === 실행마다 버전 자동 분리 토글 ===
 SPLIT_RUN = True  # True: 새 버전(1,2,3,...) 생성 / False: 가장 최근 버전에 이어서
 
+
+def _safe_replace_symlink(link_path: Path, target: Path) -> None:
+    """Create or replace a symlink so that external tools can find latest artifacts."""
+
+    try:
+        if link_path.exists() or link_path.is_symlink():
+            if link_path.is_dir() and not link_path.is_symlink():
+                shutil.rmtree(link_path)
+            else:
+                link_path.unlink()
+        link_path.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:
+        # 환경이 심볼릭 링크를 지원하지 않는 경우에는 패스(필수 동작 아님)
+        pass
+
+
 def _resolve_hpo_paths(split_run: bool):
     base = Path(HPO_DIR)
     base.mkdir(parents=True, exist_ok=True)
-    nums = [int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()]
+    nums = list_hpo_versions()
     if split_run or not nums:
-        version = (max(nums) + 1) if nums else 1
+        version = (nums[-1] + 1) if nums else 1
     else:
-        version = max(nums)
-    version_dir = base / str(version)
-    db_dir      = version_dir / "db"
-    logs_dir    = version_dir / "logs"
-    params_dir  = version_dir / "params"
-    for d in (db_dir, logs_dir, params_dir):
-        d.mkdir(parents=True, exist_ok=True)
+        version = nums[-1]
+
+    version_dir, db_dir, logs_dir, params_dir = ensure_hpo_version_artifacts(version)
     db_path = db_dir / "optuna_feature_hpo.db"
+
+    # 최신 버전 포인터 갱신
+    set_latest_hpo_version(version)
+    _safe_replace_symlink(base / "latest_logs", logs_dir)
+    _safe_replace_symlink(base / "latest_params", params_dir)
+    _safe_replace_symlink(base / "optuna_feature_hpo.db", db_path)
+
     return version, version_dir, logs_dir, db_path, params_dir
+
 
 VERSION, HPO_VERSION_DIR, HPO_LOGS_DIR, OPTUNA_DB_PATH, TOP_N_PARAMS_PATH = _resolve_hpo_paths(SPLIT_RUN)
 
@@ -243,7 +266,8 @@ def _evaluate_agent(
 
 def run_hpo(
     symbol: str,
-    df_ohlcv: pd.DataFrame,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     n_trials: int = 50,
     hpo_train_steps: int = 50_000,
     hpo_eval_steps: int = 5_000,
@@ -279,9 +303,17 @@ def run_hpo(
         pruner=pruner,
     )
 
-    print(f"[HPO] version={VERSION} dir={HPO_VERSION_DIR} db={OPTUNA_DB_PATH} study={study.study_name}")
+    latest_logs_pointer = HPO_DIR / "latest_logs"
+    print(
+        f"[HPO] version={VERSION} dir={HPO_VERSION_DIR} db={OPTUNA_DB_PATH} study={study.study_name}"
+    )
+    print(f"[HPO] TensorBoard logs: tensorboard --logdir {latest_logs_pointer}")
 
-    available_features = [c for c in df_ohlcv.columns if c != "timestamp"]
+    shared_cols = set(train_df.columns) & set(val_df.columns)
+    if "timestamp" not in shared_cols:
+        raise RuntimeError("Both train and validation dataframes must include a 'timestamp' column.")
+
+    available_features = sorted(c for c in shared_cols if c != "timestamp")
 
     def objective(trial):
         # 재현성
@@ -293,6 +325,7 @@ def run_hpo(
         log_dir = HPO_LOGS_DIR / f"hpo_trial_{trial.number:03d}"
         log_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(log_dir))
+        writer.add_scalar("Meta/trial_number", float(trial.number), 0)
 
         last_critic_loss: float | None = None
         last_log_std_mean: float | None = None
@@ -349,38 +382,40 @@ def run_hpo(
                     f"ohlcv_open{other_suffix}", f"ohlcv_high{other_suffix}", f"ohlcv_low{other_suffix}", f"ohlcv_close{other_suffix}"]
 
         # >>> NEW: always include funding columns (even if trial didn't select them)
-        mandatory_cols = _mandatory_cost_cols(df_ohlcv, symbol)
+        mandatory_cols = [c for c in _mandatory_cost_cols(train_df, symbol) if c in shared_cols]
         if len(mandatory_cols) == 0:
             print(f"[HPO][WARN] No funding columns found for {symbol}. Funding cost will be zero during HPO.")
 
         # Keep order; remove dups
         cols_to_use = ["timestamp"] + base_cols + selected_feats + mandatory_cols
-        cols_to_use = list(dict.fromkeys(cols_to_use))
-        merged_df = df_ohlcv[cols_to_use]
-        if merged_df.empty:
+        cols_to_use = [c for c in dict.fromkeys(cols_to_use) if c == "timestamp" or c in shared_cols]
+
+        missing_base = [c for c in base_cols if c not in shared_cols]
+        if missing_base:
+            raise optuna.exceptions.TrialPruned(
+                f"Required OHLCV base columns are missing from datasets: {missing_base}"
+            )
+
+        train_merged = train_df.sort_values("timestamp").reset_index(drop=True)[cols_to_use]
+        val_merged = val_df.sort_values("timestamp").reset_index(drop=True)[cols_to_use]
+
+        if train_merged.empty or val_merged.empty:
             raise optuna.exceptions.TrialPruned("No data available after feature merge.")
 
-        total_len = len(merged_df)
+        total_train_len = len(train_merged)
+        total_val_len = len(val_merged)
         max_seq_len = max(ENV_CONFIG.seq_lens.values())
         min_train_len = hpo_train_steps + max_seq_len
         min_eval_len = hpo_eval_steps + max_seq_len
 
-        if total_len < (min_train_len + min_eval_len):
-            raise optuna.exceptions.TrialPruned("Insufficient data for requested horizons.")
-
-        proposed_split = int(total_len * TRAINING_CONFIG.train_split_ratio)
-        lower_bound = min_train_len
-        upper_bound = total_len - min_eval_len
-        if upper_bound < lower_bound:
-            raise optuna.exceptions.TrialPruned("Unable to allocate disjoint train/eval windows.")
-
-        split_idx = min(max(proposed_split, lower_bound), upper_bound)
-        train_df = merged_df.iloc[:split_idx]
-        eval_df = merged_df.iloc[split_idx:]
+        if total_train_len < min_train_len:
+            raise optuna.exceptions.TrialPruned("Training window shorter than requested training horizon.")
+        if total_val_len < min_eval_len:
+            raise optuna.exceptions.TrialPruned("Validation window shorter than requested evaluation horizon.")
 
         # ----- 여기서부터: data_dict 구성 시 OHLCV 4열 선두 배치 -----
-        train_data_dict = _prepare_data_for_env(train_df, symbol_hint=symbol)
-        eval_data_dict  = _prepare_data_for_env(eval_df,  symbol_hint=symbol)
+        train_data_dict = _prepare_data_for_env(train_merged, symbol_hint=symbol)
+        eval_data_dict  = _prepare_data_for_env(val_merged,  symbol_hint=symbol)
 
         if "ohlcv" not in train_data_dict or "ohlcv" not in eval_data_dict:
             raise optuna.exceptions.TrialPruned("No ohlcv group found.")
@@ -440,9 +475,9 @@ def run_hpo(
         device = "cuda" if torch.cuda.is_available() else "cpu"
         group_seq_lens = _resolve_seq_lens(train_data_dict, ENV_CONFIG)
         max_seq_from_groups = max(group_seq_lens.values())
-        if len(train_df) - max_seq_from_groups < hpo_train_steps:
+        if len(train_merged) - max_seq_from_groups < hpo_train_steps:
             raise optuna.exceptions.TrialPruned("Training window shorter than training horizon.")
-        if len(eval_df) - max_seq_from_groups < hpo_eval_steps:
+        if len(val_merged) - max_seq_from_groups < hpo_eval_steps:
             raise optuna.exceptions.TrialPruned("Evaluation window shorter than evaluation horizon.")
 
         # --- Env: HL 인덱스 반드시 지정 + 채터링 억제 옵션 ---
@@ -469,11 +504,12 @@ def run_hpo(
         hpo_batch_size = TRAINING_CONFIG.hpo_batch_size
         learning_starts = max(10_000, int(0.2 * hpo_train_steps))
         learning_starts = max(learning_starts, hpo_batch_size)
-        max_available_steps = len(train_df) - max_seq_from_groups
+        max_available_steps = len(train_merged) - max_seq_from_groups
         if learning_starts >= hpo_train_steps:
             learning_starts = max(group_seq_lens.get("ohlcv", 1), hpo_train_steps // 2)
         learning_starts = min(learning_starts, max_available_steps - 1)
         learning_starts = max(0, learning_starts)
+        writer.add_scalar("Meta/learning_starts", float(learning_starts), 0)
 
         replay_buffer = SequenceReplayBuffer(
             max_size=100_000,
@@ -563,20 +599,19 @@ def run_hpo(
 if __name__ == "__main__":
     symbol = "ethusdt"
 
-    eth_train = pd.read_parquet(get_train_parquet_path("ethusdt"))
-    eth_val = pd.read_parquet(get_validation_parquet_path("ethusdt"))
-    eth_df = pd.concat([eth_train, eth_val]).sort_values("timestamp").reset_index(drop=True)
+    eth_train = pd.read_parquet(get_train_parquet_path("ethusdt")).sort_values("timestamp")
+    eth_val = pd.read_parquet(get_validation_parquet_path("ethusdt")).sort_values("timestamp")
 
-    btc_train = pd.read_parquet(get_train_parquet_path("btcusdt"))
-    btc_val = pd.read_parquet(get_validation_parquet_path("btcusdt"))
-    btc_df = pd.concat([btc_train, btc_val]).sort_values("timestamp").reset_index(drop=True)
+    btc_train = pd.read_parquet(get_train_parquet_path("btcusdt")).sort_values("timestamp")
+    btc_val = pd.read_parquet(get_validation_parquet_path("btcusdt")).sort_values("timestamp")
 
-    # btc_df 컬럼명 충돌을 피하기 위해 merge와 suffix 사용
-    df_ohlcv = pd.merge(eth_df, btc_df, on="timestamp", suffixes=('_eth', '_btc'))
+    train_df = pd.merge(eth_train, btc_train, on="timestamp", suffixes=('_eth', '_btc'))
+    val_df = pd.merge(eth_val, btc_val, on="timestamp", suffixes=('_eth', '_btc'))
 
     study = run_hpo(
         symbol=symbol,
-        df_ohlcv=df_ohlcv,
+        train_df=train_df.reset_index(drop=True),
+        val_df=val_df.reset_index(drop=True),
         n_trials=100,
         top_n=5,
         study_name=f"feature_and_rl_hpo_{symbol}",

@@ -2,7 +2,7 @@
 
 from optuna import Trial
 from typing import List
-import optuna
+import random
 
 def select_features_from_trial(trial: Trial, available_features: List[str]) -> List[str]:
     """
@@ -19,14 +19,18 @@ def select_features_from_trial(trial: Trial, available_features: List[str]) -> L
 
     selected = [f for f, use in use_mask.items() if use]
 
+    rng = random.Random(trial.number + 17)
+
     # 개수가 너무 적으면 부족한 피처들 무작위로 더하기
     if len(selected) < min_feats:
         others = [f for f in available_features if not use_mask[f]]
-        needed = min_feats - len(selected)
+        rng.shuffle(others)
+        needed = min(min_feats - len(selected), len(others))
         selected.extend(others[:needed])
 
-    # 많으면 제한
+    # 많으면 제한 (순서 편향 방지)
     if len(selected) > max_feats:
-        selected = selected[:max_feats]
+        rng_trim = random.Random(trial.number + 31)
+        selected = rng_trim.sample(selected, k=max_feats)
 
     return selected
