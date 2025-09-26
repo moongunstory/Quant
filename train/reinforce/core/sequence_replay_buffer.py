@@ -13,20 +13,14 @@ class SequenceReplayBuffer:
         self.size = 0
         self.seq_lens = seq_lens
         self.seq_len_max = max(seq_lens.values())
-        self.batch_size = batch_size
-        self.burn_in = burn_in
-        
-        self.obs_buf = {
-            k: np.zeros((max_size, d), dtype=np.float32)
-            for k, d in input_dims.items()
-        }
-        self.next_obs_buf = {
-            k: np.zeros((max_size, d), dtype=np.float32)
-            for k, d in input_dims.items()
-        }
+        self.obs_buf = self._init_buffer_dict(input_dims)
+        self.next_obs_buf = self._init_buffer_dict(input_dims)
         self.action_buf = np.zeros((max_size, action_dim), dtype=np.float32)
         self.reward_buf = np.zeros((max_size, 1), dtype=np.float32)
         self.done_buf = np.zeros((max_size, 1), dtype=np.float32)
+
+    def _init_buffer_dict(self, input_dims):
+        return {k: np.zeros((self.max_size, dim), dtype=np.float32) for k, dim in input_dims.items()}
 
     def __len__(self):
         return self.size

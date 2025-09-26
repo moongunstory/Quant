@@ -50,6 +50,7 @@ class EnvConfig:
     ohlcv_close_idx: int = 3
     ohlcv_high_idx: int = 1
     ohlcv_low_idx: int = 2
+    bar_interval_minutes: int = 5
     seq_lens: dict[str, int] = field(
         default_factory=lambda: {"ohlcv": 48, "index": 48, "funding": 7, "dune": 7, "other": 48}
     )

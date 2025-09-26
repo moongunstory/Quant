@@ -110,7 +110,6 @@ class CryptoTradingEnv:
         idle_penalty_cfg = cfg.get("idle_penalty")
         self.idle_penalty = max(0.0, float(idle_penalty_cfg if idle_penalty_cfg is not None else base_idle_penalty))
         self.use_idle_penalty = bool(cfg.get("use_idle_penalty", use_idle_penalty)) and self.idle_penalty > 0
-        self.idle_lambda = self.idle_penalty
 
         hold_bars_default = self.env_config.min_hold_bars or 0
         if min_hold_bars is not None:
@@ -126,6 +125,15 @@ class CryptoTradingEnv:
 
         self.turnover_penalty = max(0.0, float(cfg.get("turnover_penalty", 0.0)))
         self.reward_scale = float(cfg.get("reward_scale", 300.0))
+
+        env_bar_minutes = getattr(self.env_config, "bar_interval_minutes", 5)
+        cfg_bar_minutes = cfg.get("bar_interval_minutes")
+        if cfg_bar_minutes is not None:
+            env_bar_minutes = cfg_bar_minutes
+        env_bar_minutes = float(env_bar_minutes)
+        self.bar_interval_minutes = max(1, int(env_bar_minutes))
+        funding_steps = 480 / float(self.bar_interval_minutes)
+        self.funding_interval = max(1, int(funding_steps))
 
         self.holding_bars_running = 0
 
@@ -157,6 +165,22 @@ class CryptoTradingEnv:
         self._roll_turnover= Rolling(1000)   # |pos_t - pos_{t-1}|
         self._roll_abs_pos = Rolling(1000)
         self._roll_dpos    = Rolling(1000)
+
+        self._rolling_metrics = (
+            self._roll_trade_close,
+            self._roll_tp_close,
+            self._roll_sl_close,
+            self._roll_forced_close,
+            self._roll_action_flat,
+            self._roll_action_flip,
+            self._roll_R,
+            self._roll_hold_bars,
+            self._roll_reward,
+            self._roll_funding,
+            self._roll_turnover,
+            self._roll_abs_pos,
+            self._roll_dpos,
+        )
 
         self.reset()
 
@@ -209,18 +233,33 @@ class CryptoTradingEnv:
 
         self.ewma_abs_r = 0.0
 
-        for r in (
-            self._roll_trade_close, self._roll_tp_close, self._roll_sl_close,
-            self._roll_forced_close, self._roll_action_flat, self._roll_action_flip,
-            self._roll_R, self._roll_hold_bars, self._roll_reward,
-            self._roll_funding, self._roll_turnover, self._roll_abs_pos, self._roll_dpos
-        ):
-            r.buf.clear()
+        self._reset_rollings()
 
         return self._get_obs()
 
     def _get_obs(self):
         return {k: v[self.t - self.seq_lens[k]: self.t] for k, v in self.data.items()}
+
+    def _reset_rollings(self):
+        for rolling in self._rolling_metrics:
+            rolling.buf.clear()
+
+    def _record_trade_flags(
+        self,
+        trade: float,
+        tp: float,
+        sl: float,
+        forced: float,
+        *,
+        flat: bool = False,
+        flip: bool = False,
+    ) -> None:
+        self._roll_trade_close.add(trade)
+        self._roll_tp_close.add(tp)
+        self._roll_sl_close.add(sl)
+        self._roll_forced_close.add(forced)
+        self._roll_action_flat.add(1.0 if flat else 0.0)
+        self._roll_action_flip.add(1.0 if flip else 0.0)
 
     # --- 공통: 포지션 청산(수수료 곱셈 반영, 로그 기록) ---
     def _close_trade(self, pos_prev, exit_price, *, tp_hit=False, sl_hit=False, forced=False, reason:str=""):
@@ -232,23 +271,16 @@ class CryptoTradingEnv:
         hold_bars = int(self.holding_bars_running)
 
         # 이벤트 기록(이 스텝에서 1로 기록)
-        self._roll_trade_close.add(1.0)
-        self._roll_tp_close.add(1.0 if tp_hit else 0.0)
-        self._roll_sl_close.add(1.0 if sl_hit else 0.0)
-        self._roll_forced_close.add(1.0 if forced else 0.0)
         self._roll_R.add(R)
         self._roll_hold_bars.add(hold_bars)
-
-        # 액션 유발 분해
-        if reason == "flat":
-            self._roll_action_flat.add(1.0)
-            self._roll_action_flip.add(0.0)
-        elif reason == "flip":
-            self._roll_action_flat.add(0.0)
-            self._roll_action_flip.add(1.0)
-        else:
-            self._roll_action_flat.add(0.0)
-            self._roll_action_flip.add(0.0)
+        self._record_trade_flags(
+            1.0,
+            1.0 if tp_hit else 0.0,
+            1.0 if sl_hit else 0.0,
+            1.0 if forced else 0.0,
+            flat=reason == "flat",
+            flip=reason == "flip",
+        )
 
         # 상태 리셋
         self.position = 0
@@ -299,15 +331,15 @@ class CryptoTradingEnv:
             if pos_prev != 0:
                 self.portfolio_value *= (1.0 + pos_prev * r_step)
 
-        # --- 펀딩비(부호 포함) ---
+        # --- 펀딩비(8시간 간격 적용) ---
         if "funding" in self.data:
             frate = float(self.data["funding"][self.t, self.funding_col_idx])
-            # 펀딩비는 보통 8시간마다 적용 - 스텝당 비율로 정규화
-            # 1시간봉이라면 8로 나누기, 15분봉이라면 32로 나누기 등
-            funding_divisor = 8  # 환경에 맞게 조정 필요
-            fund_flow = pos_prev * (frate / funding_divisor)
-            self.portfolio_value *= (1.0 - fund_flow)
-            self._roll_funding.add(fund_flow)
+            if pos_prev != 0 and self.t % self.funding_interval == 0:
+                fund_flow = pos_prev * frate
+                self.portfolio_value *= (1.0 - fund_flow)
+                self._roll_funding.add(fund_flow)
+            else:
+                self._roll_funding.add(0.0)
         else:
             self._roll_funding.add(0.0)
 
@@ -351,12 +383,7 @@ class CryptoTradingEnv:
 
         # --- 거래 종료가 없었다면 0을 기록(분모 일관성) ---
         if not closed_this_step:
-            self._roll_trade_close.add(0.0)
-            self._roll_tp_close.add(0.0)
-            self._roll_sl_close.add(0.0)
-            self._roll_forced_close.add(0.0)
-            self._roll_action_flat.add(0.0)
-            self._roll_action_flip.add(0.0)
+            self._record_trade_flags(0.0, 0.0, 0.0, 0.0)
 
         # turnover 기록 및 빈도 비용 적용
         pos_now = int(self.position)

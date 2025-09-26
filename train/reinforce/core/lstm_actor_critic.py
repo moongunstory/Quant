@@ -8,6 +8,37 @@ import torch.nn as nn
 from ai_binance.train.reinforce.config import TrainingConfig
 
 
+def _build_lstm_modules(input_dims, hidden_dim, lstm_layers):
+    return nn.ModuleDict(
+        {
+            name: nn.LSTM(
+                input_size=dim,
+                hidden_size=hidden_dim,
+                num_layers=lstm_layers,
+                batch_first=True,
+            )
+            for name, dim in input_dims.items()
+        }
+    )
+
+
+def _extract_last_hidden(lstm_modules, state_seq_dict):
+    outputs = []
+    for name, lstm in lstm_modules.items():
+        x = state_seq_dict[name]
+        out, _ = lstm(x)
+        outputs.append(out[:, -1, :])
+    return outputs
+
+
+def _shared_head(input_dim, hidden_dim):
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+    )
+
+
 class LSTMActor(nn.Module):
     def __init__(
         self,
@@ -24,7 +55,7 @@ class LSTMActor(nn.Module):
         input_dims: {"ohlcv": 8, "funding": 4, "dune": 3}
         """
         super().__init__()
-        self.lstm_modules = nn.ModuleDict()
+        self.lstm_modules = _build_lstm_modules(input_dims, hidden_dim, lstm_layers)
         self.hidden_dim = hidden_dim
 
         config = training_config or TrainingConfig()
@@ -33,22 +64,10 @@ class LSTMActor(nn.Module):
         self.log_std_min = float(log_std_min if log_std_min is not None else config.log_std_min)
         self.log_std_max = float(log_std_max if log_std_max is not None else config.log_std_max)
 
-        for name, dim in input_dims.items():
-            self.lstm_modules[name] = nn.LSTM(
-                input_size=dim,
-                hidden_size=hidden_dim,
-                num_layers=lstm_layers,
-                batch_first=True,
-            )
-
         combined_dim = hidden_dim * len(input_dims)
 
         # 비선형 레이어 추가
-        self.fc_shared = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
+        self.fc_shared = _shared_head(combined_dim, hidden_dim)
         self.fc_mu = nn.Linear(hidden_dim, action_dim)
         self.fc_log_std = nn.Linear(hidden_dim, action_dim)
 
@@ -65,14 +84,7 @@ class LSTMActor(nn.Module):
         """
         state_seq_dict: {"ohlcv": (B, T1, D1), "funding": (B, T2, D2), ...}
         """
-        lstm_outputs = []
-
-        for name, lstm in self.lstm_modules.items():
-            x = state_seq_dict[name]          # (B, T_k, D_k)
-            out, _ = lstm(x)
-            h_last = out[:, -1, :]            # 마지막 시점
-            lstm_outputs.append(h_last)
-
+        lstm_outputs = _extract_last_hidden(self.lstm_modules, state_seq_dict)
         combined_features = torch.cat(lstm_outputs, dim=-1)
 
         shared_features = self.fc_shared(combined_features)
@@ -89,25 +101,13 @@ class LSTMActor(nn.Module):
 class LSTMCritic(nn.Module):
     def __init__(self, input_dims, action_dim, hidden_dim=128, lstm_layers=1):
         super().__init__()
-        self.lstm_modules = nn.ModuleDict()
+        self.lstm_modules = _build_lstm_modules(input_dims, hidden_dim, lstm_layers)
         self.hidden_dim = hidden_dim
-
-        for name, dim in input_dims.items():
-            self.lstm_modules[name] = nn.LSTM(
-                input_size=dim,
-                hidden_size=hidden_dim,
-                num_layers=lstm_layers,
-                batch_first=True,
-            )
 
         combined_dim = hidden_dim * len(input_dims) + action_dim
 
         # 비선형 레이어 추가
-        self.fc_shared = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
+        self.fc_shared = _shared_head(combined_dim, hidden_dim)
         self.fc_q = nn.Linear(hidden_dim, 1)
 
     def forward(self, state_seq_dict, action):
@@ -115,14 +115,7 @@ class LSTMCritic(nn.Module):
         state_seq_dict: {"ohlcv": (B, T1, D1), "funding": (B, T2, D2), ...}
         action: (B, action_dim)
         """
-        lstm_outputs = []
-
-        for name, lstm in self.lstm_modules.items():
-            x = state_seq_dict[name]          # (B, T_k, D_k)
-            out, _ = lstm(x)
-            h_last = out[:, -1, :]
-            lstm_outputs.append(h_last)
-
+        lstm_outputs = _extract_last_hidden(self.lstm_modules, state_seq_dict)
         combined_features = torch.cat(lstm_outputs + [action], dim=-1)
         shared_features = self.fc_shared(combined_features)
         q_value = self.fc_q(shared_features)
