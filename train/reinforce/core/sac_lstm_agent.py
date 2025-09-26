@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ai_binance.train.reinforce.config import TrainingConfig
 from ai_binance.train.reinforce.core.lstm_actor_critic import LSTMActor, LSTMCritic
+
+
+LOG_EPS = 1e-6
 
 
 class SACLSTMAgent:
@@ -34,7 +38,6 @@ class SACLSTMAgent:
         alpha_min: float | None = None,
         alpha_max: float | None = None,
         clip_grad: float | None = None,
-        reward_scale: float | None = None,
         training_config: TrainingConfig | None = None,
         use_fixed_alpha=False,
         fixed_alpha: float | None = None,
@@ -56,12 +59,6 @@ class SACLSTMAgent:
             cfg.get(
                 "clip_grad",
                 clip_grad if clip_grad is not None else self.config.grad_clip_norm,
-            )
-        )
-        self.reward_scale = float(
-            cfg.get(
-                "reward_scale",
-                reward_scale if reward_scale is not None else self.config.reward_scale,
             )
         )
         target_entropy_scale = cfg.get(
@@ -138,10 +135,6 @@ class SACLSTMAgent:
             self.actor_scheduler = None
             self.critic_schedulers = []
 
-        # --- reward running stats (for TD only) ---
-        self.r_mu = 0.0
-        self.r_std = 1.0
-
         # --- entropy target & alpha autotune ---
         log_alpha_init = math.log(init_alpha)
         self.log_alpha = torch.nn.Parameter(
@@ -170,24 +163,35 @@ class SACLSTMAgent:
     def _to_tensor(self, batch_dict):
         return {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k, v in batch_dict.items()}
 
+    def _actor_distribution(self, state_seq):
+        mu, log_std, _ = self.actor(state_seq)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        return mu, log_std, dist
+
+    def _sample_squashed(self, dist):
+        z = dist.rsample()
+        action = torch.tanh(z)
+        log_prob = dist.log_prob(z).sum(-1, keepdim=True) - torch.log(
+            1 - action.pow(2) + LOG_EPS
+        ).sum(-1, keepdim=True)
+        return action, log_prob
+
     @torch.no_grad()
     def select_action(self, state_seq_dict, deterministic: bool = False):
         """정책에서 행동 샘플. tanh-squash로 [-1,1] 보장."""
         self.actor.eval()
         state_seq_tensor = self._to_tensor({k: v[None, ...] for k, v in state_seq_dict.items()})
-        mu, log_std, _ = self.actor(state_seq_tensor)
+        mu, _, dist = self._actor_distribution(state_seq_tensor)
         if deterministic:
-            action = torch.tanh(mu)  # 결정론도 squash
+            action = torch.tanh(mu)
         else:
-            std = log_std.exp()
-            dist = torch.distributions.Normal(mu, std)
-            z = dist.sample()
-            action = torch.tanh(z)
+            action, _ = self._sample_squashed(dist)
         self.actor.train()
         return action.squeeze(0).cpu().numpy()
 
     # ===== Update =====
-    def update(self, replay_buffer, batch_size, recent_reward=None):
+    def update(self, replay_buffer, batch_size):
         state_seq, action_seq, reward_seq, next_state_seq, done_seq = replay_buffer.sample(batch_size)
 
         state_seq = self._to_tensor(state_seq)
@@ -211,18 +215,8 @@ class SACLSTMAgent:
 
         # --- Critic update ---
         with torch.no_grad():
-            next_mu, next_log_std, _ = self.actor(next_state_seq)
-            next_std = next_log_std.exp()
-            next_dist = torch.distributions.Normal(next_mu, next_std)
-            # reparameterize + tanh squash
-            z_next = next_dist.rsample()
-            next_action = torch.tanh(z_next)
-
-            # tanh 로그보정: log_prob(z) - sum log(1 - tanh(z)^2)
-            LOG_EPS = 1e-6
-            next_log_prob = next_dist.log_prob(z_next).sum(-1, keepdim=True) - torch.log(
-                1 - next_action.pow(2) + LOG_EPS
-            ).sum(-1, keepdim=True)
+            _, _, next_dist = self._actor_distribution(next_state_seq)
+            next_action, next_log_prob = self._sample_squashed(next_dist)
 
             alpha_t = self._alpha_value()
 
@@ -248,16 +242,8 @@ class SACLSTMAgent:
             opt.step()
 
         # --- Actor update ---
-        mu, log_std, _ = self.actor(state_seq)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(mu, std)
-        z = dist.rsample()
-        new_action = torch.tanh(z)
-
-        LOG_EPS = 1e-6
-        log_prob = dist.log_prob(z).sum(-1, keepdim=True) - torch.log(
-            1 - new_action.pow(2) + LOG_EPS
-        ).sum(-1, keepdim=True)
+        _, log_std, dist = self._actor_distribution(state_seq)
+        new_action, log_prob = self._sample_squashed(dist)
 
         q1, _ = self.critic_1(state_seq, new_action)
         q2, _ = self.critic_2(state_seq, new_action)
@@ -294,7 +280,7 @@ class SACLSTMAgent:
         return {
             "critic_loss": float(critic_loss.detach().cpu()),
             "actor_loss": float(actor_loss.detach().cpu()),
-            "alpha": float(alpha_t.detach().cpu()),
+            "alpha": float(self._alpha_value().detach().cpu()),
             "policy_entropy": float((-log_prob).detach().mean().cpu()),
             "log_std_mean": float(log_std.detach().mean().cpu()),
         }
@@ -318,3 +304,52 @@ class SACLSTMAgent:
         self.log_std_max = float(max_v)
         if hasattr(self.actor, "set_log_std_bounds"):
             self.actor.set_log_std_bounds(min_v, max_v)
+
+    def state_dict(self):
+        state = {
+            "actor": self.actor.state_dict(),
+            "critic_1": self.critic_1.state_dict(),
+            "critic_2": self.critic_2.state_dict(),
+            "critic_target_1": self.critic_target_1.state_dict(),
+            "critic_target_2": self.critic_target_2.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opts": [opt.state_dict() for opt in self.critic_opts],
+            "alpha_opt": self.alpha_opt.state_dict(),
+            "log_alpha": float(self.log_alpha.detach().cpu()),
+            "use_fixed_alpha": self.use_fixed_alpha,
+        }
+        if self.actor_scheduler is not None:
+            state["actor_scheduler"] = self.actor_scheduler.state_dict()
+        if self.critic_schedulers:
+            state["critic_schedulers"] = [sched.state_dict() for sched in self.critic_schedulers]
+        return state
+
+    def load_state_dict(self, state):
+        self.actor.load_state_dict(state["actor"])
+        self.critic_1.load_state_dict(state["critic_1"])
+        self.critic_2.load_state_dict(state["critic_2"])
+        self.critic_target_1.load_state_dict(state.get("critic_target_1", state["critic_1"]))
+        self.critic_target_2.load_state_dict(state.get("critic_target_2", state["critic_2"]))
+
+        self.actor_opt.load_state_dict(state["actor_opt"])
+        for opt, opt_state in zip(self.critic_opts, state["critic_opts"]):
+            opt.load_state_dict(opt_state)
+        self.alpha_opt.load_state_dict(state["alpha_opt"])
+
+        self.log_alpha.data.fill_(state.get("log_alpha", float(self.log_alpha.detach().cpu())))
+        self._fixed_alpha_tensor = None
+
+        if self.actor_scheduler is not None and "actor_scheduler" in state:
+            self.actor_scheduler.load_state_dict(state["actor_scheduler"])
+        if self.critic_schedulers and "critic_schedulers" in state:
+            for sched, sched_state in zip(self.critic_schedulers, state["critic_schedulers"]):
+                sched.load_state_dict(sched_state)
+
+    def save(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), path)
+
+    def load(self, path, *, map_location=None):
+        checkpoint = torch.load(path, map_location=map_location or self.device)
+        self.load_state_dict(checkpoint)

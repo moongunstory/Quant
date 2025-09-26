@@ -1,11 +1,20 @@
 # train/reinforce/sac/trainer.py
 
-import os
 from pathlib import Path
-import numpy as np
-import torch
+
 from torch.utils.tensorboard import SummaryWriter
-from collections import deque
+
+from config.paths import CHECKPOINTS_DIR, LOGS_DIR, PROJECT_ROOT
+
+
+def _resolve_path(path_value, default: Path) -> Path:
+    if path_value is None:
+        return default
+
+    candidate = Path(path_value)
+    if candidate.is_absolute():
+        return candidate
+    return PROJECT_ROOT / candidate
 
 
 class Trainer:
@@ -24,12 +33,11 @@ class Trainer:
         self.batch_size = config.get("batch_size", 256)
         self.log_interval = config.get("log_interval", 1000)
         self.save_interval = config.get("save_interval", 50000)
-        self.save_path = Path(config.get("save_path", "models/checkpoints"))
-
+        self.save_path = _resolve_path(config.get("save_path"), CHECKPOINTS_DIR)
         self.save_path.mkdir(parents=True, exist_ok=True)
 
         # TensorBoard SummaryWriter
-        logs_dir = Path("ai_binance/data/models/logs")
+        logs_dir = _resolve_path(config.get("logs_dir"), LOGS_DIR)
         logs_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(logs_dir)
 
@@ -39,11 +47,6 @@ class Trainer:
         total_reward = 0
         episode_reward = 0
         episode_count = 0
-
-        W = 5000
-        trade_events = deque(maxlen=W)
-        flip_events  = deque(maxlen=W)
-        turnover_hist = deque(maxlen=W)
 
         print(f"[Trainer] Starting training for {self.total_steps} steps.")
 
@@ -62,15 +65,10 @@ class Trainer:
             # 리플레이 버퍼에 경험 저장
             self.replay_buffer.add(obs, action, reward, next_obs, done)
 
-            # 슬라이딩 윈도우 로깅을 위한 정보 업데이트
-            trade_events.append(1 if info.get("did_trade") else 0)
-            flip_events.append(1 if info.get("did_flip") else 0)
-            turnover_hist.append(info.get("turnover", 0.0))
-
             # 학습 시작 스텝 이후부터 에이전트 업데이트
             if step >= self.learning_starts:
                 losses = self.agent.update(
-                    self.replay_buffer, batch_size=self.batch_size, recent_reward=episode_reward
+                    self.replay_buffer, batch_size=self.batch_size
                 )
 
                 # TensorBoard에 학습 로그 기록
@@ -97,16 +95,10 @@ class Trainer:
             if step % self.log_interval == 0:
                 print(f"--- [Step {step}/{self.total_steps}] ---")
                 self.writer.add_scalar("Train/RewardRunning", total_reward / step, step)
-
-                # 슬라이딩 윈도우 지표 계산 및 로깅
-                if len(trade_events) > 0:
-                    trades_per_1k = 1000.0 * (sum(trade_events) / len(trade_events))
-                    flip_rate_1k  = 1000.0 * (sum(flip_events) / len(flip_events))
-                    turnover_win  = sum(turnover_hist) / max(1, len(turnover_hist))
-
-                    self.writer.add_scalar("Trade/trades_per_1k", trades_per_1k, step)
-                    self.writer.add_scalar("Trade/action_flip_rate_1k", flip_rate_1k, step)
-                    self.writer.add_scalar("Trade/turnover", turnover_win, step)
+                tb_metrics = getattr(self.env, "tb_metrics", None)
+                if callable(tb_metrics):
+                    for key, value in tb_metrics().items():
+                        self.writer.add_scalar(f"Env/{key}", value, step)
 
             # 모델 체크포인트 저장
             if step % self.save_interval == 0:

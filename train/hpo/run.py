@@ -1,28 +1,33 @@
 # train/hpo/run.py
-
-import sys
 import json
 import shutil
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-sys.path.append(str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
+import numpy as np
 import optuna
 import pandas as pd
-import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from ai_binance.config.paths import (
-    get_validation_parquet_path,
-    get_train_parquet_path,
     HPO_DIR,  # 베이스만 import, 나머지는 런타임에 버전별로 생성
     ensure_hpo_version_artifacts,
+    get_train_parquet_path,
+    get_validation_parquet_path,
     list_hpo_versions,
     set_latest_hpo_version,
 )
-from ai_binance.train.reinforce.config import TrainingConfig, EnvConfig
+from ai_binance.train.hpo.core.feature_selector import select_features_from_trial
+from ai_binance.train.reinforce.config import EnvConfig, TrainingConfig
+from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
+from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
+from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
 
 # === 실행마다 버전 자동 분리 토글 ===
 SPLIT_RUN = True  # True: 새 버전(1,2,3,...) 생성 / False: 가장 최근 버전에 이어서
@@ -69,12 +74,6 @@ VERSION, HPO_VERSION_DIR, HPO_LOGS_DIR, OPTUNA_DB_PATH, TOP_N_PARAMS_PATH = _res
 TRAINING_CONFIG = TrainingConfig()
 ENV_CONFIG = EnvConfig()
 
-from ai_binance.train.hpo.core.feature_selector import select_features_from_trial
-
-from ai_binance.train.reinforce.core.crypto_trading_env import CryptoTradingEnv
-from ai_binance.train.reinforce.core.sac_lstm_agent import SACLSTMAgent
-from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceReplayBuffer
-
 HEALTH_CHECK_INTERVAL = 1_000
 HEALTH_STAGE1_STEP = 12_000      # 학습 업데이트 시작(learning_starts=10k) 이후로 프룬 지연
 HEALTH_STAGE2_STEP = 22_000
@@ -82,7 +81,13 @@ CRITIC_LOSS_LIMIT = 0.35         # 초반 수렴 여지
 PRUNER_ENABLE_STEP = 15_000      # Optuna should_prune() 호출 가드
 
 # 항상 포함할 비용(펀딩) 컬럼 선택: trial이 선택 안 해도 env로 전달되게
-def _order_funding_columns(cols: list[str], sym_suffix: str) -> list[str]:
+def _symbol_suffixes(symbol: str | None) -> tuple[str, str]:
+    if symbol == "ethusdt":
+        return "_eth", "_btc"
+    return "_btc", "_eth"
+
+
+def _order_funding_columns(cols: Sequence[str], sym_suffix: str) -> list[str]:
     """Ensure the raw funding rate is the first column consumed by the env."""
 
     preferred = [
@@ -93,19 +98,19 @@ def _order_funding_columns(cols: list[str], sym_suffix: str) -> list[str]:
         "funding_rate",
     ]
 
-    ordered = []
-    seen = set()
-    for cand in preferred:
-        if cand in cols and cand not in seen:
-            ordered.append(cand)
-            seen.add(cand)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in preferred:
+        if candidate in cols and candidate not in seen:
+            ordered.append(candidate)
+            seen.add(candidate)
 
     ordered.extend([c for c in cols if c not in seen])
     return ordered
 
 
-def _mandatory_cost_cols(df: pd.DataFrame, symbol: str):
-    sym_suffix = "_eth" if symbol == "ethusdt" else "_btc"
+def _mandatory_cost_cols(df: pd.DataFrame, symbol: str) -> list[str]:
+    sym_suffix, _ = _symbol_suffixes(symbol)
     cols = [c for c in df.columns if c.startswith("funding") and c.endswith(sym_suffix)]
     if not cols:
         return []
@@ -120,33 +125,34 @@ def _resolve_seq_lens(data_dict: dict[str, np.ndarray], env_config: EnvConfig) -
     return {group: base.get(group, default_len) for group in data_dict}
 
 
-def _merge_features(dfs: dict, ohlcv_df: pd.DataFrame):
+def _merge_features(dfs: dict[str, pd.DataFrame], ohlcv_df: pd.DataFrame) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
 
-    for name in dfs:
-        if "timestamp" in dfs[name].columns:
-            dfs[name] = dfs[name].sort_values("timestamp").dropna(subset=["timestamp"])
+    frames: list[pd.DataFrame] = []
+    for frame in dfs.values():
+        if "timestamp" not in frame.columns:
+            continue
+        cleaned = frame.sort_values("timestamp").dropna(subset=["timestamp"])
+        frames.append(cleaned)
 
-    df_5min_list = list(dfs.values())
-    df_8hour = None
-    df_daily = None
-
-    if not df_5min_list:
+    if not frames:
         return pd.DataFrame()
-    
-    merged_df = df_5min_list[0]
-    for i in range(1, len(df_5min_list)):
-        merged_df = pd.merge(merged_df, df_5min_list[i], on="timestamp", how="inner")
 
-    if df_8hour is not None and not df_8hour.empty:
-        df_8hour_resampled = df_8hour.set_index('timestamp').resample('8h').ffill().reset_index()
-        merged_df = pd.merge_asof(merged_df.sort_values('timestamp'), df_8hour_resampled.sort_values('timestamp'), on="timestamp", direction="backward")
+    merged_df = frames[0]
+    for frame in frames[1:]:
+        merged_df = pd.merge(merged_df, frame, on="timestamp", how="inner")
 
-    if df_daily is not None and not df_daily.empty:
-        merged_df = pd.merge_asof(merged_df.sort_values('timestamp'), df_daily.sort_values('timestamp'), on="timestamp", direction="backward")
-
-    final_df = pd.merge(ohlcv_df, merged_df, on="timestamp", how="inner").dropna()
+    final_df = (
+        pd.merge(
+            ohlcv_df.sort_values("timestamp"),
+            merged_df.sort_values("timestamp"),
+            on="timestamp",
+            how="inner",
+        )
+        .dropna()
+        .reset_index(drop=True)
+    )
     return final_df
 
 
@@ -192,7 +198,9 @@ def _build_ohlcv_block(df: pd.DataFrame, symbol_hint: str = None):
     return cols, df[cols].to_numpy()
 
 
-def _prepare_data_for_env(df: pd.DataFrame, symbol_hint: str = None):
+def _prepare_data_for_env(
+    df: pd.DataFrame, symbol_hint: str | None = None
+) -> dict[str, np.ndarray]:
     """
     data_dict를 생성. 'ohlcv' 그룹은 반드시 [O,H,L,C]를 선두 4열로 포함.
     나머지 그룹은 접두사별로 수집.
@@ -205,9 +213,8 @@ def _prepare_data_for_env(df: pd.DataFrame, symbol_hint: str = None):
 
     # --- 나머지 그룹 ---
     used_cols = set(ohlcv_cols)
-    sym_suffix = "_eth" if symbol_hint == "ethusdt" else "_btc"
-    other_suffix = "_btc" if sym_suffix == "_eth" else "_eth"
-    
+    sym_suffix, other_suffix = _symbol_suffixes(symbol_hint)
+
     main_symbol_features = [c for c in df.columns if c.endswith(sym_suffix) and c not in used_cols]
     other_symbol_features = [c for c in df.columns if c.endswith(other_suffix) and c not in used_cols]
     
@@ -407,12 +414,19 @@ def run_hpo(
         if not selected_feats:
             raise optuna.exceptions.TrialPruned("No features selected.")
 
-        sym_suffix = "_eth" if symbol == "ethusdt" else "_btc"
-        other_suffix = "_btc" if sym_suffix == "_eth" else "_eth"
-        base_cols = [f"ohlcv_open{sym_suffix}", f"ohlcv_high{sym_suffix}", f"ohlcv_low{sym_suffix}", f"ohlcv_close{sym_suffix}",
-                    f"ohlcv_open{other_suffix}", f"ohlcv_high{other_suffix}", f"ohlcv_low{other_suffix}", f"ohlcv_close{other_suffix}"]
+        sym_suffix, other_suffix = _symbol_suffixes(symbol)
+        base_cols = [
+            f"ohlcv_open{sym_suffix}",
+            f"ohlcv_high{sym_suffix}",
+            f"ohlcv_low{sym_suffix}",
+            f"ohlcv_close{sym_suffix}",
+            f"ohlcv_open{other_suffix}",
+            f"ohlcv_high{other_suffix}",
+            f"ohlcv_low{other_suffix}",
+            f"ohlcv_close{other_suffix}",
+        ]
 
-        # >>> NEW: always include funding columns (even if trial didn't select them)
+        # Always include funding columns even if the trial did not select them explicitly.
         mandatory_cols = [c for c in _mandatory_cost_cols(train_df, symbol) if c in shared_cols]
         if len(mandatory_cols) == 0:
             print(f"[HPO][WARN] No funding columns found for {symbol}. Funding cost will be zero during HPO.")
@@ -466,9 +480,6 @@ def run_hpo(
             "use_scheduler": False,
         }
 
-        if not (agent_cfg["log_std_min"] < agent_cfg["log_std_max"]):
-            _prune("invalid log_std bounds", 0)
-
         margin = 0.02
         th_open = trial.suggest_float("th_open", 0.25, 0.60)
         close_high = min(0.30, th_open - margin)
@@ -499,8 +510,6 @@ def run_hpo(
 
         if not (0.0 < env_cfg["th_close"] < env_cfg["th_open"] < env_cfg["th_flip"] < 1.0):
             _prune("invalid hysteresis", 0)
-        if not (agent_cfg["log_std_min"] < agent_cfg["log_std_max"]):
-            _prune("invalid log_std bounds", 0)
 
         action_dim = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
