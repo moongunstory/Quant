@@ -1,6 +1,8 @@
 # train/hpo/run.py
 import json
+import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -33,19 +35,88 @@ from ai_binance.train.reinforce.core.sequence_replay_buffer import SequenceRepla
 SPLIT_RUN = True  # True: 새 버전(1,2,3,...) 생성 / False: 가장 최근 버전에 이어서
 
 
+def _create_windows_link(link_path: Path, target: Path) -> bool:
+    """Best-effort creation of a link on Windows environments."""
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        flags = 0x1 if target.is_dir() else 0x0  # SYMBOLIC_LINK_FLAG_DIRECTORY
+        # Allow symlink creation without elevation on recent Windows 10+
+        SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2
+        kernel32.SetLastError(0)
+        result = kernel32.CreateSymbolicLinkW(
+            ctypes.c_wchar_p(str(link_path)),
+            ctypes.c_wchar_p(str(target)),
+            ctypes.c_uint32(flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE),
+        )
+        if result != 0:
+            return True
+    except Exception:
+        # Fall back to mklink /J or hardlink below
+        pass
+
+    if target.is_dir():
+        try:
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link_path), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0 and Path(link_path).exists():
+                return True
+        except Exception:
+            pass
+    else:
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetLastError(0)
+            kernel32.CreateHardLinkW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p]
+            kernel32.CreateHardLinkW.restype = ctypes.c_int
+            result = kernel32.CreateHardLinkW(
+                ctypes.c_wchar_p(str(link_path)),
+                ctypes.c_wchar_p(str(target)),
+                None,
+            )
+            if result != 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 def _safe_replace_symlink(link_path: Path, target: Path) -> None:
     """Create or replace a symlink so that external tools can find latest artifacts."""
 
+    target = target.resolve()
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.is_dir() and not link_path.is_symlink():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+
     try:
-        if link_path.exists() or link_path.is_symlink():
-            if link_path.is_dir() and not link_path.is_symlink():
-                shutil.rmtree(link_path)
-            else:
-                link_path.unlink()
         link_path.symlink_to(target, target_is_directory=target.is_dir())
-    except OSError:
-        # 환경이 심볼릭 링크를 지원하지 않는 경우에는 패스(필수 동작 아님)
-        pass
+    except OSError as exc:
+        if os.name == "nt":
+            if _create_windows_link(link_path, target):
+                return
+        hint = (
+            "Enable Developer Mode or run the shell as administrator to allow symlink creation."
+            if os.name == "nt"
+            else "Ensure the filesystem supports symbolic links."
+        )
+        raise RuntimeError(
+            f"Failed to create link {link_path} -> {target}: {exc}. {hint}"
+        )
+
 
 
 def _resolve_hpo_paths(split_run: bool):
@@ -265,9 +336,6 @@ def _evaluate_agent(
 
     # Build NAV from net step returns (includes fee/funding if env.reward is net)
     rets = np.asarray(rets, dtype=np.float64)
-    if rets.size == 0:
-        return -np.inf
-
     reward_scale = float(getattr(env, "reward_scale", 1.0))
     log_returns = rets if reward_scale == 0 else rets / reward_scale
     step_returns = np.expm1(log_returns)
@@ -275,31 +343,64 @@ def _evaluate_agent(
     values = np.insert(values, 0, 1.0)  # start NAV=1.0
 
     returns = step_returns
-    if returns.size == 0:
-        return -np.inf
+    nav_final = float(values[-1]) if values.size else 1.0
+    nav_peak = float(values.max()) if values.size else nav_final
+    nav_min = float(values.min()) if values.size else nav_final
 
     per_period_rf = rf_rate / periods_per_year if periods_per_year else 0.0
-    excess_returns = returns - per_period_rf
-    vol = returns.std(ddof=0)
-    if vol > 0:
-        annual_sharpe = (excess_returns.mean() / vol) * np.sqrt(periods_per_year)
-    else:
+
+    if returns.size == 0:
         annual_sharpe = 0.0
-
-    peak = np.maximum.accumulate(values)
-    drawdowns = (peak - values) / (peak + 1e-8)
-    max_dd = float(drawdowns.max()) if drawdowns.size else 0.0
-
-    periods = returns.size
-    if periods > 0 and values[0] > 0 and values[-1] > 0:
-        total_return = values[-1] / values[0]
-        cagr = total_return ** (periods_per_year / periods) - 1.0 if total_return > 0 else 0.0
-    else:
+        calmar_ratio = 0.0
         cagr = 0.0
-    calmar_ratio = cagr / max_dd if max_dd > 0 else 0.0
+        max_dd = 0.0
+        score = -penalty * 0.0
+    else:
+        excess_returns = returns - per_period_rf
+        vol = returns.std(ddof=0)
+        if vol > 0:
+            annual_sharpe = (excess_returns.mean() / vol) * np.sqrt(periods_per_year)
+        else:
+            annual_sharpe = 0.0
 
-    score = sharpe_weight * annual_sharpe + calmar_weight * calmar_ratio - penalty * max_dd
-    return float(score)
+        peak = np.maximum.accumulate(values)
+        drawdowns = (peak - values) / (peak + 1e-8)
+        max_dd = float(drawdowns.max()) if drawdowns.size else 0.0
+
+        periods = returns.size
+        if periods > 0 and values[0] > 0 and values[-1] > 0:
+            total_return = values[-1] / values[0]
+            cagr = total_return ** (periods_per_year / periods) - 1.0 if total_return > 0 else 0.0
+        else:
+            cagr = 0.0
+        calmar_ratio = cagr / max_dd if max_dd > 0 else 0.0
+        score = sharpe_weight * annual_sharpe + calmar_weight * calmar_ratio - penalty * max_dd
+
+    stats = {
+        "nav_final": nav_final,
+        "nav_peak": nav_peak,
+        "nav_min": nav_min,
+        "max_drawdown": float(max_dd),
+        "annual_sharpe": float(annual_sharpe),
+        "calmar_ratio": float(calmar_ratio),
+        "cagr": float(cagr),
+        "steps": int(steps),
+        "total_return_pct": float((nav_final - 1.0) * 100.0),
+        "reward_sum": float(rets.sum()) if rets.size else 0.0,
+        "reward_mean": float(rets.mean()) if rets.size else 0.0,
+        "reward_std": float(rets.std(ddof=0)) if rets.size else 0.0,
+        "avg_step_return": float(returns.mean()) if returns.size else 0.0,
+        "step_return_std": float(returns.std(ddof=0)) if returns.size else 0.0,
+        "total_trades": int(getattr(env, "total_trades", 0)),
+        "forced_closes": int(getattr(env, "total_forced_closes", 0)),
+        "tp_hits": int(getattr(env, "total_tp_hits", 0)),
+        "sl_hits": int(getattr(env, "total_sl_hits", 0)),
+        "flip_closes": int(getattr(env, "total_flip_closes", 0)),
+        "flat_closes": int(getattr(env, "total_flat_closes", 0)),
+        "cumulative_turnover": float(getattr(env, "cumulative_turnover", 0.0)),
+    }
+
+    return float(score), stats
 
 
 def run_hpo(
@@ -601,31 +702,77 @@ def run_hpo(
 
                 obs = next_obs if not done else train_env.reset()
 
-            score = _evaluate_agent(
+            score, eval_stats = _evaluate_agent(
                 agent,
                 eval_env,
                 hpo_eval_steps,
                 training_config=TRAINING_CONFIG,
             )
 
+            score_value = float(score)
+
+            eval_scalars = {
+                "nav_final": eval_stats["nav_final"],
+                "max_drawdown": eval_stats["max_drawdown"],
+                "total_trades": eval_stats["total_trades"],
+                "annual_sharpe": eval_stats["annual_sharpe"],
+                "calmar_ratio": eval_stats["calmar_ratio"],
+                "cagr": eval_stats["cagr"],
+                "score": score_value,
+            }
+            for key, value in eval_scalars.items():
+                if np.isfinite(value):
+                    try:
+                        writer.add_scalar(f"Eval/{key}", float(value), hpo_train_steps)
+                    except Exception:
+                        pass
+
             top_n_trials = study.user_attrs.get('top_n_trials', {})
             worst_score = min(top_n_trials.values()) if len(top_n_trials) == top_n else -float("inf")
 
-            if score > worst_score or len(top_n_trials) < top_n:
-                print(f"\n🔥 Trial {trial.number} is in top {top_n}! Score: {float(score):.6f}. Saving params...\n")
+            if score_value > worst_score or len(top_n_trials) < top_n:
+                print(f"\n🔥 Trial {trial.number} is in top {top_n}! Score: {score_value:.6f}. Saving params...\n")
+                print(
+                    "   ↳ NAV={nav:.4f} (peak {peak:.4f}, min {nav_min:.4f}) | MaxDD={mdd:.2%} | "
+                    "Trades={trades} | Sharpe={sharpe:.3f} | Calmar={calmar:.3f}".format(
+                        nav=eval_stats["nav_final"],
+                        peak=eval_stats["nav_peak"],
+                        nav_min=eval_stats["nav_min"],
+                        mdd=eval_stats["max_drawdown"],
+                        trades=eval_stats["total_trades"],
+                        sharpe=eval_stats["annual_sharpe"],
+                        calmar=eval_stats["calmar_ratio"],
+                    )
+                )
+                print(
+                    "   ↳ CAGR={cagr:.2%} | Turnover={turnover:.2f} | Steps={steps} | "
+                    "Rewardμ={reward_mean:.6f} | Rewardσ={reward_std:.6f} | Forced={forced} | TP={tp} | SL={sl} | Flips={flips} | Flats={flats}".format(
+                        cagr=eval_stats["cagr"],
+                        turnover=eval_stats["cumulative_turnover"],
+                        steps=eval_stats["steps"],
+                        reward_mean=eval_stats["reward_mean"],
+                        reward_std=eval_stats["reward_std"],
+                        forced=eval_stats["forced_closes"],
+                        tp=eval_stats["tp_hits"],
+                        sl=eval_stats["sl_hits"],
+                        flips=eval_stats["flip_closes"],
+                        flats=eval_stats["flat_closes"],
+                    )
+                )
+                print()
                 save_path = TOP_N_PARAMS_PATH / f"trial_{trial.number}_params.json"
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(save_path, 'w') as f:
                     json.dump(trial.params, f, indent=2)
 
-                top_n_trials[str(trial.number)] = score
+                top_n_trials[str(trial.number)] = score_value
                 if len(top_n_trials) > top_n:
                     worst_trial_key = min(top_n_trials, key=top_n_trials.get)
                     del top_n_trials[worst_trial_key]
                     (TOP_N_PARAMS_PATH / f"trial_{worst_trial_key}_params.json").unlink(missing_ok=True)
                 study.set_user_attr('top_n_trials', top_n_trials)
 
-            return score
+            return score_value
         finally:
             writer.flush()
             writer.close()

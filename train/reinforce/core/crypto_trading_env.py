@@ -182,6 +182,15 @@ class CryptoTradingEnv:
             self._roll_dpos,
         )
 
+        # Aggregated counters for evaluation summaries
+        self.total_trades = 0
+        self.total_tp_hits = 0
+        self.total_sl_hits = 0
+        self.total_forced_closes = 0
+        self.total_flip_closes = 0
+        self.total_flat_closes = 0
+        self.cumulative_turnover = 0.0
+
         self.reset()
 
     # ------------- helpers -------------
@@ -235,6 +244,14 @@ class CryptoTradingEnv:
 
         self._reset_rollings()
 
+        self.total_trades = 0
+        self.total_tp_hits = 0
+        self.total_sl_hits = 0
+        self.total_forced_closes = 0
+        self.total_flip_closes = 0
+        self.total_flat_closes = 0
+        self.cumulative_turnover = 0.0
+
         return self._get_obs()
 
     def _get_obs(self):
@@ -281,6 +298,18 @@ class CryptoTradingEnv:
             flat=reason == "flat",
             flip=reason == "flip",
         )
+
+        self.total_trades += 1
+        if tp_hit:
+            self.total_tp_hits += 1
+        if sl_hit:
+            self.total_sl_hits += 1
+        if forced:
+            self.total_forced_closes += 1
+        if reason == "flip":
+            self.total_flip_closes += 1
+        if reason == "flat":
+            self.total_flat_closes += 1
 
         # 상태 리셋
         self.position = 0
@@ -393,6 +422,7 @@ class CryptoTradingEnv:
         self._roll_turnover.add(turn_units)
         self._roll_dpos.add(float(turn_units))
         self._roll_abs_pos.add(abs(pos_now))
+        self.cumulative_turnover += float(turn_units)
 
         # --- 보상 계산: step 순수익률 (PV 일치) ---
         reward = np.log(self.portfolio_value / nav_before)
