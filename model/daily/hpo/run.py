@@ -8,32 +8,20 @@ from typing import List, Optional
 import pandas as pd
 
 # ----------------------------------------------------
-# 1) 프로젝트 경로 설정 (실행 버튼으로 직접 실행하기 위한 수정)
+# 1) 프로젝트 루트 경로 설정 & PYTHONPATH 추가
+#    현재 파일: model/daily/hpo/run.py 기준으로 계산
 # ----------------------------------------------------
-# 이 스크립트를 직접 실행할 때 'model'과 같은 모듈을 찾을 수 있도록,
-# 필요한 상위 디렉토리들을 sys.path에 직접 추가합니다.
-# __init__.py 파일을 사용하지 않기 위한 해결 방법입니다.
-# ----------------------------------------------------
-file_path = Path(__file__).resolve()
-project_root = file_path.parents[3]  # .../Quant
-model_root = file_path.parents[2]    # .../Quant/model
+CURRENT_DIR = Path(__file__).resolve().parent        # .../model/daily/hpo
+PROJECT_ROOT = CURRENT_DIR.parents[3]                # .../ (프로젝트 루트)
 
-# sys.path에 프로젝트 루트와 model 루트를 추가
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-if str(model_root) not in sys.path:
-    sys.path.insert(0, str(model_root))
-
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # ----------------------------------------------------
-# 2) 내부 모듈 임포트 (수정됨)
+# 2) 내부 모듈 임포트
 # ----------------------------------------------------
-# 'model'이 패키지로 인식되지 않으므로, 'model' 루트부터 시작하는 대신
-# 'daily'부터 시작하도록 임포트 구문을 수정합니다.
-# 이를 위해 위에서 '.../Quant/model' 디렉토리를 sys.path에 추가했습니다.
-# ----------------------------------------------------
-from daily.config import DailyConfig
-from daily.hpo.core.engine import run_hpo_for_all_horizons
+from model.daily.config import DailyConfig
+from model.daily.hpo.core.engine import run_hpo_for_all_horizons
 
 
 # ----------------------------------------------------

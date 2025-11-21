@@ -5,7 +5,7 @@ from typing import Iterable, List, Dict
 
 import pandas as pd
 
-from daily.config import DailyConfig
+from ...config import DailyConfig
 from .search_space import HpoTrialConfig, make_default_trials_for_horizon
 from .objective import evaluate_trial
 from .analyzer import select_best_config_from_trials, save_best_configs
