@@ -105,7 +105,13 @@ def run_hpo_for_all_horizons(
             trials=None,
             as_of_ts=as_of_ts,
         )
-        best_cfg = select_best_config_from_trials(df_trials, horizon_days=d)
+        # val_score를 기준으로 best config 선택 (objective.py에서 val_score = directional_accuracy로 설정됨)
+        best_cfg = select_best_config_from_trials(
+            df_trials,
+            horizon_days=d,
+            metric_col="val_score",  # directional_accuracy 우선, 없으면 accuracy
+            mode="max"
+        )
         if best_cfg is not None:
             best_map[d] = best_cfg
             # horizon별 개별 json도 같이 저장

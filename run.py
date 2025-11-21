@@ -127,7 +127,23 @@ def _print_today_predictions(daily_pred: pd.DataFrame) -> None:
 
 def main():
     """자동 실행"""
-    
+    import argparse
+
+    parser = argparse.ArgumentParser(description="BTC Jarvis Manager - Automated Pipeline")
+    parser.add_argument(
+        "--run-hpo",
+        action="store_true",
+        help="데이터 수집/처리 후 HPO (Hyperparameter Optimization) 실행"
+    )
+    parser.add_argument(
+        "--hpo-horizons",
+        nargs="+",
+        type=int,
+        default=None,
+        help="HPO를 실행할 horizons (예: --hpo-horizons 3 7 30 90)"
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("🚀 BTC Jarvis Manager - 데이터 수집 & 피처 빌드 & 데일리 학습")
     print("=" * 60)
@@ -160,7 +176,31 @@ def main():
             print(f"\n❌ 피처 빌드 중 오류 발생: {e}")
             success = False
 
-    # 3) 피처 빌드까지 성공했다면, 데일리 롤링 학습 + 예측 + 실적 업데이트
+    # 3) HPO 실행 (선택적)
+    if success and args.run_hpo:
+        print("\n" + "=" * 60)
+        print("🔧 HPO (Hyperparameter Optimization) 시작...")
+        print("=" * 60)
+        try:
+            from model.daily.hpo.run import run_hpo
+
+            master_path = Path("data/processed/master_features_1h.parquet")
+            if not master_path.exists():
+                raise FileNotFoundError(f"마스터 피처 파일이 없습니다: {master_path}")
+
+            df_master_hpo = pd.read_parquet(master_path)
+
+            # HPO 실행
+            run_hpo(
+                as_of_ts=None,  # 최신 시점 사용
+                horizons=args.hpo_horizons  # None이면 [3, 7, 30, 90] 사용
+            )
+            print("✅ HPO 완료! 최적 파라미터가 data/hpo/daily/best/ 에 저장되었습니다.")
+        except Exception as e:
+            print(f"\n⚠️ HPO 실행 중 오류 발생: {e}")
+            print("HPO를 건너뛰고 일반 학습을 진행합니다.")
+
+    # 4) 피처 빌드까지 성공했다면, 데일리 롤링 학습 + 예측 + 실적 업데이트
     daily_pred = None
     if success:
         print("\n" + "=" * 60)

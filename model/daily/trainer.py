@@ -98,8 +98,17 @@ def train_horizon_model(
     sw_train = sample_weight_all[:split_idx]
     sw_val = sample_weight_all[split_idx:]
 
-    # ---- 모델 생성 ----
-    model = create_lgbm_classifier(num_classes=3)
+    # ---- 모델 생성 (HPO 파라미터 사용) ----
+    lgbm_params = cfg.get_lgbm_params_for(horizon_days)
+    model = create_lgbm_classifier(
+        num_classes=3,
+        n_estimators=lgbm_params.get("n_estimators", 300),
+        learning_rate=lgbm_params.get("learning_rate", 0.05),
+        num_leaves=int(lgbm_params.get("num_leaves", 31)),
+        max_depth=int(lgbm_params.get("max_depth", -1)),
+        subsample=lgbm_params.get("subsample", 0.8),
+        colsample_bytree=lgbm_params.get("colsample_bytree", 0.8),
+    )
 
     # ---- 성능 안 좋아지면 자동 멈춤 설정 ----
     callbacks = []

@@ -27,7 +27,8 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # Import collection functions
-from ingest.sources import binance, macro, sentiment, news, onchain, derivatives
+from ingest.sources import binance, macro, news, onchain, derivatives
+# Note: sentiment module exists but is not currently used in the pipeline
 
 
 class DataOrchestrator:

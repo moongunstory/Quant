@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Tuple, Dict, Optional
 
 
@@ -17,6 +19,43 @@ window_days_map = {
     30: 540,
     90: 720,
 }
+
+
+@dataclass
+class FeatureConfig:
+    """Technical indicator parameters - centralized configuration"""
+    # RSI
+    rsi_period: int = 14
+
+    # Moving averages (in hours for 1h data)
+    ma_short: int = 24      # 24 hours (1 day)
+    ma_long: int = 168      # 168 hours (7 days)
+
+    # Bollinger Bands
+    bb_period: int = 20
+    bb_std: float = 2.0
+
+    # Volatility windows (in hours)
+    vol_24h: int = 24
+    vol_7d: int = 168
+
+    # OI and LS Ratio z-score windows (in hours)
+    oi_zscore_window: int = 720    # 30 days
+    ls_zscore_window: int = 720    # 30 days
+
+    # Funding rate windows
+    fr_ma_window: int = 24         # 24 hours
+    fr_cumsum_window: int = 8      # 8 hours
+
+    # On-chain z-score windows (in days)
+    onchain_zscore_window: int = 365
+
+    # Macro z-score windows (in days)
+    macro_zscore_window: int = 252  # 1 trading year
+
+    # DVOL z-score windows (in days)
+    dvol_zscore_window: int = 180
+
 
 @dataclass
 class DailyConfig:
@@ -60,6 +99,49 @@ class DailyConfig:
     # 리포트 파일 저장 여부
     save_report: bool = True
 
+    # HPO integration
+    hpo_best_config_path: str = "data/hpo/daily/best/best_config_daily.json"
+    use_hpo_params: bool = True  # True이면 HPO 결과를 자동으로 로딩하여 적용
+    lgbm_params_map: Optional[Dict[int, Dict]] = None  # Horizon별 LGBM 파라미터
+
+    # Feature engineering configuration
+    feature_config: FeatureConfig = field(default_factory=FeatureConfig)
+
+    def __post_init__(self):
+        """HPO 결과가 있으면 자동으로 로딩하여 파라미터 덮어쓰기"""
+        if not self.use_hpo_params:
+            return
+
+        best_config_path = Path(self.hpo_best_config_path)
+        if not best_config_path.exists():
+            print(f"[INFO] HPO 결과 파일 없음: {best_config_path}")
+            print(f"[INFO] 기본 파라미터 사용: threshold_map={self.threshold_map}, window_days_map={self.window_days_map}")
+            return
+
+        try:
+            with open(best_config_path, 'r', encoding='utf-8') as f:
+                hpo_configs = json.load(f)
+
+            # Horizon별 threshold/window_days/lgbm_params 맵 업데이트
+            self.threshold_map = {}
+            self.window_days_map = {}
+            self.lgbm_params_map = {}
+
+            for horizon_str, cfg in hpo_configs.items():
+                horizon = int(horizon_str)
+                self.threshold_map[horizon] = cfg["threshold"]
+                self.window_days_map[horizon] = cfg["window_days"]
+                self.lgbm_params_map[horizon] = cfg.get("lgbm_params", {})
+
+            print(f"✅ HPO 최적 파라미터 로딩 완료: {best_config_path}")
+            print(f"   - Thresholds: {self.threshold_map}")
+            print(f"   - Window days: {self.window_days_map}")
+            print(f"   - LGBM params loaded for horizons: {list(self.lgbm_params_map.keys())}")
+
+        except Exception as e:
+            print(f"⚠️ HPO 결과 로딩 실패: {e}")
+            print(f"[INFO] 기본 파라미터 사용")
+
     # ---- 편의 메서드 ----
     def get_window_days_for(self, horizon_days: int) -> int:
         """해당 horizon(일 기준)에 사용할 window_days 리턴."""
@@ -72,3 +154,17 @@ class DailyConfig:
         if self.threshold_map and horizon_days in self.threshold_map:
             return float(self.threshold_map[horizon_days])
         return self.threshold
+
+    def get_lgbm_params_for(self, horizon_days: int) -> Dict:
+        """해당 horizon(일 기준)에 사용할 LGBM 파라미터 리턴."""
+        if self.lgbm_params_map and horizon_days in self.lgbm_params_map:
+            return self.lgbm_params_map[horizon_days]
+        # 기본 파라미터
+        return {
+            "n_estimators": 300,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": -1,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+        }

@@ -52,3 +52,20 @@ def add_rolling_zscore(
     out = pd.DataFrame({f"{prefix}_val": s})
     out[f"{prefix}_z_{window}"] = (s - mean) / std
     return out
+
+
+def compute_z_score(series: pd.Series, window: int, min_periods: int = 30) -> pd.Series:
+    """
+    Rolling Z-score 계산 (중복 코드 제거용 공통 함수).
+
+    Args:
+        series: 입력 시리즈
+        window: Rolling window 크기
+        min_periods: 최소 필요 데이터 수
+
+    Returns:
+        Z-score 시리즈
+    """
+    series = series.astype(float)
+    roll = series.rolling(window, min_periods=min_periods)
+    return (series - roll.mean()) / roll.std()
