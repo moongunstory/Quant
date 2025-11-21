@@ -14,64 +14,79 @@ from .log import append_predictions_log, update_realized_outcomes
 from .report import print_and_save_report
 from .policy import attach_expected_return
 
+
 def run_daily_cycle(
     cfg: DailyConfig,
     df_master: pd.DataFrame,
     as_of_ts: datetime | None = None,
 ) -> pd.DataFrame:
     """
-    1) window_days 윈도우로 horizon별 LGBM 학습
-    2) as_of_ts 시점에서 horizon별 예측 1건씩
-    3) daily_predictions.parquet에 append
-    4) 과거 예측들 중 실적 채울 수 있는 것들 업데이트
-    5) 한국어 텍스트 리포트 출력 + (선택) 저장
+    전체 일일 사이클:
+    1) horizon별 학습
+    2) as_of_ts 시점에서 horizon별 예측 1건 생성
+    3) pred_log_path에 append
+    4) 실현 수익률(realized_return, realized_label) 업데이트
+    5) 전체 로그 기준 리포트 출력 + 오늘 예측에 예상 수익률 붙여서 리턴
     """
+    # 인덱스 정리
     df_master = ensure_datetime_index(df_master, cfg)
 
+    # 기준 시점 결정
     if as_of_ts is None:
         as_of_ts = df_master.index.max()
 
     as_of_ts = pd.to_datetime(as_of_ts, utc=True)
     as_of_date = as_of_ts.normalize()
 
-    # 오늘 이미 실행된 적 있으면 학습 스킵하고 실적만 업데이트
-    existing_log = None
+    # 이미 오늘 기록이 있으면 학습 스킵 + 실적만 업데이트
+    existing_log: pd.DataFrame | None = None
     if os.path.exists(cfg.pred_log_path):
         existing_log = pd.read_parquet(cfg.pred_log_path)
-        if cfg.skip_if_exists and (existing_log["as_of_date"] == as_of_date).any():
-            print(
-                f"오늘({as_of_date.date()}) 데일리 사이클은 이미 실행됨. "
-                "학습은 스킵하고, 실적(realized)만 업데이트합니다."
-            )
-            updated_log = update_realized_outcomes(existing_log, df_master, cfg)
-            updated_log.to_parquet(cfg.pred_log_path)
-            print_and_save_report(updated_log, cfg, as_of_date)
 
-            # ✅ 오늘(as_of_date) 예측만 잘라서
-            today_mask = updated_log["as_of_date"] == as_of_date
-            today_pred = updated_log.loc[today_mask].copy()
+        if cfg.skip_if_exists and "as_of_date" in existing_log.columns:
+            if (existing_log["as_of_date"] == as_of_date).any():
+                print(
+                    f"[INFO] {as_of_date.date()} 데일리 사이클 이미 실행됨 → "
+                    "학습 스킵, 실현 수익률만 업데이트"
+                )
+                updated_log = update_realized_outcomes(existing_log, df_master, cfg)
+                updated_log.to_parquet(cfg.pred_log_path)
 
-            # ✅ 여기서 예상 수익률 붙여서 리턴
-            today_pred = attach_expected_return(
-                today_pred=today_pred,
-                df_log_full=updated_log,   # 전체 로그로 성적표 만듦
-                cfg=cfg,
-                bin_width=0.1,
-                min_samples=20,
-            )
+                # 전체 로그 기준 리포트
+                print_and_save_report(updated_log, cfg, as_of_date)
 
-            return today_pred
+                # 오늘 예측만 분리
+                today = updated_log.loc[updated_log["as_of_date"] == as_of_date].copy()
+                if today.empty:
+                    return today
 
+                # 오늘 예측에 예상 수익률 붙여서 리턴
+                today = attach_expected_return(
+                    today_pred=today,
+                    df_log_full=updated_log,
+                    cfg=cfg,
+                    bin_width=0.1,
+                    min_samples=20,
+                )
+                return today
+
+    # ─────────────────────────────────────────
+    # horizon별 학습 + 예측
+    # ─────────────────────────────────────────
     all_rows: List[dict] = []
 
     for d in cfg.horizons_days:
-        H = d * 24
+        H = d * 24  # 일 → 시간
+
         try:
             X, y, feature_names = build_supervised_for_horizon(
-                df_master, as_of_ts, H, cfg
+                df=df_master,
+                as_of_ts=as_of_ts,
+                horizon_hours=H,
+                cfg=cfg,
             )
         except ValueError as e:
-            print(f"[{as_of_date.date()}] horizon {d}일({H}h) 스킵:", e)
+            print(f"[WARN] {as_of_date.date()} horizon {d}d({H}h) 스킵: {e}")
             continue
 
         # 학습 + 저장
@@ -93,53 +108,53 @@ def run_daily_cycle(
             feature_names=feature_names,
         )
 
-        new_row = {
-            "as_of_ts": as_of_ts,
-            "as_of_date": as_of_date,
-            "model_id": model_id,
-            "horizon_days": d,
-            "horizon_hours": H,
-            "pred_label": pred_label,
-            "proba_down": float(proba[0]),
-            "proba_flat": float(proba[1]),
-            "proba_up": float(proba[2]),
-            "created_at": pd.Timestamp.utcnow(),
-        }
-        all_rows.append(new_row)
+        all_rows.append(
+            {
+                "as_of_ts": as_of_ts,
+                "as_of_date": as_of_date,
+                "model_id": model_id,
+                "horizon_days": d,
+                "horizon_hours": H,
+                "pred_label": pred_label,
+                "proba_down": float(proba[0]),
+                "proba_flat": float(proba[1]),
+                "proba_up": float(proba[2]),
+                "created_at": pd.Timestamp.utcnow(),
+            }
+        )
 
+    # 학습된 horizon이 하나도 없으면
     if not all_rows:
-        print(f"[{as_of_date.date()}] 학습된 horizon이 없습니다.")
+        print(f"[WARN] {as_of_date.date()} 학습된 horizon 없음.")
         if existing_log is not None:
             updated_log = update_realized_outcomes(existing_log, df_master, cfg)
             updated_log.to_parquet(cfg.pred_log_path)
             print_and_save_report(updated_log, cfg, as_of_date)
         return pd.DataFrame()
 
+    # 오늘 새 예측들
     pred_df = pd.DataFrame(all_rows)
 
-    # 오늘 예측 append
+    # 로그에 append → 전체 로그
     combined = append_predictions_log(pred_df, cfg)
-    # 과거 예측들 중 실적 채울 수 있는 것들 업데이트
     combined = update_realized_outcomes(combined, df_master, cfg)
     combined.to_parquet(cfg.pred_log_path)
 
-    # ---- 여기서 오늘 예측에 예상 수익률 붙이기 ----
-    # as_of_date 기준 오늘 레코드만 따로 뽑고
+    # 오늘 예측만 분리
     today_mask = combined["as_of_date"] == as_of_date
     today_pred = combined.loc[today_mask].copy()
 
-    # 성적표 기반 예상 수익률 컬럼(exp_return) 붙이기
+    # 예상 수익률(exp_return 등) 붙이기
     today_pred = attach_expected_return(
         today_pred=today_pred,
         df_log_full=combined,
         cfg=cfg,
-        bin_width=0.1,      # 0.1 (=10%) 확률 구간
-        min_samples=20,     # 성적표 최소 샘플 수
+        bin_width=0.1,
+        min_samples=20,
     )
 
-    # 한국어 리포트 출력 + 저장 (이건 전체 로그 기준)
+    # 전체 로그 기준 리포트 출력 + 저장
     print_and_save_report(combined, cfg, as_of_date)
 
-    # run.py에서 오늘 예측만 요약할 때 쓰라고 오늘 것만 리턴
+    # run.py 쪽에서 오늘 예측만 쓰기 좋게, 오늘 것만 리턴
     return today_pred
-

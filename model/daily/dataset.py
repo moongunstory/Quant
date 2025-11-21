@@ -67,7 +67,14 @@ def build_supervised_for_horizon(
     - 미래 horizon만큼의 수익률로 라벨 만들고
     - X, y, feature_names 리턴
     """
-    window_start_ts = as_of_ts - timedelta(days=cfg.window_days)
+    # 예: 72h → 3일
+    horizon_days = max(int(horizon_hours // 24), 1)
+
+    # horizon별 window_days / threshold 가져오기
+    window_days = cfg.get_window_days_for(horizon_days)
+    threshold = cfg.get_threshold_for(horizon_days)
+
+    window_start_ts = as_of_ts - timedelta(days=window_days)
     last_label_ts = as_of_ts - timedelta(hours=horizon_hours)
 
     df_win = df.loc[window_start_ts:last_label_ts].copy()
@@ -86,8 +93,8 @@ def build_supervised_for_horizon(
 
     df_win[ret_col] = ret
     df_win[label_col] = 0
-    df_win.loc[ret >= cfg.threshold, label_col] = 1
-    df_win.loc[ret <= -cfg.threshold, label_col] = -1
+    df_win.loc[ret >= threshold, label_col] = 1
+    df_win.loc[ret <= -threshold, label_col] = -1
 
     # 미래 수익률 없는 구간 제거
     df_train = df_win.dropna(subset=[ret_col])
