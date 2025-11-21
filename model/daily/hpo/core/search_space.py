@@ -50,26 +50,31 @@ def _default_window_days_candidates(cfg: DailyConfig, horizon_days: int) -> List
 
 def _default_lgbm_param_grid() -> List[Dict[str, float]]:
     """
-    간단한 그리드만 제공. 필요하면 여기 숫자만 조금씩 바꾸면 됨.
+    최적화된 그리드: Early stopping이 있으므로 n_estimators는 큰 값 하나로 고정.
+    대신 num_leaves를 더 다양하게 탐색하여 더 효율적인 탐색 공간 구성.
+
+    이전: 3 × 2 × 3 × 4 = 72개 조합
+    현재: 3 × 4 × 2 = 24개 조합 (67% 감소)
     """
-    learning_rates = [0.03, 0.05, 0.1]
-    num_leaves_list = [31, 63]
-    max_depth_list = [-1, 6, 10]
-    n_estimators_list = [200, 400, 800]
+    learning_rates = [0.01, 0.05, 0.1]        # 더 넓은 범위 (0.01 추가)
+    num_leaves_list = [15, 31, 63, 127]       # 더 다양한 후보 (15, 127 추가)
+    max_depth_list = [-1, 10]                 # 무제한 vs 제한 (6 제거)
+    n_estimators = 1000                       # Early stopping이 알아서 조절
 
     grid: List[Dict[str, float]] = []
     for lr in learning_rates:
         for nl in num_leaves_list:
             for md in max_depth_list:
-                for ne in n_estimators_list:
-                    grid.append(
-                        {
-                            "learning_rate": lr,
-                            "num_leaves": nl,
-                            "max_depth": md,
-                            "n_estimators": ne,
-                        }
-                    )
+                grid.append(
+                    {
+                        "learning_rate": lr,
+                        "num_leaves": nl,
+                        "max_depth": md,
+                        "n_estimators": n_estimators,
+                        "subsample": 0.8,
+                        "colsample_bytree": 0.8,
+                    }
+                )
     return grid
 
 

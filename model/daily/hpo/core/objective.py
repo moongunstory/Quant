@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier, early_stopping
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 from ...config import DailyConfig
 from ...dataset import ensure_datetime_index, build_supervised_for_horizon
@@ -157,9 +157,27 @@ def evaluate_trial(
 
     # ---- 검증 점수 계산 ----
     y_pred = model.predict(X_val)
+
+    # 1. Overall Accuracy
     acc = float(accuracy_score(y_val, y_pred))
 
-    record["val_score"] = acc
+    # 2. Directional Accuracy (중립 제외, 상승/하락만 평가)
+    mask = (y_val != 0) & (y_pred != 0)
+    if mask.sum() >= 10:  # 최소 10개 샘플 필요
+        y_val_binary = (y_val[mask] > 0).astype(int)
+        y_pred_binary = (y_pred[mask] > 0).astype(int)
+        dir_acc = float(accuracy_score(y_val_binary, y_pred_binary))
+    else:
+        dir_acc = np.nan
+
+    # 3. Macro F1-Score (Class imbalance 보정)
+    f1 = float(f1_score(y_val, y_pred, average="macro", zero_division=0))
+
+    record["val_accuracy"] = acc
+    record["val_directional_accuracy"] = dir_acc
+    record["val_f1_macro"] = f1
+    record["val_score"] = dir_acc if not np.isnan(dir_acc) else acc  # 최적화 목표: Directional Accuracy
+    record["metric"] = "directional_accuracy"
     record["n_train"] = int(train_size)
     record["n_val"] = int(val_size)
 

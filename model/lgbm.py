@@ -28,18 +28,31 @@ class ModelMetadata:
     horizon_days: int           # 3 / 7 / 30 / 90
 
 
-def create_lgbm_classifier(num_classes: int) -> lgb.LGBMClassifier:
-    """탭ular 데이터용 기본 LightGBM 분류기."""
+def create_lgbm_classifier(
+    num_classes: int,
+    n_estimators: int = 300,
+    learning_rate: float = 0.05,
+    num_leaves: int = 31,
+    max_depth: int = -1,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8,
+    min_data_in_leaf: int = 50,
+) -> lgb.LGBMClassifier:
+    """
+    Tabular 데이터용 LightGBM 분류기.
+    HPO 결과를 파라미터로 받을 수 있도록 개선됨.
+    """
     return lgb.LGBMClassifier(
-        n_estimators=300,          # 500 → 300 정도로 줄여도 충분
-        learning_rate=0.05,
-        max_depth=-1,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        num_leaves=num_leaves,
+        max_depth=max_depth,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
         objective="multiclass" if num_classes > 2 else "binary",
         num_class=num_classes if num_classes > 2 else None,
-        min_data_in_leaf=50,      # 너무 작은 리프 방지 → 쓸데없는 분기 감소
-        verbose=-1,               # LightGBM 내부 로그 깔끔하게
+        min_data_in_leaf=min_data_in_leaf,
+        verbose=-1,
         n_jobs=-1,
         random_state=42,
     )
