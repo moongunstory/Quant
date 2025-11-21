@@ -6,21 +6,6 @@ from dataclasses import dataclass, field
 from typing import Tuple, Dict, Optional
 
 
-threshold_map = {
-    3: 0.004,
-    7: 0.006,
-    30: 0.015,
-    90: 0.03,
-}
-
-window_days_map = {
-    3: 180,
-    7: 360,
-    30: 540,
-    90: 720,
-}
-
-
 @dataclass
 class FeatureConfig:
     """Technical indicator parameters - centralized configuration"""
@@ -72,9 +57,13 @@ class DailyConfig:
     window_days: int = 540
     horizons_days: Tuple[int, ...] = (3, 7, 30, 90)
 
-    # horizon별 개별 윈도우 설정 (없으면 window_days 사용)
-    # 예: window_days_map = {3: 360, 7: 360, 30: 540, 90: 720}
-    window_days_map: Optional[Dict[int, int]] = None
+    # horizon별 개별 윈도우 설정 (기본값: HPO 탐색의 시작점)
+    window_days_map: Dict[int, int] = field(default_factory=lambda: {
+        3: 180,    # 3일 예측: 180일 학습 윈도우
+        7: 360,    # 7일 예측: 360일 학습 윈도우
+        30: 540,   # 30일 예측: 540일 학습 윈도우
+        90: 720,   # 90일 예측: 720일 학습 윈도우
+    })
 
     # 기본 컬럼 설정
     timestamp_col: str = "timestamp"
@@ -83,9 +72,13 @@ class DailyConfig:
     # 라벨 기준: 수익률이 threshold 이상/이하이면 방향 인정 (기본값)
     threshold: float = 0.005       # 0.5%
 
-    # horizon별 개별 threshold 설정 (없으면 threshold 사용)
-    # 예: threshold_map = {3: 0.004, 7: 0.006, 30: 0.015, 90: 0.03}
-    threshold_map: Optional[Dict[int, float]] = None
+    # horizon별 개별 threshold 설정 (기본값: HPO 탐색의 시작점)
+    threshold_map: Dict[int, float] = field(default_factory=lambda: {
+        3: 0.004,   # 0.4%
+        7: 0.006,   # 0.6%
+        30: 0.015,  # 1.5%
+        90: 0.03,   # 3.0%
+    })
 
     min_samples: int = 500         # horizon별 최소 학습 샘플 수
     skip_if_exists: bool = True    # 같은 날짜에 이미 학습했으면 스킵
@@ -102,13 +95,13 @@ class DailyConfig:
     # HPO integration
     hpo_best_config_path: str = "data/hpo/daily/best/best_config_daily.json"
     use_hpo_params: bool = True  # True이면 HPO 결과를 자동으로 로딩하여 적용
-    lgbm_params_map: Optional[Dict[int, Dict]] = None  # Horizon별 LGBM 파라미터
+    lgbm_params_map: Dict[int, Dict] = field(default_factory=dict)  # Horizon별 LGBM 파라미터
 
     # Feature engineering configuration
     feature_config: FeatureConfig = field(default_factory=FeatureConfig)
 
     def __post_init__(self):
-        """HPO 결과가 있으면 자동으로 로딩하여 파라미터 덮어쓰기"""
+        """HPO 결과가 있으면 자동으로 로딩하여 기본값 위에 덮어쓰기"""
         if not self.use_hpo_params:
             return
 
@@ -122,11 +115,7 @@ class DailyConfig:
             with open(best_config_path, 'r', encoding='utf-8') as f:
                 hpo_configs = json.load(f)
 
-            # Horizon별 threshold/window_days/lgbm_params 맵 업데이트
-            self.threshold_map = {}
-            self.window_days_map = {}
-            self.lgbm_params_map = {}
-
+            # Horizon별 threshold/window_days/lgbm_params 맵 업데이트 (기본값 유지하면서 덮어쓰기)
             for horizon_str, cfg in hpo_configs.items():
                 horizon = int(horizon_str)
                 self.threshold_map[horizon] = cfg["threshold"]
