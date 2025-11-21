@@ -1,33 +1,55 @@
-# Python
+# =========================================
+# Python cache & binaries
+# =========================================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.pdb
 
-# Environments
+# =========================================
+# Virtual Environments
+# =========================================
 .env
 *.env
 .venv/
 venv/
 
-# IDE/Editor
+# =========================================
+# IDE / Editor Settings
+# =========================================
 .vscode/
 .idea/
 
+# =========================================
 # OS files
+# =========================================
 .DS_Store
 
-# Logs / temp
+# =========================================
+# Logs / Temp
+# =========================================
 logs/
 *.log
 tmp/
 temp/
 
-# Data
+# =========================================
+# Data files (large, generated)
+# =========================================
 *.parquet
 *.csv
 *.db
+
+# Entire data folders
 data/
 output/
 reports/
+
+# =========================================
+# ML Model Artifacts
+# =========================================
+*.pkl        # LightGBM / ML models
+*.h5         # (예비) Keras/TensorFlow
+*.pt         # (예비) PyTorch
+*.onnx       # (예비) ONNX models
