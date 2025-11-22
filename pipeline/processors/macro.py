@@ -1,4 +1,4 @@
-# process/modules/macro.py
+# pipeline/processors/macro.py
 
 from __future__ import annotations
 from typing import Dict

@@ -1,4 +1,4 @@
-# process/modules/binance.py
+# pipeline/processors/binance.py
 
 from __future__ import annotations
 from typing import Optional
