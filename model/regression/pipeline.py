@@ -94,43 +94,63 @@ def train_horizon_ensemble(
 
     print(f"      LGBM RMSE: {lgbm_rmse:.6f}, Dir Acc: {lgbm_dir_acc:.3f}")
 
-    # Train XGBoost
-    print("    Training XGBoost...")
-    xgb_params = cfg.get_xgboost_params_for(horizon_hours)
-    xgb_model = create_xgboost_regressor(xgb_params)
-    xgb_model = train_xgboost_regressor(
-        model=xgb_model,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        sample_weight_train=sw_train,
-        sample_weight_val=sw_val,
-        early_stopping_rounds=cfg.early_stopping_rounds,
-    )
+    # Train XGBoost (if available)
+    xgb_model = None
+    xgb_rmse = None
+    xgb_dir_acc = None
 
-    # Validation metrics for XGBoost
-    xgb_pred_val = xgb_model.predict(X_val)
-    xgb_rmse = np.sqrt(np.mean((y_val - xgb_pred_val) ** 2))
-    xgb_dir_acc = np.mean(np.sign(y_val) == np.sign(xgb_pred_val))
+    try:
+        print("    Training XGBoost...")
+        xgb_params = cfg.get_xgboost_params_for(horizon_hours)
+        xgb_model = create_xgboost_regressor(xgb_params)
+        xgb_model = train_xgboost_regressor(
+            model=xgb_model,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            sample_weight_train=sw_train,
+            sample_weight_val=sw_val,
+            early_stopping_rounds=cfg.early_stopping_rounds,
+        )
 
-    print(f"      XGB RMSE: {xgb_rmse:.6f}, Dir Acc: {xgb_dir_acc:.3f}")
+        # Validation metrics for XGBoost
+        xgb_pred_val = xgb_model.predict(X_val)
+        xgb_rmse = np.sqrt(np.mean((y_val - xgb_pred_val) ** 2))
+        xgb_dir_acc = np.mean(np.sign(y_val) == np.sign(xgb_pred_val))
 
-    # Create ensemble (weighted by inverse RMSE)
-    # Better models (lower RMSE) get higher weight
-    lgbm_inv_rmse = 1.0 / lgbm_rmse if lgbm_rmse > 0 else 1.0
-    xgb_inv_rmse = 1.0 / xgb_rmse if xgb_rmse > 0 else 1.0
-    total = lgbm_inv_rmse + xgb_inv_rmse
+        print(f"      XGB RMSE: {xgb_rmse:.6f}, Dir Acc: {xgb_dir_acc:.3f}")
+    except Exception as e:
+        print(f"      XGBoost training failed (skipping): {e}")
+        xgb_model = None
 
-    weights = {
-        'lgbm': lgbm_inv_rmse / total,
-        'xgb': xgb_inv_rmse / total,
-    }
+    # Create ensemble (use only available models)
+    if xgb_model is not None:
+        # Use both models
+        lgbm_inv_rmse = 1.0 / lgbm_rmse if lgbm_rmse > 0 else 1.0
+        xgb_inv_rmse = 1.0 / xgb_rmse if xgb_rmse > 0 else 1.0
+        total = lgbm_inv_rmse + xgb_inv_rmse
 
-    ensemble = SimpleEnsemble(
-        models={'lgbm': lgbm_model, 'xgb': xgb_model},
-        weights=weights
-    )
+        weights = {
+            'lgbm': lgbm_inv_rmse / total,
+            'xgb': xgb_inv_rmse / total,
+        }
+
+        ensemble = SimpleEnsemble(
+            models={'lgbm': lgbm_model, 'xgb': xgb_model},
+            weights=weights
+        )
+
+        print(f"      Weights: LGBM={weights['lgbm']:.3f}, XGB={weights['xgb']:.3f}")
+    else:
+        # Use only LGBM
+        weights = {'lgbm': 1.0}
+        ensemble = SimpleEnsemble(
+            models={'lgbm': lgbm_model},
+            weights=weights
+        )
+
+        print(f"      Using LGBM only (XGBoost unavailable)")
 
     # Ensemble validation metrics
     ensemble_pred_val = ensemble.predict(X_val)
@@ -138,7 +158,6 @@ def train_horizon_ensemble(
     ensemble_dir_acc = np.mean(np.sign(y_val) == np.sign(ensemble_pred_val))
 
     print(f"      Ensemble RMSE: {ensemble_rmse:.6f}, Dir Acc: {ensemble_dir_acc:.3f}")
-    print(f"      Weights: LGBM={weights['lgbm']:.3f}, XGB={weights['xgb']:.3f}")
 
     metadata = {
         'horizon_hours': horizon_hours,

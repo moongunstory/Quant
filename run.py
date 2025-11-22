@@ -4,8 +4,9 @@ BTC Jarvis Manager - Main Entry Point (Daemon Mode)
 
 Modes:
 1. Paper Trading: Virtual money trading (safe)
+   - Resume: Continue from existing log
+   - Restart: Start fresh (backup old log)
 2. Live Trading: Real Binance Futures trading (REAL MONEY!)
-3. Predict Only: Just generate predictions, no trading
 
 자동 실행:
 - 필수 데이터 파일이 없으면 → 누락된 모듈만 540일치 초기 수집
@@ -146,7 +147,7 @@ def _print_today_predictions(daily_pred: pd.DataFrame) -> None:
 
         print(line)
 
-def select_mode() -> Literal["paper", "live", "predict_only"]:
+def select_mode() -> Literal["paper", "live"]:
     """
     Prompt user to select trading mode (no CLI args).
     """
@@ -156,11 +157,10 @@ def select_mode() -> Literal["paper", "live", "predict_only"]:
     print("\n모드 선택:")
     print("  1. Paper Trading (가상 자금)")
     print("  2. Live Trading (실제 자금 - 주의!)")
-    print("  3. Predict Only (예측만, 거래 없음)")
     print()
 
     while True:
-        choice = input("선택 (1/2/3): ").strip()
+        choice = input("선택 (1/2): ").strip()
         if choice == "1":
             return "paper"
         elif choice == "2":
@@ -169,13 +169,30 @@ def select_mode() -> Literal["paper", "live", "predict_only"]:
                 return "live"
             else:
                 print("Live trading 취소. 다른 모드를 선택하세요.\n")
-        elif choice == "3":
-            return "predict_only"
         else:
-            print("잘못된 입력입니다. 1, 2, 3 중 선택하세요.\n")
+            print("잘못된 입력입니다. 1 또는 2를 선택하세요.\n")
 
 
-def run_trading_daemon(mode: str):
+def select_paper_mode() -> Literal["resume", "restart"]:
+    """
+    Prompt user to select paper trading mode: resume or restart.
+    """
+    print("\n가상 거래 모드:")
+    print("  1. 이어서 하기 (기존 로그 유지)")
+    print("  2. 처음부터 시작 (새 세션, 기존 로그는 백업)")
+    print()
+
+    while True:
+        choice = input("선택 (1/2): ").strip()
+        if choice == "1":
+            return "resume"
+        elif choice == "2":
+            return "restart"
+        else:
+            print("잘못된 입력입니다. 1 또는 2를 선택하세요.\n")
+
+
+def run_trading_daemon(mode: str, paper_mode: str = "resume"):
     """
     Main trading loop - runs continuously.
 
@@ -185,6 +202,10 @@ def run_trading_daemon(mode: str):
     - Train models (once per day)
     - Generate predictions
     - Execute trades (if mode is paper or live)
+
+    Args:
+        mode: "paper" or "live"
+        paper_mode: "resume" or "restart" (only for paper trading)
     """
     print(f"\n🚀 Trading daemon 시작 ({mode.upper()} 모드)...")
     print(f"⏰ 시작 시간: {datetime.now()}")
@@ -194,6 +215,17 @@ def run_trading_daemon(mode: str):
     trading_config = TradingConfig(mode=mode)
 
     if mode == "paper":
+        # Handle restart: backup existing log and reset paper trader
+        if paper_mode == "restart":
+            log_path = Path(trading_config.paper_log_path)
+            if log_path.exists():
+                backup_path = log_path.parent / f"{log_path.stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+                import shutil
+                shutil.copy(log_path, backup_path)
+                log_path.unlink()
+                print(f"📦 기존 로그를 백업했습니다: {backup_path}")
+            print("🔄 새로운 Paper Trading 세션을 시작합니다.\n")
+
         trader = PaperTrader(initial_capital=trading_config.paper_initial_capital)
         print(f"💰 Paper trading 초기 자본: ${trading_config.paper_initial_capital:,.0f}\n")
     elif mode == "live":
@@ -214,12 +246,9 @@ def run_trading_daemon(mode: str):
             leverage=trading_config.leverage
         )
         print(f"⚠️  LIVE TRADING ({trading_config.symbol}, {trading_config.leverage}x leverage)\n")
-    else:
-        trader = None
-        print("📈 예측 전용 모드 (거래 없음)\n")
 
-    strategy = SimpleStrategy(trading_config) if trader else None
-    trade_logger = TradeLogger(trading_config.get_log_path()) if trader else None
+    strategy = SimpleStrategy(trading_config)
+    trade_logger = TradeLogger(trading_config.get_log_path())
 
     # Data orchestrator
     orchestrator = DataOrchestrator()
@@ -275,61 +304,57 @@ def run_trading_daemon(mode: str):
                 horizon_days = horizon_hours // 24
                 print(f"  {horizon_days}일: {pred_return:+.4f} ({pred_return*100:+.2f}%)")
 
-            # Step 6: Execute trades (if trading mode)
-            if trader and strategy:
-                print("\n💼 [5/5] 거래 로직 실행...")
+            # Step 6: Execute trades
+            print("\n💼 [5/5] 거래 로직 실행...")
 
-                current_price = df_master.iloc[-1][regression_config.close_col]
+            current_price = df_master.iloc[-1][regression_config.close_col]
 
-                if mode == "paper":
-                    current_position = trader.position
-                else:
-                    current_position = trader.get_position()
-
-                # Generate signal
-                action, size, stop_loss, take_profit = strategy.generate_signal(
-                    predictions=predictions,
-                    current_position=current_position
-                )
-
-                print(f"  신호: {action.upper()}")
-                if action != "hold":
-                    print(f"  크기: {size:.2%}")
-                    print(f"  Stop Loss: {stop_loss:+.2%}")
-                    print(f"  Take Profit: {take_profit:+.2%}")
-
-                # Execute
-                result = trader.execute(
-                    action=action,
-                    size=size,
-                    current_price=current_price,
-                    timestamp=pd.Timestamp.now(),
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
-                )
-
-                if result.get('status') in ['executed', 'buy', 'sell']:
-                    print(f"  ✅ 거래 실행: {result}")
-                    trade_logger.log_trade(result)
-
-                # Portfolio status
-                if mode == "paper":
-                    equity = trader.get_equity(current_price)
-                    pnl = trader.get_pnl(current_price)
-                    ret = trader.get_return(current_price)
-                    print(f"\n💰 포트폴리오 상태:")
-                    print(f"  자본: ${equity:,.2f}")
-                    print(f"  P&L: ${pnl:+,.2f} ({ret:+.2%})")
-                    print(f"  포지션: {trader.position:.6f} BTC @ ${trader.entry_price:,.2f}")
-                else:
-                    balance = trader.get_balance()
-                    position = trader.get_position()
-                    print(f"\n💰 포트폴리오 상태:")
-                    print(f"  잔액: ${balance:,.2f} USDT")
-                    print(f"  포지션: {position:.6f} BTC")
-
+            if mode == "paper":
+                current_position = trader.position
             else:
-                print("\n[5/5] 거래 비활성화 (예측 전용 모드)")
+                current_position = trader.get_position()
+
+            # Generate signal
+            action, size, stop_loss, take_profit = strategy.generate_signal(
+                predictions=predictions,
+                current_position=current_position
+            )
+
+            print(f"  신호: {action.upper()}")
+            if action != "hold":
+                print(f"  크기: {size:.2%}")
+                print(f"  Stop Loss: {stop_loss:+.2%}")
+                print(f"  Take Profit: {take_profit:+.2%}")
+
+            # Execute
+            result = trader.execute(
+                action=action,
+                size=size,
+                current_price=current_price,
+                timestamp=pd.Timestamp.now(),
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+
+            if result.get('status') in ['executed', 'buy', 'sell']:
+                print(f"  ✅ 거래 실행: {result}")
+                trade_logger.log_trade(result)
+
+            # Portfolio status
+            if mode == "paper":
+                equity = trader.get_equity(current_price)
+                pnl = trader.get_pnl(current_price)
+                ret = trader.get_return(current_price)
+                print(f"\n💰 포트폴리오 상태:")
+                print(f"  자본: ${equity:,.2f}")
+                print(f"  P&L: ${pnl:+,.2f} ({ret:+.2%})")
+                print(f"  포지션: {trader.position:.6f} BTC @ ${trader.entry_price:,.2f}")
+            else:
+                balance = trader.get_balance()
+                position = trader.get_position()
+                print(f"\n💰 포트폴리오 상태:")
+                print(f"  잔액: ${balance:,.2f} USDT")
+                print(f"  포지션: {position:.6f} BTC")
 
             # Wait for next hour
             print(f"\n⏳ 다음 업데이트까지 대기...")
@@ -368,7 +393,18 @@ def run_trading_daemon(mode: str):
 def main():
     """Entry point."""
     mode = select_mode()
-    run_trading_daemon(mode)
+
+    # If paper trading, check if log exists and ask resume/restart
+    paper_mode = "resume"
+    if mode == "paper":
+        trading_config = TradingConfig(mode=mode)
+        log_path = Path(trading_config.paper_log_path)
+        if log_path.exists():
+            paper_mode = select_paper_mode()
+        else:
+            print("\n🆕 새로운 Paper Trading 세션을 시작합니다.\n")
+
+    run_trading_daemon(mode, paper_mode)
 
 
 if __name__ == "__main__":

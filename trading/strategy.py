@@ -40,6 +40,14 @@ class SimpleStrategy:
             stop_loss: Stop-loss percentage (relative to entry price)
             take_profit: Take-profit percentage (relative to entry price)
         """
+        # Handle empty predictions
+        if not predictions:
+            print("  No predictions available - holding position")
+            if abs(current_position) > 0:
+                return "close", abs(current_position), 0.0, 0.0
+            else:
+                return "hold", 0.0, 0.0, 0.0
+
         # Use shortest horizon for fastest reaction (e.g., 3-day = 72h)
         horizon_hours = min(predictions.keys())
         pred_return = predictions[horizon_hours]
