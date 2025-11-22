@@ -24,22 +24,18 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Tuple, Literal
 
-from ingest.orchestrator import DataOrchestrator
-from process.builder import build_all_features
+from pipeline.orchestrator import DataOrchestrator
+from pipeline.builder import build_all_features
 
-# Regression models (NEW)
-from model.regression.config import RegressionConfig
-from model.regression.pipeline import train_all_horizons, generate_predictions
+# Regression models
+from models.regression.config import RegressionConfig
+from models.regression.pipeline import train_all_horizons, generate_predictions
 
-# Classification models (OLD - still available)
-from model.daily.config import DailyConfig
-from model.daily.pipeline import run_daily_cycle
-
-# Trading components (NEW)
-from trading.config import TradingConfig
-from trading.strategy import SimpleStrategy
-from trading.paper import PaperTrader
-from trading.executor import BinanceExecutor
+# Trading components
+from config.trading import TradingConfig
+from trading.strategy.regression import SimpleStrategy
+from trading.execution.paper import PaperTrader
+from trading.execution.live import BinanceExecutor
 from trading.logger import TradeLogger
 
 
