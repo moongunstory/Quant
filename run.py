@@ -1,24 +1,45 @@
 # run.py
 """
-BTC Jarvis Manager - Main Entry Point
+BTC Jarvis Manager - Main Entry Point (Daemon Mode)
+
+Modes:
+1. Paper Trading: Virtual money trading (safe)
+2. Live Trading: Real Binance Futures trading (REAL MONEY!)
+3. Predict Only: Just generate predictions, no trading
 
 자동 실행:
 - 필수 데이터 파일이 없으면 → 누락된 모듈만 540일치 초기 수집
 - 모든 파일이 있으면 → 각 데이터의 갱신 주기에 따라 필요한 항목만 '스마트 업데이트'
-- 데이터 수집/가공 후 → 최근 540일 기준 데일리 롤링 학습 + 예측 + 예측 로그/실적 업데이트
+- 데이터 수집/가공 후 → Regression 모델 학습 + 예측
+- 예측 기반 거래 실행 (Paper or Live)
+- 1시간마다 반복
 """
 
 import sys
+import time
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import List, Tuple
+from datetime import datetime, timedelta
+from typing import List, Tuple, Literal
 
 from ingest.orchestrator import DataOrchestrator
 from process.builder import build_all_features
-from model.daily.config import DailyConfig          # ✅ 여기서 가져와야 함
-from model.daily.pipeline import run_daily_cycle       # ✅ 이건 그대로
+
+# Regression models (NEW)
+from model.regression.config import RegressionConfig
+from model.regression.pipeline import train_all_horizons, generate_predictions
+
+# Classification models (OLD - still available)
+from model.daily.config import DailyConfig
+from model.daily.pipeline import run_daily_cycle
+
+# Trading components (NEW)
+from trading.config import TradingConfig
+from trading.strategy import SimpleStrategy
+from trading.paper import PaperTrader
+from trading.executor import BinanceExecutor
+from trading.logger import TradeLogger
 
 
 def check_data_status() -> Tuple[List[str], int]:
@@ -125,119 +146,230 @@ def _print_today_predictions(daily_pred: pd.DataFrame) -> None:
 
         print(line)
 
-def main():
-    """자동 실행"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="BTC Jarvis Manager - Automated Pipeline")
-    parser.add_argument(
-        "--run-hpo",
-        action="store_true",
-        help="데이터 수집/처리 후 HPO (Hyperparameter Optimization) 실행"
-    )
-    parser.add_argument(
-        "--hpo-horizons",
-        nargs="+",
-        type=int,
-        default=None,
-        help="HPO를 실행할 horizons (예: --hpo-horizons 3 7 30 90)"
-    )
-    args = parser.parse_args()
-
+def select_mode() -> Literal["paper", "live", "predict_only"]:
+    """
+    Prompt user to select trading mode (no CLI args).
+    """
     print("=" * 60)
-    print("🚀 BTC Jarvis Manager - 데이터 수집 & 피처 빌드 & 데일리 학습")
+    print("🤖 BTC Jarvis Manager - Regression Trading System")
     print("=" * 60)
-    
-    # check_data_status는 이제 필수 파일 누락 여부만 확인하는 용도로 사용
-    missing_modules, _ = check_data_status()
-    
-    orchestrator = DataOrchestrator()
-    success = False
-    
-    # 1) 데이터 수집/업데이트
-    if missing_modules:
-        print(f"\n📂 데이터 불완전 ({', '.join(missing_modules)} 모듈 누락)")
-        print("📥 누락된 데이터에 대해 540일치 초기 수집 시작...\n")
-        success = orchestrator.initial_collection(days=540, targets=missing_modules)
-    else:
-        # 모든 필수 파일이 존재하면, 세부적인 갱신 여부는 smart_update에 위임
-        print(f"\n📊 모든 필수 데이터 발견. 스마트 업데이트를 시작합니다...\n")
-        success = orchestrator.smart_update()
+    print("\n모드 선택:")
+    print("  1. Paper Trading (가상 자금)")
+    print("  2. Live Trading (실제 자금 - 주의!)")
+    print("  3. Predict Only (예측만, 거래 없음)")
+    print()
 
-    # 2) 데이터 수집이 성공했으면, 바로 피처 가공 + 병합
-    if success:
-        print("\n" + "=" * 60)
-        print("🧮 피처 가공 및 병합 시작 (process.builder.build_all_features)")
-        print("=" * 60)
-        try:
-            build_all_features()   # binance/onchain/macro/derivatives/news + master_1h
-            print("\n✅ 피처/마스터 테이블 빌드 완료!")
-        except Exception as e:
-            print(f"\n❌ 피처 빌드 중 오류 발생: {e}")
-            success = False
-
-    # 3) HPO 실행 (선택적)
-    if success and args.run_hpo:
-        print("\n" + "=" * 60)
-        print("🔧 HPO (Hyperparameter Optimization) 시작...")
-        print("=" * 60)
-        try:
-            from model.daily.hpo.run import run_hpo
-
-            master_path = Path("data/processed/master_features_1h.parquet")
-            if not master_path.exists():
-                raise FileNotFoundError(f"마스터 피처 파일이 없습니다: {master_path}")
-
-            df_master_hpo = pd.read_parquet(master_path)
-
-            # HPO 실행
-            run_hpo(
-                as_of_ts=None,  # 최신 시점 사용
-                horizons=args.hpo_horizons  # None이면 [3, 7, 30, 90] 사용
-            )
-            print("✅ HPO 완료! 최적 파라미터가 data/hpo/daily/best/ 에 저장되었습니다.")
-        except Exception as e:
-            print(f"\n⚠️ HPO 실행 중 오류 발생: {e}")
-            print("HPO를 건너뛰고 일반 학습을 진행합니다.")
-
-    # 4) 피처 빌드까지 성공했다면, 데일리 롤링 학습 + 예측 + 실적 업데이트
-    daily_pred = None
-    if success:
-        print("\n" + "=" * 60)
-        print("🤖 데일리 롤링 학습 + 예측 + 예측 로그/실적 업데이트 시작 (model.daily.run_daily_cycle)")
-        print("=" * 60)
-        try:
-            master_path = Path("data/processed/master_features_1h.parquet")
-            if not master_path.exists():
-                raise FileNotFoundError(f"마스터 피처 파일이 없습니다: {master_path}")
-            
-            df_master = pd.read_parquet(master_path)
-
-            cfg = DailyConfig()
-            daily_pred = run_daily_cycle(cfg, df_master=df_master)
-
-            if daily_pred is not None and not daily_pred.empty:
-                print("\n✅ 데일리 롤링 학습 + 예측 1회 완료!")
+    while True:
+        choice = input("선택 (1/2/3): ").strip()
+        if choice == "1":
+            return "paper"
+        elif choice == "2":
+            confirm = input("⚠️  실제 자금을 사용합니다. 'YES' 입력하여 확인: ").strip()
+            if confirm == "YES":
+                return "live"
             else:
-                print("\nℹ️ 오늘은 학습이 스킵되었거나, 예측만 업데이트되었습니다.")
-        except Exception as e:
-            print(f"\n❌ 데일리 학습/예측 루프 중 오류 발생: {e}")
-            success = False
+                print("Live trading 취소. 다른 모드를 선택하세요.\n")
+        elif choice == "3":
+            return "predict_only"
+        else:
+            print("잘못된 입력입니다. 1, 2, 3 중 선택하세요.\n")
 
-    # 🔹 오늘 예측 결과를 즉시 로그로 출력
-    if daily_pred is not None and not daily_pred.empty:
-        _print_today_predictions(daily_pred)
 
-    print("\n" + "=" * 60)
-    if success:
-        print("✅ 전체 파이프라인 완료! (수집 + 피처 빌드 + 데일리 학습/예측)")
+def run_trading_daemon(mode: str):
+    """
+    Main trading loop - runs continuously.
+
+    Every 1 hour:
+    - Update data
+    - Rebuild features
+    - Train models (once per day)
+    - Generate predictions
+    - Execute trades (if mode is paper or live)
+    """
+    print(f"\n🚀 Trading daemon 시작 ({mode.upper()} 모드)...")
+    print(f"⏰ 시작 시간: {datetime.now()}")
+    print(f"📊 업데이트 주기: 1시간\n")
+
+    # Initialize trading components
+    trading_config = TradingConfig(mode=mode)
+
+    if mode == "paper":
+        trader = PaperTrader(initial_capital=trading_config.paper_initial_capital)
+        print(f"💰 Paper trading 초기 자본: ${trading_config.paper_initial_capital:,.0f}\n")
+    elif mode == "live":
+        # Load API keys from environment or config
+        import os
+        api_key = os.getenv("BINANCE_API_KEY", trading_config.api_key)
+        api_secret = os.getenv("BINANCE_API_SECRET", trading_config.api_secret)
+
+        if not api_key or not api_secret:
+            print("❌ Binance API 키가 설정되지 않았습니다!")
+            print("환경 변수 BINANCE_API_KEY, BINANCE_API_SECRET를 설정하세요.")
+            return
+
+        trader = BinanceExecutor(
+            api_key=api_key,
+            api_secret=api_secret,
+            symbol=trading_config.symbol,
+            leverage=trading_config.leverage
+        )
+        print(f"⚠️  LIVE TRADING ({trading_config.symbol}, {trading_config.leverage}x leverage)\n")
     else:
-        print("❌ 일부 작업 실패 (로그 확인 필요)")
-    print("=" * 60)
-    
-    return 0 if success else 1
+        trader = None
+        print("📈 예측 전용 모드 (거래 없음)\n")
+
+    strategy = SimpleStrategy(trading_config) if trader else None
+    trade_logger = TradeLogger(trading_config.get_log_path()) if trader else None
+
+    # Data orchestrator
+    orchestrator = DataOrchestrator()
+    regression_config = RegressionConfig()
+
+    models = None  # Will be loaded/trained
+    iteration = 0
+
+    while True:
+        iteration += 1
+        print(f"\n{'=' * 60}")
+        print(f"Iteration #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'=' * 60}\n")
+
+        try:
+            # Step 1: Update data
+            print("📥 [1/5] 데이터 업데이트...")
+            missing_modules, _ = check_data_status()
+            if missing_modules:
+                print(f"  누락 모듈: {', '.join(missing_modules)}")
+                orchestrator.initial_collection(days=540, targets=missing_modules)
+            else:
+                orchestrator.smart_update()
+
+            # Step 2: Build features
+            print("⚙️  [2/5] 피처 빌드...")
+            build_all_features()
+
+            # Step 3: Load master data
+            master_path = Path("data/processed/master_features_1h.parquet")
+            if not master_path.exists():
+                print("❌ 마스터 피처 파일이 없습니다. 다음 iteration에서 재시도...")
+                time.sleep(300)
+                continue
+
+            df_master = pd.read_parquet(master_path)
+            print(f"  Master data: {len(df_master)} rows")
+
+            # Step 4: Train models (once per day at start, or every 24 iterations)
+            print("🧠 [3/5] 모델 로딩/학습...")
+            if models is None or iteration % 24 == 1:
+                print("  새 모델 학습 중...")
+                models = train_all_horizons(df_master, regression_config)
+            else:
+                print("  기존 모델 사용")
+
+            # Step 5: Generate predictions
+            print("🔮 [4/5] 예측 생성...")
+            predictions = generate_predictions(df_master, models, regression_config)
+
+            print("\n📊 예측 결과:")
+            for horizon_hours, pred_return in predictions.items():
+                horizon_days = horizon_hours // 24
+                print(f"  {horizon_days}일: {pred_return:+.4f} ({pred_return*100:+.2f}%)")
+
+            # Step 6: Execute trades (if trading mode)
+            if trader and strategy:
+                print("\n💼 [5/5] 거래 로직 실행...")
+
+                current_price = df_master.iloc[-1][regression_config.close_col]
+
+                if mode == "paper":
+                    current_position = trader.position
+                else:
+                    current_position = trader.get_position()
+
+                # Generate signal
+                action, size, stop_loss, take_profit = strategy.generate_signal(
+                    predictions=predictions,
+                    current_position=current_position
+                )
+
+                print(f"  신호: {action.upper()}")
+                if action != "hold":
+                    print(f"  크기: {size:.2%}")
+                    print(f"  Stop Loss: {stop_loss:+.2%}")
+                    print(f"  Take Profit: {take_profit:+.2%}")
+
+                # Execute
+                result = trader.execute(
+                    action=action,
+                    size=size,
+                    current_price=current_price,
+                    timestamp=pd.Timestamp.now(),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+
+                if result.get('status') in ['executed', 'buy', 'sell']:
+                    print(f"  ✅ 거래 실행: {result}")
+                    trade_logger.log_trade(result)
+
+                # Portfolio status
+                if mode == "paper":
+                    equity = trader.get_equity(current_price)
+                    pnl = trader.get_pnl(current_price)
+                    ret = trader.get_return(current_price)
+                    print(f"\n💰 포트폴리오 상태:")
+                    print(f"  자본: ${equity:,.2f}")
+                    print(f"  P&L: ${pnl:+,.2f} ({ret:+.2%})")
+                    print(f"  포지션: {trader.position:.6f} BTC @ ${trader.entry_price:,.2f}")
+                else:
+                    balance = trader.get_balance()
+                    position = trader.get_position()
+                    print(f"\n💰 포트폴리오 상태:")
+                    print(f"  잔액: ${balance:,.2f} USDT")
+                    print(f"  포지션: {position:.6f} BTC")
+
+            else:
+                print("\n[5/5] 거래 비활성화 (예측 전용 모드)")
+
+            # Wait for next hour
+            print(f"\n⏳ 다음 업데이트까지 대기...")
+            next_hour = (datetime.now() + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            wait_seconds = (next_hour - datetime.now()).total_seconds()
+
+            if wait_seconds > 0:
+                print(f"   다음 업데이트: {next_hour.strftime('%Y-%m-%d %H:%M:%S')}")
+                time.sleep(wait_seconds)
+
+        except KeyboardInterrupt:
+            print("\n\n🛑 종료 중...")
+
+            if mode == "paper" and trader:
+                print(f"\n📊 Paper Trading 최종 결과:")
+                current_price = df_master.iloc[-1][regression_config.close_col]
+                print(f"  초기 자본: ${trader.initial_capital:,.2f}")
+                print(f"  최종 자본: ${trader.get_equity(current_price):,.2f}")
+                print(f"  총 P&L: ${trader.get_pnl(current_price):+,.2f}")
+                print(f"  수익률: {trader.get_return(current_price):+.2%}")
+
+                summary = trader.get_trade_summary()
+                print(f"  총 거래 수: {summary['total_trades']}")
+                print(f"  승률: {summary['win_rate']:.1%}")
+
+            break
+
+        except Exception as e:
+            print(f"\n❌ Iteration #{iteration} 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            print("5분 후 재시도...")
+            time.sleep(300)  # Wait 5 minutes before retry
+
+
+def main():
+    """Entry point."""
+    mode = select_mode()
+    run_trading_daemon(mode)
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    main()

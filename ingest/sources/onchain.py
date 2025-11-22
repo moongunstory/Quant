@@ -20,6 +20,10 @@ BLOCKCHAIN_COM_METRICS = {
     "n-transactions": "Daily Transaction Count",
     "n-unique-addresses": "Daily Active Addresses",
     "estimated-transaction-volume-usd": "Daily Estimated Transaction Volume (USD)",
+    "hash-rate": "Network Hash Rate (TH/s)",
+    "difficulty": "Mining Difficulty",
+    "mempool-size": "Mempool Size (bytes)",
+    "avg-block-size": "Average Block Size (bytes)",
 }
 
 # ==================== Blockchain.com ====================
