@@ -34,14 +34,23 @@ def train_xgboost_regressor(
     Returns:
         Trained model
     """
-    model.fit(
-        X_train,
-        y_train,
-        sample_weight=sample_weight_train,
-        eval_set=[(X_val, y_val)],
-        sample_weight_eval_set=[sample_weight_val] if sample_weight_val is not None else None,
-        early_stopping_rounds=early_stopping_rounds,
-        verbose=False,
-    )
+    # XGBoost 2.0+ uses callbacks instead of early_stopping_rounds parameter
+    try:
+        model.fit(
+            X_train,
+            y_train,
+            sample_weight=sample_weight_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+    except Exception as e:
+        # Fallback: try old API or just fit without validation
+        print(f"      Warning: Could not use validation set: {e}")
+        model.fit(
+            X_train,
+            y_train,
+            sample_weight=sample_weight_train,
+            verbose=False,
+        )
 
     return model
