@@ -1,0 +1,24 @@
+# Core dependencies
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=11.0.0
+
+# Machine Learning
+lightgbm>=4.0.0
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+
+# Data collection
+requests>=2.31.0
+feedparser>=6.0.0
+python-dotenv>=1.0.0
+vaderSentiment>=3.3.2
+
+# Binance trading (optional - only needed for live trading)
+python-binance>=1.0.17
+
+# HPO (optional - for hyperparameter optimization)
+optuna>=3.3.0
+
+# Utilities
+tqdm>=4.65.0
