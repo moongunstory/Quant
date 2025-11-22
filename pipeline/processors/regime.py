@@ -1,4 +1,4 @@
-# process/modules/regime.py
+# pipeline/processors/regime.py
 """
 Market regime detection features.
 

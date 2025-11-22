@@ -1,4 +1,4 @@
-# process/modules/news.py
+# pipeline/processors/news.py
 
 from __future__ import annotations
 import pandas as pd
