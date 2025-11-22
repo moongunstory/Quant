@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import early_stopping
 
-from ..lgbm import ModelMetadata, create_lgbm_classifier, save_model
+from ..models import ModelMetadata, create_lgbm_classifier, save_model
 from .config import DailyConfig
 
 
