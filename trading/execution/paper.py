@@ -1,4 +1,4 @@
-# trading/paper.py
+# trading/execution/paper.py
 """
 Paper trading simulator (virtual money).
 """

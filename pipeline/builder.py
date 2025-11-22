@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-# process/builder.py
+# pipeline/builder.py
 
 import os
 import sys
 
 # === 프로젝트 루트 경로 자동 설정 ===
-# 현재 파일: Quant/process/builder.py
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))   # .../Quant/process
+# 현재 파일: Quant/pipeline/builder.py
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))   # .../Quant/pipeline
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)                # .../Quant
 
 if PROJECT_ROOT not in sys.path:
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict
 import pandas as pd
 
-from process.modules import (
+from pipeline.processors import (
     binance as binance_mod,
     onchain as onchain_mod,
     macro as macro_mod,

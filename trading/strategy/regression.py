@@ -1,4 +1,4 @@
-# trading/strategy.py
+# trading/strategy/regression.py
 """
 Trading strategy logic.
 """
@@ -6,7 +6,7 @@ Trading strategy logic.
 from __future__ import annotations
 from typing import Dict, Tuple, Literal
 
-from .config import TradingConfig
+from config.trading import TradingConfig
 
 
 class SimpleStrategy:

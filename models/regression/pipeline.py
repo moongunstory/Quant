@@ -1,4 +1,4 @@
-# model/regression/pipeline.py
+# models/regression/pipeline.py
 """
 Main regression training pipeline.
 """
@@ -14,16 +14,14 @@ import pandas as pd
 import numpy as np
 
 from .config import RegressionConfig
-from .dataset import (
+from models.core.dataset import (
     ensure_datetime_index,
     build_supervised_for_horizon,
     make_sample_weight,
 )
-from .lgbm.model import create_lgbm_regressor
-from .lgbm.trainer import train_lgbm_regressor
-from .xgboost.model import create_xgboost_regressor
-from .xgboost.trainer import train_xgboost_regressor
-from .ensemble.blend import SimpleEnsemble
+from .lgbm import create_lgbm_regressor, train_lgbm_regressor
+from .xgboost import create_xgboost_regressor, train_xgboost_regressor
+from models.core.ensemble import SimpleEnsemble
 
 
 def train_horizon_ensemble(

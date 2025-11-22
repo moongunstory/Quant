@@ -1,4 +1,4 @@
-# trading/executor.py
+# trading/execution/live.py
 """
 Live trading executor for Binance Futures.
 

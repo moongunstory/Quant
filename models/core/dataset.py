@@ -1,4 +1,4 @@
-# model/regression/dataset.py
+# models/core/dataset.py
 """
 Dataset preparation for regression models.
 """
@@ -10,7 +10,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
-from .config import RegressionConfig
+from models.regression.config import RegressionConfig
 
 
 def ensure_datetime_index(df: pd.DataFrame, cfg: RegressionConfig) -> pd.DataFrame:

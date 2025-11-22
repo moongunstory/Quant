@@ -1,4 +1,4 @@
-# model/regression/ensemble/blend.py
+# models/core/ensemble.py
 """
 Simple ensemble blending (weighted average of multiple models).
 """
