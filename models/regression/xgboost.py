@@ -72,7 +72,6 @@ def train_xgboost_regressor(
         y_train,
         sample_weight=sample_weight_train,
         eval_set=[(X_val, y_val)],
-        sample_weight=[(sample_weight_val if sample_weight_val is not None else None)],
         early_stopping_rounds=early_stopping_rounds,
         verbose=False,
     )
