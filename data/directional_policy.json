@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "description": "롱숏 비율을 5:5로 강제하지 않고 신호가 정하게 하는 영속 규칙(PLAN 2026-07-11 ②). 자격 규칙: (1) 알파의 패밀리가 eligible_families 에 있고 (2) 원신호(neutralization 전)가 실제로 부호를 가질 때만(=raw signal 에 음수 존재) neutralization 을 partial 로 승격한다. rank/zscore 로 감싼 신호는 순노출이 상수/0 이라 자동 제외된다(상수 편향 주입 방지). 승격된 알파의 순노출은 포트폴리오 market_neutrality 밴드(net_exposure_limit)가 유일한 통제기다. 장세 판별·예측 없음 — 신호 자율.",
+  "eligible_families": ["carry", "orderbook"],
+  "beta": 0.5,
+  "net_exposure_limit_hint": 0.20
+}

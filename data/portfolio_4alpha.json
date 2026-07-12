@@ -1,0 +1,19 @@
+{
+  "name": "4alpha",
+  "description": "독립 4알파 조합(유동성 제외) — taker_flow_follow(플로우, 신규) + range_high_60d(모멘텀) + crowd_ls_fade(포지셔닝) + funding_carry_7d(펀딩). 넷 다 서로 corr<0.5 독립, 전부 OOS 통과. 펀딩은 최근 식었지만 recency 게이트(min_recent_sharpe)로 자율 벤치/복귀 맡김 — sharpe_hl +1.55 로 지금은 유지. amihud(유동성)는 최근 음수+기존필드 고갈로 제외, 오더북 수집 여부 별도 결정. 리스크 스택은 improved(검증본, position_cap 0.10 / vol_target·gross_cap 예산 1.5 정합) 그대로.",
+  "alphas": ["taker_flow_follow", "range_high_60d", "crowd_ls_fade", "funding_carry_7d"],
+  "selection": {
+    "method": "low_correlation",
+    "params": {"max_corr_threshold": 0.6, "max_per_family": 2, "top_n": 8, "min_fitness": 0.0, "min_recent_sharpe": 0.0}
+  },
+  "weighting": {"method": "inverse_vol", "params": {"max_weight": 0.35}},
+  "risk_pipeline": [
+    {"type": "position_cap", "enabled": true, "params": {"max_weight": 0.10}},
+    {"type": "market_neutrality", "enabled": true, "params": {}},
+    {"type": "family_corr_scale", "enabled": true, "params": {"lookback": 60, "min_scale": 0.3}},
+    {"type": "family_gross_cap", "enabled": true, "params": {"max_gross_per_family": 0.5}},
+    {"type": "vol_target", "enabled": true, "params": {"max_scale": 1.5}},
+    {"type": "killswitch_v2", "enabled": true, "params": {"velocity_kill": 0.10}},
+    {"type": "gross_cap", "enabled": true, "params": {"max_gross": 1.5}}
+  ]
+}

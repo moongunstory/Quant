@@ -1,0 +1,54 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== 환경 / 시크릿 =====
+.env
+.env.*
+*.key
+secrets/
+
+# ===== 데이터 (대용량 / 런타임 생성) =====
+data/raw/
+data/processed/
+data/live/
+data/live_log/
+data/panel/
+data/scan/
+data/universe_snapshots/
+data/experiments/
+data/alphas/
+data/meta/
+
+# ===== 로그 =====
+logs/
+*.log
+
+# ===== IDE / 에디터 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 가상환경 =====
+venv/
+.venv/
+env/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Agents =====
+.agents/

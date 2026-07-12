@@ -1,0 +1,17 @@
+{
+  "name": "baseline",
+  "description": "기본 포트폴리오 — 3개 알파 inverse_vol 결합 + 핵심 리스크 오버레이. 알파별 bar(판단주기)는 각 알파 JSON에서 지정(기본 1d). rebalance_band>0 이면 라이브에서 목표가 현재와 그만큼 이상 달라질 때만 리밸런싱.",
+  "alphas": ["clean_momentum", "funding_carry", "reversal_5d"],
+  "rebalance_band": 0.0,
+  "weighting": {"method": "inverse_vol", "params": {}},
+  "risk_pipeline": [
+    {"type": "position_cap", "enabled": true, "params": {}},
+    {"type": "market_neutrality", "enabled": true, "params": {}},
+    {"type": "family_corr_scale", "enabled": false, "params": {"lookback": 60, "min_scale": 0.3}},
+    {"type": "family_gross_cap", "enabled": false, "params": {"max_gross_per_family": 0.5}},
+    {"type": "vol_target", "enabled": true, "params": {"max_scale": 3.0}},
+    {"type": "killswitch_v2", "enabled": true, "params": {"velocity_kill": 0.10}},
+    {"type": "gross_cap", "enabled": true, "params": {"max_gross": 1.0}},
+    {"type": "lot_rounding", "enabled": false, "params": {}}
+  ]
+}

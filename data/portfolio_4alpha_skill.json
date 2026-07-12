@@ -1,0 +1,19 @@
+{
+  "name": "4alpha_skill",
+  "description": "4알파 + 실력비례(skill) 가중 실험. inverse_vol(변동성 역수) 대신 최근 실력(반감기가중 샤프)에 비례해 비중 부여 — 뜨거운 알파는 더, 식은 알파(예: 최근 funding_carry_7d)는 비중이 부드럽게 0 으로 수렴. 이진 편입/제외가 아니라 연속적 벤치/복귀. half_life 90, floor 0.0(최근 손실이면 비중 0), max_weight 0.5. 나머지(알파 구성·리스크 스택)는 4alpha 와 동일 — 가중 방식만 A/B.",
+  "alphas": ["taker_flow_follow", "range_high_60d", "crowd_ls_fade", "funding_carry_7d"],
+  "selection": {
+    "method": "low_correlation",
+    "params": {"max_corr_threshold": 0.6, "max_per_family": 2, "top_n": 8, "min_fitness": 0.0, "min_recent_sharpe": 0.0}
+  },
+  "weighting": {"method": "skill", "params": {"half_life": 90, "floor": 0.0, "power": 1.0, "max_weight": 0.5}},
+  "risk_pipeline": [
+    {"type": "position_cap", "enabled": true, "params": {"max_weight": 0.10}},
+    {"type": "market_neutrality", "enabled": true, "params": {}},
+    {"type": "family_corr_scale", "enabled": true, "params": {"lookback": 60, "min_scale": 0.3}},
+    {"type": "family_gross_cap", "enabled": true, "params": {"max_gross_per_family": 0.5}},
+    {"type": "vol_target", "enabled": true, "params": {"max_scale": 1.5}},
+    {"type": "killswitch_v2", "enabled": true, "params": {"velocity_kill": 0.10}},
+    {"type": "gross_cap", "enabled": true, "params": {"max_gross": 1.5}}
+  ]
+}
