@@ -15,19 +15,20 @@ build/
 secrets/
 
 # ===== 데이터 (대용량 / 런타임 생성) =====
-data/raw/
 data/processed/
 data/live/
-data/live_log/
 data/panel/
 data/scan/
 data/universe_snapshots/
 data/experiments/
 data/alphas/
 data/meta/
+data/market/
+data/runtime/
+data/strategy/
 
 # ===== 로그 =====
-logs/
+data/logs/
 *.log
 
 # ===== IDE / 에디터 =====

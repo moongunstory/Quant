@@ -29,7 +29,7 @@ from src.config.backtest_settings import SETTINGS
 
 def load_policy(path=None):
     """data/directional_policy.json 로드. 없으면 None(규칙 비활성)."""
-    p = Path(path) if path else SETTINGS.data_dir / "directional_policy.json"
+    p = Path(path) if path else SETTINGS.data_dir / "meta" / "directional_policy.json"
     if not p.exists():
         return None
     return json.loads(p.read_text(encoding="utf-8"))

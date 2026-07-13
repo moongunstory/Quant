@@ -5,7 +5,7 @@
 
 스키마:
   name          포트폴리오 이름.
-  alphas        알파 이름 리스트. 빈 리스트 [] = data/alphas 전체 사용.
+  alphas        알파 이름 리스트. 빈 리스트 [] = data/strategy/alphas 전체 사용.
   weighting     {"method": "equal"|"inverse_vol", "params": {...}}.
   risk_pipeline [{"type","enabled","params"}, ...]  (실행순서 = 리스트순서).
                 type 는 risk.RISK_REGISTRY 키. enabled=false 면 건너뜀(리포트엔 표시).
@@ -25,7 +25,7 @@ VALID_SELECTION = ("low_correlation", "manual")
 
 
 @dataclass(frozen=True)
-class PortfolioConfig:
+class PortfolioSpec:
     name: str
     alphas: list = field(default_factory=list)
     weighting: dict = field(default_factory=lambda: {"method": "equal", "params": {}})
@@ -44,7 +44,7 @@ class PortfolioConfig:
 
     def validate(self):
         if not self.name or not isinstance(self.name, str):
-            raise ValueError("PortfolioConfig.name 은 비어있지 않은 문자열")
+            raise ValueError("PortfolioSpec.name 은 비어있지 않은 문자열")
         if not isinstance(self.alphas, list):
             raise ValueError("alphas 는 리스트여야 함")
         m = (self.weighting or {}).get("method")
@@ -72,13 +72,13 @@ class PortfolioConfig:
         return (self.weighting or {}).get("params", {}) or {}
 
 
-def load_portfolio_config(path) -> PortfolioConfig:
+def load_portfolio_spec(path) -> PortfolioSpec:
     p = Path(path)
     d = json.loads(p.read_text(encoding="utf-8"))
     unknown = set(d) - _ALLOWED_TOP
     if unknown:
-        raise ValueError(f"PortfolioConfig: 알 수 없는 키 {sorted(unknown)}")
-    return PortfolioConfig(
+        raise ValueError(f"PortfolioSpec: 알 수 없는 키 {sorted(unknown)}")
+    return PortfolioSpec(
         name=d.get("name", p.stem),
         alphas=d.get("alphas", []),
         weighting=d.get("weighting", {"method": "equal", "params": {}}),

@@ -1,4 +1,4 @@
-"""target_weights — 승인 포트폴리오 config -> 오늘의 목표 가중치 행.
+﻿"""target_weights — 승인 포트폴리오 config -> 오늘의 목표 가중치 행.
 
 라이브 계층의 첫 조각. build_portfolio 를 그대로 재사용해 전체 히스토리로
 combine+risk 를 돌리고, 결과 가중치 패널의 '마지막 행'을 오늘의 목표로 삼는다
@@ -20,7 +20,7 @@ from src.live import freshness as FR
 _DUST = 1e-6
 
 
-def _select_specs(cfg, alphas_dir="data/alphas"):
+def _select_specs(cfg, alphas_dir="data/strategy/alphas"):
     specs = load_all(alphas_dir)
     if cfg.alphas:
         by = {s.name: s for s in specs}
@@ -29,7 +29,7 @@ def _select_specs(cfg, alphas_dir="data/alphas"):
 
 
 def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_STALENESS_DAYS,
-                           rebuild=False, alphas_dir="data/alphas"):
+                           rebuild=False, alphas_dir="data/strategy/alphas"):
     """cfg -> {date, weights:{coin:weight}, held_alphas, alpha_weights, diagnostics}."""
     today = today or datetime.now(timezone.utc).date()
     specs = _select_specs(cfg, alphas_dir=alphas_dir)
@@ -41,7 +41,7 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
 
     if g["all_stale"]:
         return {"date": today.isoformat(), "weights": {}, "held_alphas": [],
-                "alpha_weights": {}, "diagnostics": diagnostics}
+                "alpha_weights": {}, "diagnostics": diagnostics, "day_returns": {}}
 
     fresh_names = [s.name for s in g["fresh"]]
     cfg_fresh = replace(cfg, alphas=fresh_names)
@@ -50,11 +50,20 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
     final = out["weights"]
     if final.empty:
         return {"date": today.isoformat(), "weights": {}, "held_alphas": fresh_names,
-                "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics}
+                "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics, "day_returns": {}}
 
     last_row = final.iloc[-1]
     weights = {c: float(w) for c, w in last_row.items()
                if w == w and abs(float(w)) > _DUST}  # NaN/dust 제외
     diagnostics["target_row_date"] = str(final.index[-1].date())
+
+    # 당일 수익률 추출 (자산 가치 평가용)
+    returns_df = out["result"].returns
+    day_returns = {}
+    if not returns_df.empty:
+        last_ret = returns_df.iloc[-1]
+        day_returns = {c: float(r) for c, r in last_ret.items() if r == r}
+
     return {"date": today.isoformat(), "weights": weights, "held_alphas": fresh_names,
-            "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics}
+            "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics,
+            "day_returns": day_returns}

@@ -19,8 +19,8 @@ universe_probe.py가 만든 rolling_score를 바탕으로, "매 리밸런싱 시
 min_universe_symbols 이상인 첫 달"부터 리밸런싱을 시작한다.
 
 만드는 것:
-  data/universe_snapshots/{YYYY-MM}.json       : 그 달 멤버십 + 순위
-  data/universe_snapshots/{YYYY-MM}_diff.json  : 전월 대비 entered/exited
+  data/market/universe/{YYYY-MM}.json       : 그 달 멤버십 + 순위
+  data/market/universe/{YYYY-MM}_diff.json  : 전월 대비 entered/exited
 
 이 모듈은 순위/멤버십 계산만 한다. 전체 필드 수집은 full_collector.py 몫이다.
 """
@@ -261,8 +261,3 @@ def run() -> None:
         prev_membership = membership
 
     logger.info("[universe_builder] 완료. 총 %d개 리밸런싱 시점 처리", len(rebalance_dates))
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    run()

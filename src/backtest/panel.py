@@ -1,4 +1,4 @@
-"""panel — Quant 원자료(심볼별 parquet)를 "date×coin" 표로 바꾼다.
+﻿"""panel — Quant 원자료(심볼별 parquet)를 "date×coin" 표로 바꾼다.
 
 이 파일이 coin 과 Quant 의 가장 큰 차이다. coin 은 자체 ingest/core.panel 을 쓰지만,
 Quant 는 src/collector 가 심볼별로 시간단위 parquet 를 저장한다. 여기서 그걸 읽어

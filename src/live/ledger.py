@@ -15,7 +15,7 @@ from src.config.backtest_settings import SETTINGS
 
 def _ledger_path(today=None):
     today = today or datetime.now(timezone.utc).date()
-    d = SETTINGS.data_dir.parent / "logs"
+    d = SETTINGS.logs_dir
     d.mkdir(parents=True, exist_ok=True)
     return d / f"live-{today.isoformat()}.jsonl"
 

@@ -1,9 +1,9 @@
-"""orders — 목표 가중치 vs 현재 포지션 -> 주문 리스트 (coin live/orders.py 이식).
+﻿"""orders — 목표 가중치 vs 현재 포지션 -> 주문 리스트 (coin live/orders.py 이식).
 
 target_weights.compute_target_weights() 가 오늘의 목표 가중치를 내면, 이 모듈이
 현재 포지션과 diff 해서 주문 리스트를 만든다. 두 모드:
 
-  paper : 실거래 연결 없음. '현재 포지션' = 지난 주문이 옮긴 대상, data/live/
+  paper : 실거래 연결 없음. '현재 포지션' = 지난 주문이 옮긴 대상, data/runtime/live/
           positions.json 에 {coin: weight} 로 저장. 즉시/완전 체결 가정(수수료·
           슬리피지는 이미 모든 백테스트 숫자에 반영돼 있으므로 페이퍼에선 생략).
   real  : 현재 포지션을 실제 거래소에서 읽고(trade/exchange.get_open_positions),
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from src.config.backtest_settings import SETTINGS
 
-POSITIONS_PATH_DEFAULT = SETTINGS.data_dir / "live" / "positions.json"
+POSITIONS_PATH_DEFAULT = SETTINGS.data_dir / "runtime" / "live" / "positions.json"
 DUST_THRESHOLD_DEFAULT = 0.001   # 이보다 작은 가중치 변화는 무시(부동소수/서브-lot 잡음)
 
 
@@ -58,7 +58,7 @@ def compute_orders(target_weights, current_weights, dust_threshold=DUST_THRESHOL
 
 def _real_current_weights():
     """실제 거래소 포지션 -> {coin: weight} (수량*마크가격 / book_aum_usd)."""
-    from src.trade import exchange
+    from src.live.exchange import exchange
     positions = exchange.get_open_positions()
     if not positions:
         return {}
@@ -73,7 +73,7 @@ def _real_current_weights():
 
 def _already_sent_today(today) -> bool:
     """daily guard: 오늘자 orders 기록이 real & not skipped 면 이미 전송된 것."""
-    p = Path(SETTINGS.data_dir) / "live" / f"orders_{today.isoformat()}.json"
+    p = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
     if not p.exists():
         return False
     try:
@@ -85,7 +85,7 @@ def _already_sent_today(today) -> bool:
 
 def _send_real_orders(orders):
     """각 주문 dict 에 exchange_result 또는 error 를 채운다."""
-    from src.trade import exchange
+    from src.live.exchange import exchange
     prices = exchange.get_mark_prices()
     for o in orders:
         symbol = o["coin"]
@@ -120,7 +120,7 @@ def generate_orders(target_record, positions_path=None, today=None,
                     dust_threshold=DUST_THRESHOLD_DEFAULT, mode="paper",
                     rebalance_band=0.0):
     """target_record(compute_target_weights 결과)를 현재 포지션과 diff, 주문 리스트
-    기록을 data/live/orders_<date>.json 에 저장(페이퍼는 positions.json 도 갱신).
+    기록을 data/runtime/live/orders_<date>.json 에 저장(페이퍼는 positions.json 도 갱신).
     real 모드는 주문도 전송. 주문 기록 dict 반환.
 
     rebalance_band (Phase 3-B): 현재 포트폴리오 대비 총 드리프트(Σ|Δ|)가 이 값보다
@@ -149,7 +149,7 @@ def generate_orders(target_record, positions_path=None, today=None,
                                       "-- 아직 충분히 다르지 않음, 리밸런싱 보류(포지션 유지)"),
                       "orders": [], "n_orders": 0, "drift": drift,
                       "rebalance_band": rebalance_band}
-            out_path = Path(SETTINGS.data_dir) / "live" / f"orders_{today.isoformat()}.json"
+            out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
             return record
@@ -163,7 +163,7 @@ def generate_orders(target_record, positions_path=None, today=None,
         if mode == "paper":
             save_positions(target, positions_path)  # 즉시·완전 체결 가정
 
-    out_path = Path(SETTINGS.data_dir) / "live" / f"orders_{today.isoformat()}.json"
+    out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
     return record

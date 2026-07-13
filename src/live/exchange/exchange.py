@@ -1,4 +1,4 @@
-"""exchange — 실거래(real) 모드에서 쓰는 거래소 조회/주문 래퍼.
+﻿"""exchange — 실거래(real) 모드에서 쓰는 거래소 조회/주문 래퍼.
 
 trade/client.py(클라이언트 생성) + trade/order.py(시장가 주문) 위에, orders.py 가
 필요로 하는 '현재 포지션 조회 / 마크가격 / 수량 반올림 / 주문 전송'을 얹는다.
@@ -13,8 +13,8 @@ from __future__ import annotations
 import math
 
 from src.config.backtest_settings import SETTINGS
-from src.trade.client import get_client
-from src.trade.order import place_market_order as _place_market_order
+from src.live.exchange.client import get_client
+from src.live.exchange.order import place_market_order as _place_market_order
 
 # 심볼별 LOT step 캐시(거래소 exchangeInfo 에서 1회 조회). 미조회 시 기본 step.
 _LOT_STEP_CACHE: dict[str, float] = {}

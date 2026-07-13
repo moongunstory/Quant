@@ -1,10 +1,11 @@
-"""portfolio — 여러 승인 알파를 하나의 포트폴리오 가중치로 결합.
+"""portfolio — 알파 결합 및 리스크 오버레이 패키지.
 
-combine.py : 알파별 가중치 패널(dict) -> 결합 가중치 패널(일별 L1=1).
-             가중방식(WEIGHTING_REGISTRY): equal / inverse_vol.
-config.py  : portfolio.json(알파 선택 + 가중 + risk_pipeline) 로더/스키마.
-pipeline.py: 승인 config -> 알파별 백테스트 -> combine -> risk 오버레이 -> 리포트.
+알파 신호(JSON)를 받아 최종 포트폴리오 가중치를 만드는 두 단계를 담는다:
 
-coin research/portfolio 이식(Phase 1 스코프). hedge/low_correlation 선택 등
-고급 기능은 Phase 3. PLAN_quant_upgrade.md 참고.
+  1. 결합 (combine / pipeline)
+       여러 알파를 가중 평균하거나 상관 기반으로 선택해 블렌드 포지션을 만든다.
+
+  2. 리스크 오버레이 (risk / report)
+       포지션 캡, 순노출 한도, vol 타겟팅, MDD 킬스위치 등을 단계적으로 적용한다.
+       각 단계 전후의 성과를 report.py 가 추적한다.
 """

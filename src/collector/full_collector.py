@@ -513,8 +513,3 @@ def run(datasets: Optional[list[str]] = None, max_workers: int = DEFAULT_MAX_WOR
             future.result()  # 코드 버그성 예외는 숨기지 않고 그대로 전파
 
     logger.info("완료. 대상 %d개 중 %d개 심볼 갱신됨 (datasets=%s)", total, updated, datasets)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    run()

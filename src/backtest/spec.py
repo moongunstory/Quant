@@ -1,6 +1,6 @@
 """AlphaSpec — 알파 하나의 정의(계약).
 
-알파 1개 = JSON 파일 1개 (data/alphas/<name>.json).
+알파 1개 = JSON 파일 1개 (data/strategy/alphas/<name>.json).
 이 모양만 안정적으로 유지되면 엔진/메트릭/검증은 자유롭게 바꿔도 된다.
 
 필드:

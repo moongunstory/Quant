@@ -1,4 +1,4 @@
-"""freshness — 라이브 데이터 신선도 게이트 (coin live/freshness.py 이식).
+﻿"""freshness — 라이브 데이터 신선도 게이트 (coin live/freshness.py 이식).
 
 왜 필요한가: 한 알파의 의존 데이터가 오늘까지 안 왔는데도 블렌드에 그 알파의
 낡은/NaN 행이 섞여 들어가면, 스케줄된 실행이 조용히 북을 언더웨이트한다. 이 게이트는
@@ -6,7 +6,7 @@
 전에 아예 빼고 이름을 명시한다.
 
 메커니즘: 각 알파의 수식에서 필요한 panel field(evaluate.required_fields)를 뽑고,
-각 field 의 패널(data/panel/<field>.parquet)의 '마지막 유효(non-NaN) 날짜'를 확인한다.
+각 field 의 패널(data/market/panel/<field>.parquet)의 '마지막 유효(non-NaN) 날짜'를 확인한다.
 그 날짜가 today 대비 max_staleness_days 보다 더 뒤처지면 그 알파를 STALE 로 표시.
 """
 from __future__ import annotations

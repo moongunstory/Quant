@@ -1,10 +1,10 @@
-import argparse
+﻿import argparse
 import logging
 
 import pandas as pd
 
-from src.trade.client import get_client
-from src.trade.order import place_market_order
+from src.live.exchange.client import get_client
+from src.live.exchange.order import place_market_order
 from src.collector import symbol_universe, universe_probe, universe_builder, full_collector
 from src.backtest import engine, metrics as M, panel as P, validation as V
 from src.backtest.evaluate import required_fields, spec_required_fields
@@ -154,14 +154,14 @@ def run_backtest_test(args):
 def run_backtest_rank(args):
     specs = load_all(SETTINGS.alphas_dir)
     if not specs:
-        print("data/alphas/ 에 알파가 없음")
+        print("data/strategy/alphas/ 에 알파가 없음")
         return
     if getattr(args, "only", None):
         want = set(args.only)
         found = {s.name for s in specs}
         missing = want - found
         if missing:
-            print(f"  경고: data/alphas/ 에 없는 이름 무시: {sorted(missing)}")
+            print(f"  경고: data/strategy/alphas/ 에 없는 이름 무시: {sorted(missing)}")
         specs = [s for s in specs if s.name in want]
         if not specs:
             print("  --only 로 지정한 알파가 하나도 없음")
@@ -233,7 +233,7 @@ def run_backtest_corr(args):
         print(f"  · {r:24s} sharpe {s:+.2f}{dupes}")
 
     if args.save:
-        out = SETTINGS.data_dir / "alpha_corr.csv"
+        out = SETTINGS.data_dir / "meta" / "alpha_corr.csv"
         corr.round(4).to_csv(out)
         print(f"\n상관행렬 저장: {out}")
 
@@ -245,7 +245,7 @@ def run_backtest_all(args):
 
     specs = load_all(SETTINGS.alphas_dir)
     if not specs:
-        print("\ndata/alphas/ 에 알파가 없음")
+        print("\ndata/strategy/alphas/ 에 알파가 없음")
         return
 
     print(f"\n=== 2) 알파 {len(specs)}개 백테스트 ===")
@@ -266,11 +266,11 @@ def run_backtest_all(args):
 
 def run_portfolio(args):
     """포트폴리오 config 로드 -> combine -> risk 오버레이 -> stage 리포트 + 최종 메트릭."""
-    from src.portfolio.config import load_portfolio_config
+    from src.portfolio.spec import load_portfolio_spec
     from src.portfolio import pipeline as PP
-    from src.risk import report as RPT
+    from src.portfolio import report as RPT
 
-    cfg = load_portfolio_config(args.config)
+    cfg = load_portfolio_spec(args.config)
     out = PP.build_portfolio(cfg, rebuild=args.rebuild)
     m = out["metrics"]
 
@@ -307,8 +307,8 @@ def run_walkforward(args):
     families = _load_families()
     cfg = None
     if getattr(args, "config", None):
-        from src.portfolio.config import load_portfolio_config
-        cfg = load_portfolio_config(args.config)
+        from src.portfolio.spec import load_portfolio_spec
+        cfg = load_portfolio_spec(args.config)
         series, pos_panels, master_panels, funding_events = WF.collect_alpha_books(
             rebuild=args.rebuild, families=families)
         wf = WF.run_walkforward_portfolio(
@@ -342,6 +342,13 @@ def run_live(args):
     H._print_summary(res)
 
 
+def run_bot(args):
+    """텔레그램 Polling 봇 구동."""
+    from src.live import telegram_bot as TB
+    TB.start_polling_bot()
+
+
+
 def main():
     _setup_logging()
 
@@ -358,13 +365,13 @@ def main():
                               help="포지션 축소/청산 전용 주문으로 실행")
     trade_parser.set_defaults(func=run_trade)
 
-    universe_parser = subparsers.add_parser("universe", help="심볼 유니버스 갱신 (data/meta/symbol_list.json 재생성)")
+    universe_parser = subparsers.add_parser("universe", help="심볼 유니버스 갱신 (data/strategy/meta/symbol_list.json 재생성)")
     universe_parser.set_defaults(func=run_universe)
 
-    universe_probe_parser = subparsers.add_parser("universe-probe", help="유니버스 판단용 rolling_score 스캔 (data/scan/*.parquet 갱신)")
+    universe_probe_parser = subparsers.add_parser("universe-probe", help="유니버스 판단용 rolling_score 스캔 (data/market/scan/*.parquet 갱신)")
     universe_probe_parser.set_defaults(func=run_universe_probe)
 
-    universe_builder_parser = subparsers.add_parser("universe-builder", help="과거 전체 리밸런싱 시점의 유니버스 스냅샷 재구성 (data/universe_snapshots/*.json 갱신)")
+    universe_builder_parser = subparsers.add_parser("universe-builder", help="과거 전체 리밸런싱 시점의 유니버스 스냅샷 재구성 (data/market/universe/*.json 갱신)")
     universe_builder_parser.set_defaults(func=run_universe_builder)
 
     universe_refresh_parser = subparsers.add_parser(
@@ -391,14 +398,14 @@ def main():
     backtest_build_panel_parser.set_defaults(func=run_backtest_build_panel)
 
     backtest_test_parser = subparsers.add_parser("backtest-test", help="알파 하나 백테스트")
-    backtest_test_parser.add_argument("--alpha", required=True, help="data/alphas/<이름>.json 의 이름")
+    backtest_test_parser.add_argument("--alpha", required=True, help="data/strategy/alphas/<이름>.json 의 이름")
     backtest_test_parser.add_argument("--validate", action="store_true", help="OOS/WF/순열검정 실행")
     backtest_test_parser.add_argument("--n-perm", type=int, default=500)
     backtest_test_parser.add_argument("--rebuild", action="store_true", help="패널 캐시 무시하고 재빌드")
     backtest_test_parser.add_argument("--save-curve", action="store_true", help="자본곡선 CSV 저장")
     backtest_test_parser.set_defaults(func=run_backtest_test)
 
-    backtest_rank_parser = subparsers.add_parser("backtest-rank", help="data/alphas/ 모든 알파 fitness 랭킹")
+    backtest_rank_parser = subparsers.add_parser("backtest-rank", help="data/strategy/alphas/ 모든 알파 fitness 랭킹")
     backtest_rank_parser.add_argument("--rebuild", action="store_true")
     backtest_rank_parser.add_argument(
         "--only", nargs="+", default=None,
@@ -431,7 +438,7 @@ def main():
         "portfolio",
         help="포트폴리오 config(combine+risk) 백테스트 + 리스크 stage 리포트",
     )
-    portfolio_parser.add_argument("--config", default="data/portfolio.json",
+    portfolio_parser.add_argument("--config", default="data/strategy/portfolio/config.json",
                                   help="포트폴리오 JSON 경로")
     portfolio_parser.add_argument("--rebuild", action="store_true", help="패널 캐시 재빌드")
     portfolio_parser.add_argument("--save-report", action="store_true",
@@ -457,7 +464,7 @@ def main():
     walkforward_parser.add_argument("--max-corr", type=float, default=0.5)
     walkforward_parser.add_argument("--top-n", type=int, default=None)
     walkforward_parser.add_argument("--max-per-family", type=int, default=None,
-                                    help="패밀리당 최대 알파 수(data/alpha_families.json)")
+                                    help="패밀리당 최대 알파 수(data/strategy/meta/alpha_families.json)")
     walkforward_parser.add_argument("--method", default="low_correlation",
                                     help="selection method(low_correlation|manual)")
     walkforward_parser.add_argument("--save-report", action="store_true",
@@ -468,12 +475,17 @@ def main():
     live_parser = subparsers.add_parser(
         "live", help="라이브 사이클(가상/실매매): freshness -> 목표가중 -> 주문 -> 원장",
     )
-    live_parser.add_argument("--config", default="data/portfolio.json")
+    live_parser.add_argument("--config", default="data/strategy/portfolio/config.json")
     live_parser.add_argument("--mode", choices=["paper", "real"], default="paper")
     live_parser.add_argument("--refresh", action="store_true", help="사이클 전 데이터 최신화(top100×채택필드)")
     live_parser.add_argument("--rebuild", action="store_true", help="패널 캐시 재빌드")
     live_parser.add_argument("--max-staleness-days", type=int, default=None)
     live_parser.set_defaults(func=run_live)
+
+    bot_parser = subparsers.add_parser(
+        "bot", help="라이브 텔레그램 Polling 봇 구동"
+    )
+    bot_parser.set_defaults(func=run_bot)
 
     args = parser.parse_args()
     args.func(args)

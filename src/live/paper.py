@@ -6,7 +6,7 @@
 positions.json 을 목표로 갱신하므로, 여기서는 그 위에 '페이퍼 자산곡선'만 얹는다.
 
 mark_to_market: 저장된 페이퍼 포지션({coin: weight})을 그날 수익률에 곱해 하루 손익을
-추정하고 equity 곡선(data/live/paper_equity.jsonl)에 append. 실거래 ledger 와 별개로,
+추정하고 equity 곡선(data/runtime/live/paper_equity.jsonl)에 append. 실거래 ledger 와 별개로,
 '가상 계좌가 실제로 어떻게 움직였나'를 본다.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from src.config.backtest_settings import SETTINGS
 
-EQUITY_PATH = SETTINGS.data_dir / "live" / "paper_equity.jsonl"
+EQUITY_PATH = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
 
 
 def mark_to_market(weights, day_returns, today=None):

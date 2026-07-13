@@ -57,19 +57,23 @@ class Settings:
 
     @property
     def processed_dir(self) -> Path:
-        return self.data_dir / "processed"
+        return self.data_dir / "market" / "processed"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.data_dir / "runtime" / "logs"
 
     @property
     def panel_dir(self) -> Path:
-        return self.data_dir / "panel"
+        return self.data_dir / "market" / "panel"
 
     @property
     def universe_snapshot_dir(self) -> Path:
-        return self.data_dir / "universe_snapshots"
+        return self.data_dir / "market" / "universe"
 
     @property
     def alphas_dir(self) -> Path:
-        return self.data_dir / "alphas"
+        return self.data_dir / "strategy" / "alphas"
 
 
 SETTINGS = Settings()

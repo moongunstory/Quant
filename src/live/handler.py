@@ -3,7 +3,7 @@
 run_cycle: (선택)데이터 최신화 -> 목표 가중치 계산 -> 주문 생성/실행 -> 원장 기록.
 로컬/클라우드 동일 경로. mode="paper"(기본) 또는 "real".
 
-    python -m src.live.handler --config data/portfolio.json --mode paper
+    python -m src.live.handler --config data/strategy/portfolio/config.json --mode paper
 
 fail-safe: target_weights 가 all_alphas_stale 이면 orders 가 자동 SKIP(포지션 유지).
 """
@@ -13,8 +13,9 @@ import argparse
 import logging
 from datetime import datetime, timezone
 
-from src.portfolio.config import load_portfolio_config
+from src.portfolio.spec import load_portfolio_spec
 from src.live import target_weights as TW, orders as OR, ledger as LG
+from src.live.state import load_live_state
 
 log = logging.getLogger("quant.live.handler")
 
@@ -23,7 +24,24 @@ def run_cycle(config_path, mode="paper", today=None, refresh=False,
               max_staleness_days=None, rebuild=False):
     """한 사이클 실행. -> {target, orders} 요약 dict."""
     today = today or datetime.now(timezone.utc).date()
-    cfg = load_portfolio_config(config_path)
+
+    # [동적 설정 반영] data/runtime/live/config.json 설정이 존재하면 이를 우선하여 적용함
+    live_cfg = load_live_state()
+    if not live_cfg.get("enabled", True):
+        log.info("라이브 봇이 비활성화(disabled) 상태이므로 사이클을 스킵합니다.")
+        try:
+            from src.live import telegram_bot as TB
+            TB.send_telegram_message("ℹ️ <b>라이브 봇이 비활성화(disabled) 상태이므로 사이클을 스킵합니다.</b>")
+        except Exception:
+            pass
+        return {
+            "target": {"date": today.isoformat(), "weights": {}, "held_alphas": [], "diagnostics": {"all_alphas_stale": True}},
+            "orders": {"date": today.isoformat(), "mode": mode, "skipped": True, "skip_reason": "봇 비활성화 상태"}
+        }
+
+    # 설정 파일에 지정된 모드("paper" 또는 "real")로 실행 모드를 결정함
+    mode = live_cfg.get("mode", mode)
+    cfg = load_portfolio_spec(config_path)
 
     if refresh:
         try:
@@ -40,6 +58,17 @@ def run_cycle(config_path, mode="paper", today=None, refresh=False,
                          "stale_alphas": target["diagnostics"].get("stale_alphas")},
               today=today)
 
+    # [가상 매매 상시 트래킹] 모드와 무관하게 로컬 시뮬레이션(Paper) PnL 을 트래킹합니다.
+    paper_current = OR.load_positions()
+    day_returns = target.get("day_returns", {})
+    if day_returns and paper_current:
+        try:
+            from src.live import paper as PA
+            day_pnl, equity = PA.mark_to_market(paper_current, day_returns, today=today)
+            log.info("[Paper PnL] 일일 가상 손익: %+.6f | 누적 가상 자산: %.6f", day_pnl, equity)
+        except Exception as e:
+            log.warning("로컬 가상 매매 PnL 업데이트 실패: %s", e)
+
     order_record = OR.generate_orders(target, today=today, mode=mode,
                                       rebalance_band=getattr(cfg, "rebalance_band", 0.0))
     LG.record("orders", {"date": order_record["date"], "mode": mode,
@@ -48,7 +77,21 @@ def run_cycle(config_path, mode="paper", today=None, refresh=False,
                          "skip_reason": order_record.get("skip_reason")},
               today=today)
 
-    return {"target": target, "orders": order_record}
+    # mode == "real" 일 때도 로컬 가상 포지션을 target 가중치로 갱신하여 다음 사이클의 PnL 계산에 반영되게 합니다.
+    # mode == "paper" 일 때는 OR.generate_orders 내부에서 자동으로 save_positions를 수행하므로 생략합니다.
+    if mode == "real" and not order_record.get("skipped"):
+        OR.save_positions(target.get("weights", {}))
+
+    res = {"target": target, "orders": order_record}
+
+    # [텔레그램 보고서 자동 발송] 사이클 결과를 유저에게 전달합니다.
+    try:
+        from src.live import telegram_bot as TB
+        TB.send_cycle_report(res)
+    except Exception as e:
+        log.warning("텔레그램 사이클 실행 보고 전송 실패: %s", e)
+
+    return res
 
 
 def _print_summary(res):
@@ -70,22 +113,3 @@ def _print_summary(res):
             print(f"    {od['side']:4} {od['coin']:12} "
                   f"{od['current_weight']:+.4f} -> {od['target_weight']:+.4f} "
                   f"(Δ{od['delta']:+.4f})")
-
-
-def main():
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    ap = argparse.ArgumentParser(description="Quant 라이브 사이클")
-    ap.add_argument("--config", default="data/portfolio.json")
-    ap.add_argument("--mode", choices=["paper", "real"], default="paper")
-    ap.add_argument("--refresh", action="store_true", help="사이클 전 데이터 최신화")
-    ap.add_argument("--rebuild", action="store_true", help="패널 캐시 재빌드")
-    ap.add_argument("--max-staleness-days", type=int, default=None)
-    args = ap.parse_args()
-    res = run_cycle(args.config, mode=args.mode, refresh=args.refresh,
-                    rebuild=args.rebuild, max_staleness_days=args.max_staleness_days)
-    _print_summary(res)
-
-
-if __name__ == "__main__":
-    main()

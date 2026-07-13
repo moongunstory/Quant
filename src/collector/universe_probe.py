@@ -11,8 +11,8 @@ symbol_universe.py가 확보한 전체 심볼 목록을 대상으로,
 대해서만 수행한다.
 
 이 모듈이 만드는 것:
-  data/scan/{SYMBOL}.parquet : date, close, quote_volume, rolling_score
-  data/scan/_manifest.json   : {symbol: "YYYY-MM"}  (gap-aware 재실행용)
+  data/market/scan/{SYMBOL}.parquet : date, close, quote_volume, rolling_score
+  data/market/scan/_manifest.json   : {symbol: "YYYY-MM"}  (gap-aware 재실행용)
 
 rolling_score 계산 규칙은 전부 universe_rules.json에서 읽어온다.
 이 파일에는 "몇 위 안에 들어야 편입되는지" 같은 순위/이력밴드 로직은 없다.

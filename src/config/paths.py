@@ -13,22 +13,50 @@ from pathlib import Path
 
 DATA_ROOT = Path("data")
 
+# ── 디렉토리 구조 ────────────────────────────────────────────────────────────
+#
+#  data/
+#   ├── market/       시장 데이터 수집 파이프라인 (수집·가공·캐시)
+#   │   ├── processed/     full_collector 원본 데이터 (심볼별 parquet)
+#   │   ├── scan/          universe_probe 경량 스캔 결과
+#   │   ├── universe/      월별 top-N 유니버스 스냅샷 + 룰
+#   │   └── panel/         백테스트용 date×coin 피벗 캐시
+#   ├── strategy/     전략 설계·정의 파일
+#   │   ├── alphas/        알파 시그널 정의 (JSON)
+#   │   ├── portfolio/     포트폴리오 구성 설정 (config.json)
+#   │   └── meta/          심볼 마스터, 알파 패밀리, 방향성 정책
+#   ├── runtime/      실시간 운영 상태
+#   │   ├── live/          실전/모의 포지션·주문 이력
+#   │   └── logs/          리밸런싱 로그·포트폴리오 백업
+#   └── experiments/  백테스트 실험 결과 (루트 직속)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
 # full_collector가 다루는 데이터셋 목록. 데이터셋마다 하위 폴더와 별도 manifest를 갖는다.
 # (binance_api.DATASET_SPECS의 키와 반드시 일치해야 한다. 새 데이터셋 추가 시 양쪽 모두 수정.)
 PROCESSED_DATASETS = ["klines", "premiumIndexKlines", "metrics", "fundingRate", "bookDepth"]
 
 PATHS = {
-    "meta": DATA_ROOT / "meta",                       # symbol_list.json 등 메타데이터
-    "raw": DATA_ROOT / "raw",                          # (필요 시) 원본 보관
-    "scan": DATA_ROOT / "scan",                        # light_scanner 결과
-    "universe_snapshots": DATA_ROOT / "universe_snapshots",  # 월별 top-N 스냅샷 + diff
-    "universe_rules": DATA_ROOT / "universe_snapshots" / "rules",  # universe_probe/builder 판단 규칙(json)
-    "processed": DATA_ROOT / "processed",              # full_collector 결과 루트 (하위는 데이터셋별)
-    "live_log": DATA_ROOT / "live_log",                # 실전 매매 로그 (ingest.py 관련, 연구 데이터와 분리)
-    # 데이터셋별 저장 경로: data/processed/{dataset}/{SYMBOL}.parquet + 데이터셋별 _manifest.json
-    # (예전엔 processed 평면에 {SYMBOL}__{dataset}.parquet로 섞여 있었다.
-    #  scripts/migrate_processed_layout.py로 1회 마이그레이션.)
-    **{f"processed_{ds}": DATA_ROOT / "processed" / ds for ds in PROCESSED_DATASETS},
+    # ── market/ ──────────────────────────────────────────────────────────────
+    "processed": DATA_ROOT / "market" / "processed",       # full_collector 결과 루트
+    # 데이터셋별 저장 경로: data/market/processed/{dataset}/{SYMBOL}.parquet + _manifest.json
+    **{f"processed_{ds}": DATA_ROOT / "market" / "processed" / ds for ds in PROCESSED_DATASETS},
+    "scan": DATA_ROOT / "market" / "scan",                 # universe_probe 경량 스캔
+    "universe_snapshots": DATA_ROOT / "market" / "universe",  # 월별 top-N 스냅샷 + diff
+    "universe_rules": DATA_ROOT / "market" / "universe" / "rules",  # 유니버스 판단 규칙
+    "panel": DATA_ROOT / "market" / "panel",               # date×coin 피벗 캐시
+
+    # ── strategy/ ────────────────────────────────────────────────────────────
+    "alphas": DATA_ROOT / "strategy" / "alphas",           # 알파 시그널 정의
+    "portfolio": DATA_ROOT / "strategy" / "portfolio",     # 포트폴리오 구성 설정 (config.json 등)
+    "meta": DATA_ROOT / "strategy" / "meta",               # 심볼 마스터, 알파 패밀리, 방향성 정책
+
+    # ── runtime/ ─────────────────────────────────────────────────────────────
+    "live": DATA_ROOT / "runtime" / "live",                # 실전/모의 포지션·주문 이력
+    "logs": DATA_ROOT / "runtime" / "logs",                # 리밸런싱 로그·포트폴리오 백업
+
+    # ── research/ ────────────────────────────────────────────────────────────
+    "experiments": DATA_ROOT / "experiments",               # 백테스트 실험 결과 (루트 직속)
 }
 
 MANIFEST_FILENAME = "_manifest.json"

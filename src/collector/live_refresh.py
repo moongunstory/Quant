@@ -1,4 +1,4 @@
-"""live_refresh — 라이브용 '좁은' 데이터 최신화.
+﻿"""live_refresh — 라이브용 '좁은' 데이터 최신화.
 
 리서치/백테스트(full_collector)는 넓은 유니버스·넓은 필드로 수집하지만, 라이브는
 이중으로 좁힌다(coin 의 '라이브 데이터 과부하' 실패를 구조적으로 차단):
@@ -58,7 +58,7 @@ def _current_top100():
     return set(d.get("members", []))
 
 
-def compute_scope(cfg, alphas_dir="data/alphas"):
+def compute_scope(cfg, alphas_dir="data/strategy/alphas"):
     """cfg -> {fields, datasets, symbols, alphas}. 라이브 최신화 스코프."""
     specs = load_all(alphas_dir)
     if cfg.alphas:
@@ -77,7 +77,7 @@ def compute_scope(cfg, alphas_dir="data/alphas"):
             "n_symbols": len(symbols)}
 
 
-def run(cfg, alphas_dir="data/alphas", max_workers=10):
+def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10):
     """스코프 계산 후 필요한 데이터셋만 최신화."""
     scope = compute_scope(cfg, alphas_dir=alphas_dir)
     log.info("live_refresh 스코프: 알파=%s 필드=%s 데이터셋=%s top100=%d종목",

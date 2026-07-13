@@ -1,4 +1,4 @@
-"""pipeline — 승인 포트폴리오 config 를 실제 백테스트로.
+﻿"""pipeline — 승인 포트폴리오 config 를 실제 백테스트로.
 
 흐름:
   1. config 의 알파들을 각각 백테스트(engine.run) → 알파별 (신호 가중치, 순손익)
@@ -25,8 +25,8 @@ from src.backtest.evaluate import required_fields, spec_required_fields, evaluat
 from src.backtest.spec import load_all
 from src.config.backtest_settings import SETTINGS
 from src.portfolio import combine as C
-from src.portfolio.config import PortfolioConfig
-from src.risk import risk as RK, report as RPT
+from src.portfolio.spec import PortfolioSpec
+from src.portfolio import risk as RK, report as RPT
 
 log = logging.getLogger(__name__)
 
@@ -55,23 +55,23 @@ def _backtestable_specs(specs):
 
 
 def _load_families(path=None):
-    """{alpha_name -> family} 를 data/alpha_families.json({family:[names]})에서 로드.
+    """{alpha_name -> family} 를 data/strategy/meta/alpha_families.json({family:[names]})에서 로드.
     파일 없으면 None → family 캡/모듈은 조용히 비활성(coin _load_families 이식)."""
-    p = Path(path) if path else SETTINGS.data_dir / "alpha_families.json"
+    p = Path(path) if path else SETTINGS.data_dir / "strategy" / "meta" / "alpha_families.json"
     if not p.exists():
         return None
     fam = json.loads(p.read_text(encoding="utf-8"))
     return {name: family for family, names in fam.items() for name in names}
 
 
-def _select_specs(cfg: PortfolioConfig, alphas_dir="data/alphas"):
+def _select_specs(cfg: PortfolioSpec, alphas_dir="data/strategy/alphas"):
     specs = load_all(alphas_dir)
     if cfg.alphas:
         # 명시 라인업: 이름 못 찾으면 에러(오타 방지). 필드 미가용은 엔진이 명확히 raise.
         by_name = {s.name: s for s in specs}
         missing = [n for n in cfg.alphas if n not in by_name]
         if missing:
-            raise ValueError(f"config 알파를 data/alphas 에서 못 찾음: {missing}")
+            raise ValueError(f"config 알파를 data/strategy/alphas 에서 못 찾음: {missing}")
         specs = [by_name[n] for n in cfg.alphas]
     else:
         # 자동선택 풀: 백테스트 불가 알파(필드 미가용)는 조용히 제외.
@@ -81,8 +81,8 @@ def _select_specs(cfg: PortfolioConfig, alphas_dir="data/alphas"):
     return specs
 
 
-def build_portfolio(cfg: PortfolioConfig, rebuild=False, alphas_dir="data/alphas"):
-    """PortfolioConfig -> {weights, net_pnl, metrics, stages, report, alpha_weights}.
+def build_portfolio(cfg: PortfolioSpec, rebuild=False, alphas_dir="data/strategy/alphas"):
+    """PortfolioSpec -> {weights, net_pnl, metrics, stages, report, alpha_weights}.
 
     Phase 3: 알파마다 bar(판단주기)가 다를 수 있다. 각 알파를 자기 bar 그리드에서
     계산하고, delay 를 그 bar 단위로 적용한 뒤(pos_bar = weights.shift(delay)), 결과를

@@ -3,10 +3,10 @@
 top-100 유니버스는 '월별' 개념(월말 리밸런싱 스냅샷)이라, 갱신도 월 1회가 맞다.
 이 체인은 스냅샷을 최신으로 만드는 3단계를 한 번에 묶는다:
 
-  1) symbol_universe : 거래 가능한 전체 심볼 목록 갱신(data/meta/symbol_list.json)
-  2) universe_probe  : 경량 일봉으로 rolling_score 계산(data/scan/*.parquet) — 자기 데이터
+  1) symbol_universe : 거래 가능한 전체 심볼 목록 갱신(data/strategy/meta/symbol_list.json)
+  2) universe_probe  : 경량 일봉으로 rolling_score 계산(data/market/scan/*.parquet) — 자기 데이터
                        를 직접 받으므로 선행 수집 불필요(gap-aware 증분)
-  3) universe_builder: 그 점수로 월별 top-100 스냅샷 재구성(data/universe_snapshots/)
+  3) universe_builder: 그 점수로 월별 top-100 스냅샷 재구성(data/market/universe/)
 
 라이브 daily 사이클(live_refresh)은 이 결과(최신 스냅샷)를 '읽기만' 한다 — 무거운
 재구성을 매일 돌리지 않는다. 월 1회 스케줄로 돌리거나, 스냅샷이 아예 없을 때

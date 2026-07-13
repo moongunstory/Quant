@@ -1,4 +1,4 @@
-"""report — 리스크 파이프라인의 stage별 성과 추적.
+﻿"""report — 리스크 파이프라인의 stage별 성과 추적.
 
 각 리스크 모듈을 적용한 '직후'의 북 순손익을 4지표로 요약한다:
 
@@ -128,7 +128,7 @@ def format_table(report) -> str:
 
 
 def _logs_dir() -> Path:
-    d = SETTINGS.data_dir.parent / "logs"
+    d = SETTINGS.logs_dir
     d.mkdir(parents=True, exist_ok=True)
     return d
 

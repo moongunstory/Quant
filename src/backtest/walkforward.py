@@ -1,4 +1,4 @@
-"""walkforward — '선택 과정 자체'를 미래참조 0으로 검증(과최적화 방어).
+﻿"""walkforward — '선택 과정 자체'를 미래참조 0으로 검증(과최적화 방어).
 
 동기(coin 이식, PLAN 2026-07-11 ③-2): 전 표본 fitness 랭킹은 selector 에게
 '나중에 평가받을 바로 그 미래'를 보여주기 때문에, 2020~21 에만 수익이 몰린
@@ -272,7 +272,7 @@ def run_walkforward_portfolio(series, pos_panels, master_panels, funding_events,
     부과하지 않는다(각 폴드를 독립적으로 warm-up). 폴드 내부 거래비용/펀딩은 엔진이
     정확히 반영. 반환 {oos_pnl, periods}(summarize/save_report 호환)."""
     from src.portfolio import combine as C
-    from src.risk import risk as RK
+    from src.portfolio import risk as RK
 
     sel_cfg = cfg.selection or {}
     sp = dict(sel_cfg.get("params", {}) or {})

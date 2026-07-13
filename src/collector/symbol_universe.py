@@ -3,7 +3,7 @@ symbol_universe.py
 
 전체 USDS-M 무기한 선물 심볼 목록을 확보한다.
 "현재 상장 중인 심볼"과 "과거에 상장됐다가 폐지된 심볼"을 합쳐서
-data/meta/symbol_list.json 하나로 저장한다.
+data/strategy/meta/symbol_list.json 하나로 저장한다.
 
 이 결과물은 시세 데이터가 아니라 메타데이터이기 때문에
 scan/universe_snapshots/processed 와는 별도 경로(meta)에 둔다.

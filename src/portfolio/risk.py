@@ -1,4 +1,4 @@
-"""risk — 결합된 포트폴리오 가중치에 씌우는 안전 오버레이.
+﻿"""risk — 결합된 포트폴리오 가중치에 씌우는 안전 오버레이.
 
 coin research/risk/risk.py 를 Quant 로 이식(Phase 1 스코프). config 구동
 파이프라인(RISK_REGISTRY): 어떤 모듈이/어떤 순서로/어떤 임계값으로 도는지는
