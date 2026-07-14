@@ -368,7 +368,7 @@ def run_telemetry_send(args):
     """최근 N일 텔레메트리를 zip 으로 묶어 텔레그램으로 전송(크론/람다 월간 스케줄용).
 
     예) 매월 1일 09:00 KST 자동 전송:
-        0 0 1 * *  cd /path/Quant && python main.py telemetry-send --days 30
+        0 0 1 * *  cd /path/Quant && python cli.py telemetry-send --days 30
     --no-send 를 주면 전송 없이 zip 파일만 생성(경로 출력)."""
     from src.live import ledger as LG
     if args.no_send:
