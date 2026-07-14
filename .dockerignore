@@ -1,0 +1,13 @@
+# 이미지에 안 들어가도 되는 것들 — 이미지 크기 줄이고 빌드 캐시 오염 방지.
+data/market
+data/runtime
+data/experiments
+lambda_package
+lambda_deployment.zip
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+tests

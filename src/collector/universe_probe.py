@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -242,8 +243,11 @@ def _compute_rolling_score(df: pd.DataFrame, rules: dict) -> pd.DataFrame:
     return df
 
 
-def probe_symbol(symbol: str, meta_entry: dict, rules: dict) -> Optional[Path]:
-    """단일 심볼 gap-aware 스캔. 새로 받아올 게 없으면 None 반환."""
+def probe_symbol(symbol: str, meta_entry: dict, rules: dict, deadline: Optional[float] = None) -> Optional[Path]:
+    """단일 심볼 gap-aware 스캔. 새로 받아올 게 없으면 None 반환.
+
+    deadline: time.monotonic() 기준 절대 마감 시각(초). None이면 무제한.
+    """
     last_collected = storage.get_last_collected(category="scan", symbol=symbol)
 
     if last_collected:
@@ -272,6 +276,9 @@ def probe_symbol(symbol: str, meta_entry: dict, rules: dict) -> Optional[Path]:
     last_processed_ym: Optional[str] = None
 
     for idx, ym in enumerate(months):
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.info(f"{symbol} {ym}: 시간 예산 초과, 여기서 멈추고 다음 실행에서 이어서")
+            break
         is_last_month = (idx == len(months) - 1)
         is_in_progress_month = (ym == current_ym)
         try:
@@ -333,8 +340,16 @@ def probe_symbol(symbol: str, meta_entry: dict, rules: dict) -> Optional[Path]:
     return path
 
 
-def run(max_workers: int = DEFAULT_MAX_WORKERS) -> None:
-    """bootstrap 이후 정기 실행되는 진입점. main.py에서 호출."""
+def run(max_workers: int = DEFAULT_MAX_WORKERS, deadline: Optional[float] = None) -> None:
+    """bootstrap 이후 정기 실행되는 진입점. main.py에서 호출.
+
+    deadline: time.monotonic() 기준 절대 마감 시각(초). None이면 무제한(기본값, CLI용).
+    Lambda 콜드스타트처럼 실행시간이 제한된 환경에서, 전체 유니버스(수백 심볼) x
+    수년치 히스토리 스캔이 타임아웃으로 강제 종료되는 걸 막기 위한 안전장치.
+    마감이 지나면 남은 심볼은 아예 시작하지 않고, 이미 시작한 심볼도 진행 중이던
+    달에서 멈춘다. manifest는 완료분만큼만 전진해 있으므로 다음 실행이 정확히
+    이어서 계속한다.
+    """
     storage.ensure_dirs()
     rules = load_rules()
 
@@ -351,24 +366,32 @@ def run(max_workers: int = DEFAULT_MAX_WORKERS) -> None:
 
     def _run_one(symbol: str, meta_entry: dict) -> Optional[Path]:
         nonlocal processed_count
-        result = probe_symbol(symbol, meta_entry, rules)
+        result = probe_symbol(symbol, meta_entry, rules, deadline=deadline)
         with progress_lock:
             processed_count += 1
             if processed_count % 50 == 0:
                 logger.info(f"진행 {processed_count}/{total}")
         return result
 
+    skipped_symbols = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_run_one, symbol, meta_entry): symbol
-            for symbol, meta_entry in symbols.items()
-        }
+        futures = {}
+        for symbol, meta_entry in symbols.items():
+            if deadline is not None and time.monotonic() >= deadline:
+                skipped_symbols += 1
+                continue
+            futures[executor.submit(_run_one, symbol, meta_entry)] = symbol
         for future in as_completed(futures):
             symbol = futures[future]
             result_path = future.result()
             if result_path is not None:
                 updated += 1
 
+    # archive_start_month 캐시 등 meta_entry 갱신분은 여기서만 저장된다.
+    # 마감 초과로 중간에 멈췄어도 이미 처리한 심볼의 캐시는 보존해서 다음 실행에 재활용한다.
     storage.save_json(symbol_list_payload, category="meta", filename="symbol_list")
+
+    if skipped_symbols:
+        logger.warning(f"시간 예산 초과로 {skipped_symbols}개 심볼은 이번 실행에서 아예 시작 못함(다음 실행에서 이어서 진행)")
 
     logger.info(f"완료. {total}개 중 {updated}개 심볼 갱신됨")

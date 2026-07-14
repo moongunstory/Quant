@@ -10,15 +10,29 @@
 compute_scope: 채택 알파 -> required_fields 합집합 -> 필요한 데이터셋 + top-100 심볼.
 run: 그 스코프로 full_collector.run(datasets=...) 호출.
 
-주의: full_collector.run 은 현재 심볼 단위 필터 인자가 없어(유니버스 전체 대상, gap-aware),
-데이터셋 축소(필드 스코핑)는 지금 바로 적용되고, top-100 심볼 축소는 스코프로 계산·기록만
-한다(full_collector 에 symbols= 인자를 추가하는 것이 다음 개선 — TODO 주석 참고).
+콜드스타트(데이터가 아예 없는 상태)도 이 모듈이 알아서 처리한다:
+  - top-100 스냅샷이 없으면 universe_maintenance 체인을 1회 자동 실행해 만든다.
+  - full_collector.run 은 심볼/데이터셋별로 이미 수집된 게 없으면(last_collected 없음)
+    아카이브가 실제로 시작하는 시점(또는 상장일)부터 오늘까지를 자동으로 전부 채운다.
+    즉 "필요한 만큼"이 아니라 "구할 수 있는 전체 히스토리"를 받아온다 — 알파들이
+    쓰는 rolling window가 며칠 안에서만 필요해도 다년치를 다 받는다는 뜻인데,
+    라이브에서 이렇게 하는 이유는 백테스트/재검증도 같은 원자료를 재사용하기 때문.
+
+deadline(실행시간 제한 안전장치): 위 콜드스타트 백필은 심볼 수 x 데이터셋 수 x
+연 단위 기간이라 시간이 오래 걸릴 수 있다. Lambda처럼 실행시간이 제한된 환경에서
+중간에 강제종료(SIGKILL)당하면 정리가 안 되므로, deadline(마감 시각)을 받아
+universe_maintenance/full_collector 아래까지 전달한다. 마감 전까지 처리한 만큼은
+manifest에 정상 기록되므로, 다음 스케줄 실행이 그 지점부터 자연스럽게 이어서
+계속한다(재수집 낭비 없음). CLI 등 시간제한 없는 환경에서는 deadline=None(기본값)
+으로 끝까지 돈다.
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
+from typing import Optional
 
 from src.backtest.panel import FIELD_SPECS
 from src.backtest.evaluate import required_fields
@@ -77,8 +91,11 @@ def compute_scope(cfg, alphas_dir="data/strategy/alphas"):
             "n_symbols": len(symbols)}
 
 
-def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10):
-    """스코프 계산 후 필요한 데이터셋만 최신화."""
+def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10, deadline: Optional[float] = None):
+    """스코프 계산 후 필요한 데이터셋만 최신화.
+
+    deadline: time.monotonic() 기준 절대 마감 시각(초). None이면 무제한.
+    """
     scope = compute_scope(cfg, alphas_dir=alphas_dir)
     log.info("live_refresh 스코프: 알파=%s 필드=%s 데이터셋=%s top100=%d종목",
              scope["alphas"], scope["fields"], scope["datasets"], scope["n_symbols"])
@@ -94,7 +111,7 @@ def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10):
     if not scope["symbols"]:
         log.warning("top-100 스냅샷 없음 → 유니버스 갱신 체인 자동 실행(cold-start 1회).")
         from src.collector import universe_maintenance
-        universe_maintenance.run()
+        universe_maintenance.run(deadline=deadline)
         scope = compute_scope(cfg, alphas_dir=alphas_dir)
         log.info("유니버스 갱신 후 스코프 재계산: top100=%d종목", scope["n_symbols"])
 
@@ -102,6 +119,10 @@ def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10):
         # 갱신 뒤에도 비면 데이터/설정 문제 → 전체 폴백(데이터 없는 것보단 낫다)하되 크게 경고.
         log.warning("갱신 후에도 스냅샷이 비어있음 → 전체 유니버스로 폴백. 데이터/설정 확인 필요.")
 
+    if deadline is not None and time.monotonic() >= deadline:
+        log.warning("유니버스 갱신 체인에서 이미 시간 예산을 다 써서 원자료 수집(full_collector)은 이번 실행에서 스킵. 다음 실행에서 이어서 진행.")
+        return scope
+
     full_collector.run(datasets=scope["datasets"], max_workers=max_workers,
-                       symbols=(scope["symbols"] or None))
+                       symbols=(scope["symbols"] or None), deadline=deadline)
     return scope

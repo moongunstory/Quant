@@ -15,18 +15,25 @@ live_refresh 가 cold-start 로 1회 자동 호출한다.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from src.collector import symbol_universe, universe_probe, universe_builder
 
 log = logging.getLogger("quant.universe_maintenance")
 
 
-def run() -> None:
-    """유니버스 갱신 3단계를 순서대로 실행(순서 의존: 각 단계가 앞 단계 산출물을 씀)."""
+def run(deadline: Optional[float] = None) -> None:
+    """유니버스 갱신 3단계를 순서대로 실행(순서 의존: 각 단계가 앞 단계 산출물을 씀).
+
+    deadline: time.monotonic() 기준 절대 마감 시각(초). None이면 무제한.
+    1단계(symbol_universe)와 3단계(universe_builder)는 네트워크 요청이 가볍거나
+    없어서 빠르다 — 시간이 오래 걸릴 수 있는 건 2단계(universe_probe, 전체 유니버스
+    x 수년치 히스토리 스캔)뿐이라 여기만 deadline을 전달한다.
+    """
     log.info("유니버스 갱신 1/3: 심볼 목록")
     symbol_universe.run()
     log.info("유니버스 갱신 2/3: 경량 스캔(rolling_score)")
-    universe_probe.run()
+    universe_probe.run(deadline=deadline)
     log.info("유니버스 갱신 3/3: 월별 top-100 스냅샷 재구성")
     universe_builder.run()
     log.info("유니버스 갱신 완료")

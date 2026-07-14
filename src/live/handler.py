@@ -21,8 +21,14 @@ log = logging.getLogger("quant.live.handler")
 
 
 def run_cycle(config_path, mode=None, today=None, refresh=False,
-              max_staleness_days=None, rebuild=False):
-    """한 사이클 실행. -> {target, orders} 요약 dict."""
+              max_staleness_days=None, rebuild=False, collector_deadline=None):
+    """한 사이클 실행. -> {target, orders} 요약 dict.
+
+    collector_deadline: time.monotonic() 기준 절대 마감 시각(초). refresh=True일 때
+    live_refresh(및 콜드스타트 시 그 아래 universe_maintenance/full_collector)로 전달됨.
+    Lambda처럼 실행시간이 제한된 환경에서 콜드스타트 백필이 타임아웃으로 강제종료되는 걸
+    막기 위한 안전장치. None(기본값)이면 무제한.
+    """
     today = today or datetime.now(timezone.utc).date()
 
     # [동적 설정 반영] data/runtime/live/config.json 설정이 존재하면 이를 우선하여 적용함
@@ -49,7 +55,7 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
         rebuild = True  # 데이터 최신화 시 패널 캐시 재빌드(rebuild)도 강제로 활성화합니다.
         try:
             from src.collector import live_refresh as LR
-            LR.run(cfg)
+            LR.run(cfg, deadline=collector_deadline)
         except Exception as e:
             log.warning("live_refresh 실패(기존 캐시로 진행): %s", e)
 

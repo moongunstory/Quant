@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
@@ -463,7 +464,14 @@ def collect_symbol_dataset(symbol: str, meta_entry: dict, rules: dict, dataset: 
 
 
 def run(datasets: Optional[list[str]] = None, max_workers: int = DEFAULT_MAX_WORKERS,
-        symbols: Optional[list[str]] = None) -> None:
+        symbols: Optional[list[str]] = None, deadline: Optional[float] = None) -> None:
+    """
+    deadline: time.monotonic() 기준 절대 마감 시각(초). None이면 무제한(CLI/백테스트 기본값).
+    Lambda 등 실행시간 제한 환경에서 콜드스타트(수년치 히스토리 백필)가 타임아웃으로
+    강제 종료(SIGKILL)되는 걸 막기 위한 안전장치 — 마감이 다가오면 남은 심볼/데이터셋을
+    깨끗하게 건너뛰고 리턴한다. manifest(last_collected)는 완료된 만큼만 전진해 있으므로
+    다음 실행이 정확히 이어서 계속한다(데이터 손실이나 재수집 낭비 없음).
+    """
     storage.ensure_dirs()
     rules = load_rules()
     symbol_meta = load_symbol_meta()
@@ -486,6 +494,9 @@ def run(datasets: Optional[list[str]] = None, max_workers: int = DEFAULT_MAX_WOR
     processed_count = 0
     updated = 0
 
+    def _deadline_hit() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     def _run_one(symbol: str) -> None:
         nonlocal processed_count, updated
         meta_entry = symbol_meta.get(symbol, {})
@@ -494,6 +505,9 @@ def run(datasets: Optional[list[str]] = None, max_workers: int = DEFAULT_MAX_WOR
 
         symbol_updated = False
         for dataset in datasets:
+            if _deadline_hit():
+                logger.info("%s: 시간 예산 초과 -> 남은 데이터셋(%s 포함) 스킵, 다음 실행에서 이어서", symbol, dataset)
+                break
             result_path = collect_symbol_dataset(symbol, meta_entry, rules, dataset)
             if result_path is not None:
                 symbol_updated = True
@@ -507,9 +521,18 @@ def run(datasets: Optional[list[str]] = None, max_workers: int = DEFAULT_MAX_WOR
 
     # 심볼 단위 병렬. 요청 속도는 전역 스로틀이 잡아주므로 여기선 워커 수만 관리한다.
     # manifest 갱신은 storage.update_last_collected 내부 락으로 보호된다.
+    skipped_symbols = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_run_one, symbol): symbol for symbol in sorted(targets)}
+        futures = {}
+        for symbol in sorted(targets):
+            if _deadline_hit():
+                skipped_symbols += 1
+                continue
+            futures[executor.submit(_run_one, symbol)] = symbol
         for future in as_completed(futures):
             future.result()  # 코드 버그성 예외는 숨기지 않고 그대로 전파
+
+    if skipped_symbols:
+        logger.warning("시간 예산 초과로 %d개 심볼은 이번 실행에서 아예 시작 못함(다음 실행에서 이어서 진행)", skipped_symbols)
 
     logger.info("완료. 대상 %d개 중 %d개 심볼 갱신됨 (datasets=%s)", total, updated, datasets)
