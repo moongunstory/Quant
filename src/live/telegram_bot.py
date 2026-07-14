@@ -44,6 +44,52 @@ def send_telegram_message(text: str, parse_mode: str = "HTML") -> dict | None:
         return None
 
 
+def send_telegram_document(file_path, caption: str = "") -> dict | None:
+    """urllib 만으로 텔레그램에 파일을 전송(multipart/form-data).
+
+    외부 라이브러리(requests 등) 없이 순수 표준 라이브러리로 sendDocument 를 호출해
+    Lambda 등 경량 환경에서도 그대로 동작한다. 텔레그램 문서 업로드 상한은 50MB.
+    """
+    if not TOKEN or not CHAT_ID:
+        log.warning("텔레그램 설정(TOKEN, CHAT_ID)이 유실되어 파일 전송을 건너뜁니다.")
+        return None
+
+    path = Path(file_path)
+    if not path.exists():
+        log.error(f"전송할 파일이 존재하지 않습니다: {file_path}")
+        return None
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
+    boundary = "----QuantEngineBoundary7MA4YWxkTrZu0gW"
+    file_content = path.read_bytes()
+
+    parts = []
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{CHAT_ID}\r\n".encode("utf-8")
+    )
+    if caption:
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode("utf-8")
+        )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{path.name}\"\r\n"
+        f"Content-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+    )
+    parts.append(file_content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    req = urllib.request.Request(url, data=body)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"텔레그램 파일 전송 실패: {e}")
+        return None
+
+
 def send_cycle_report(res: dict):
     """라이브 사이클 실행 요약을 보기 좋게 포맷하여 텔레그램으로 전송합니다."""
     t, o = res["target"], res["orders"]
@@ -154,14 +200,18 @@ def cmd_balance():
         try:
             from src.live.exchange import client
             cli = client.get_client("real")
-            resp = cli.rest_api.account()
+            # 주의: 예전엔 존재하지 않는 cli.rest_api.account() 를 호출하고 응답도
+            # dict.get() 으로 읽었다(실제론 pydantic 객체라 속성 접근 필요) -- 둘 다
+            # 항상 예외로 떨어져 "조회 실패"만 찍혔다. account_information_v3() +
+            # 속성 접근으로 수정.
+            resp = cli.rest_api.account_information_v3()
             data = resp.data() if hasattr(resp, "data") else resp
-            assets = data.get("assets", [])
+            assets = getattr(data, "assets", None) or []
             found = False
             for asset in assets:
-                asset_name = asset.get("asset")
-                wallet_balance = float(asset.get("walletBalance", 0.0))
-                unrealized_pnl = float(asset.get("unrealizedProfit", 0.0))
+                asset_name = getattr(asset, "asset", None)
+                wallet_balance = float(getattr(asset, "wallet_balance", 0.0) or 0.0)
+                unrealized_pnl = float(getattr(asset, "unrealized_profit", 0.0) or 0.0)
                 if wallet_balance > 0.001:
                     lines.append(f"• <b>{asset_name}</b> 잔고: {wallet_balance:.2f} (미실현 손익: {unrealized_pnl:+.2f})")
                     found = True
@@ -289,6 +339,68 @@ def cmd_risk():
         send_telegram_message(f"❌ 리스크 정보 파싱 실패: <code>{e}</code>")
 
 
+def send_telemetry_bundle(days: int = 30, caption: str | None = None) -> bool:
+    """최근 `days` 일 텔레메트리를 zip 으로 묶어 텔레그램으로 전송. 성공 여부 반환.
+
+    텔레그램 명령어(/텔레메트리)와 크론 자동전송(main.py telemetry-send)이 공유한다.
+    묶을 파일이 없으면 안내 메시지만 보내고 False."""
+    from src.live import ledger as LG
+    zip_path = LG.build_telemetry_bundle(days=days)
+    if zip_path is None:
+        send_telegram_message(f"ℹ️ 최근 {days}일간 쌓인 텔레메트리 파일이 없습니다.")
+        return False
+    size_kb = zip_path.stat().st_size / 1024
+    cap = caption or (f"📦 텔레메트리 번들 (최근 {days}일)\n"
+                      f"파일: {zip_path.name} ({size_kb:.1f} KB)\n"
+                      f"로컬에서 <code>python main.py attribution {zip_path.name}</code> 로 기여도 분석하세요.")
+    res = send_telegram_document(zip_path, caption=cap)
+    return bool(res and res.get("ok"))
+
+
+def cmd_telemetry(arg: str):
+    """/텔레메트리 [일수|날짜] — 텔레메트리 파일/번들을 전송.
+
+    • <code>/텔레메트리</code>           : 최근 30일 zip 번들
+    • <code>/텔레메트리 7</code>         : 최근 7일 zip 번들
+    • <code>/텔레메트리 2026-07-13</code>: 해당 날짜 단일 파일
+    """
+    from datetime import date as _date
+    from src.live import ledger as LG
+
+    arg = (arg or "").strip()
+
+    # 날짜 지정 → 단일 파일 전송
+    if arg and "-" in arg:
+        try:
+            day = _date.fromisoformat(arg)
+        except ValueError:
+            send_telegram_message("❌ 날짜 형식이 올바르지 않습니다. 예: <code>/텔레메트리 2026-07-13</code>")
+            return
+        path = LG.telemetry_path(day)
+        if not path.exists():
+            send_telegram_message(f"❌ <code>{arg}</code> 날짜의 텔레메트리 파일이 없습니다.")
+            return
+        send_telegram_message(f"📄 <code>{path.name}</code> 전송 중...")
+        res = send_telegram_document(path, caption=f"📄 텔레메트리 {arg}")
+        if not (res and res.get("ok")):
+            send_telegram_message("❌ 파일 전송에 실패했습니다. (토큰/네트워크 확인)")
+        return
+
+    # 일수 지정(기본 30일) → zip 번들 전송
+    days = 30
+    if arg:
+        try:
+            days = max(1, int(arg))
+        except ValueError:
+            send_telegram_message("❌ 일수는 숫자로 입력하세요. 예: <code>/텔레메트리 7</code>")
+            return
+
+    send_telegram_message(f"📦 최근 {days}일 텔레메트리를 묶어 전송합니다...")
+    ok = send_telemetry_bundle(days=days)
+    if not ok:
+        send_telegram_message("⚠️ 번들 전송을 완료하지 못했습니다. (파일 없음 또는 전송 실패)")
+
+
 def cmd_help():
     lines = [
         "<b>[Quant 라이브 텔레그램 봇 명령어 도움말]</b>",
@@ -300,6 +412,7 @@ def cmd_help():
         "• <code>/실행</code>: 당일 라이브 사이클 즉시 강제 수행 (데이터 갱신)",
         "• <code>/스냅샷</code>: 최신 월 스냅샷 정보 및 최종 재밸런싱 실행일 조회",
         "• <code>/리스크</code>: 현재 작동 중인 리스크 오버레이 모듈 상태 요약",
+        "• <code>/텔레메트리 [일수|날짜]</code>: 사이클 텔레메트리(기여도 분석용) 파일/번들 전송 (기본 30일 zip)",
         "• <code>/초기화</code>: 로컬 가상 포지션 초기화",
         "• <code>/도움말</code>: 봇 도움말 보기"
     ]
@@ -339,6 +452,8 @@ def handle_message(msg: dict):
         cmd_snapshot()
     elif cmd == "/리스크":
         cmd_risk()
+    elif cmd in ("/텔레메트리", "/로그파일"):
+        cmd_telemetry(arg)
     elif cmd in ("/도움말", "/help", "/start"):
         cmd_help()
 

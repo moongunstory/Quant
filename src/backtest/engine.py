@@ -87,16 +87,37 @@ def run(spec, panels, universe=None, funding_events=None):
                                funding_events=funding_events, spec=spec)
 
 
-def result_from_weights(weights, panels, delay=1, funding_events=None, spec=None):
+def result_from_weights(weights, panels, delay=1, funding_events=None, spec=None,
+                        execution=None):
     """이미 만들어진 가중치 패널(신호, 지연 전) -> EngineResult.
 
     포트폴리오 결합 후 combine/risk 를 거친 최종 가중치에 대해서도 동일한 손익
     회계(gross - 거래비용 + 8h펀딩)를 적용하려고 run() 에서 분리한 것.
-    spec 없이(포트폴리오) 호출 가능 — 메트릭 계산은 spec 을 안 쓴다."""
+    spec 없이(포트폴리오) 호출 가능 — 메트릭 계산은 spec 을 안 쓴다.
+
+    execution: 체결가 가정. None 이면 SETTINGS.execution("close" 기본).
+      "close"     positions_t 가 close_{t-1}→close_t 를 번다(결정=체결 종가, 약간 낙관적).
+      "next_open" positions_t 가 open_t→open_{t+1} 을 번다(종가 결정 후 '다음 봉 시가'
+                  체결 — 실전과 정합, 신뢰도↑). open 패널 필요. 미래참조 없음:
+                  positions_t 는 close_{t-1}까지 정보로 정해졌고 수익은 그 이후 실현.
+    """
     if "close" not in panels:
         raise KeyError("panels 에 'close' 가 있어야 수익률 계산 가능")
-    close = panels["close"].reindex_like(weights)
-    returns = close / close.shift(1) - 1.0
+
+    execution = execution or SETTINGS.execution
+    if execution == "next_open":
+        if "open" not in panels:
+            raise KeyError(
+                "execution='next_open' 은 'open' 패널이 필요 — 필드 로드에 'open' 을 "
+                "포함하라(QUANT_EXECUTION=next_open 시 자동 포함되도록 파이프라인 처리됨)"
+            )
+        op = panels["open"].reindex_like(weights)
+        returns = op.shift(-1) / op - 1.0   # open_t -> open_{t+1} (다음 봉 시가 체결)
+    elif execution == "close":
+        close = panels["close"].reindex_like(weights)
+        returns = close / close.shift(1) - 1.0
+    else:
+        raise ValueError(f"알 수 없는 execution {execution!r} (close|next_open)")
 
     positions = weights.shift(delay)  # 당일 체결 없음
 

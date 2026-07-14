@@ -7,8 +7,12 @@ target_weights.compute_target_weights() 가 오늘의 목표 가중치를 내면
           positions.json 에 {coin: weight} 로 저장. 즉시/완전 체결 가정(수수료·
           슬리피지는 이미 모든 백테스트 숫자에 반영돼 있으므로 페이퍼에선 생략).
   real  : 현재 포지션을 실제 거래소에서 읽고(trade/exchange.get_open_positions),
-          목표 가중치를 mark price + book_aum_usd 로 목표 수량으로 환산, LOT 반올림
-          후 시장가 전송. 같은 날 중복 전송을 막는 daily guard 포함.
+          목표 가중치를 mark price + 그 사이클에 조회한 실제 계좌 총자산(aum_usd,
+          exchange.get_account_equity) 으로 목표 수량으로 환산, LOT 반올림 후 시장가
+          전송. 같은 날 중복 전송을 막는 daily guard 포함. (SETTINGS.book_aum_usd 는
+          risk.py 의 백테스트/참여율 캡 계산에만 쓰이는 고정 가정치이고, 실거래 주문
+          수량 계산에는 더 이상 안 쓰임 -- 실계좌/테스트넷 잔고가 그 고정값과 안 맞아
+          증거금 부족(-2019)이 나던 문제 때문에 동적 조회로 바꿈.)
 
 FAIL-SAFE: target diagnostics.all_alphas_stale 이면 '청산 주문'을 만들지 않고
 명시적으로 SKIP (오늘 목표를 신뢰할 수 없으므로 현재 포지션을 그대로 둔다).
@@ -16,10 +20,13 @@ FAIL-SAFE: target diagnostics.all_alphas_stale 이면 '청산 주문'을 만들�
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from src.config.backtest_settings import SETTINGS
+
+log = logging.getLogger("quant.live.orders")
 
 POSITIONS_PATH_DEFAULT = SETTINGS.data_dir / "runtime" / "live" / "positions.json"
 DUST_THRESHOLD_DEFAULT = 0.001   # 이보다 작은 가중치 변화는 무시(부동소수/서브-lot 잡음)
@@ -56,8 +63,9 @@ def compute_orders(target_weights, current_weights, dust_threshold=DUST_THRESHOL
     return orders
 
 
-def _real_current_weights():
-    """실제 거래소 포지션 -> {coin: weight} (수량*마크가격 / book_aum_usd)."""
+def _real_current_weights(aum_usd):
+    """실제 거래소 포지션 -> {coin: weight} (수량*마크가격 / aum_usd).
+    aum_usd 는 그 사이클에서 조회한 실제 계좌 총자산(고정 book_aum_usd 아님)."""
     from src.live.exchange import exchange
     positions = exchange.get_open_positions()
     if not positions:
@@ -67,12 +75,16 @@ def _real_current_weights():
     for symbol, qty in positions.items():
         price = prices.get(symbol)
         if price:
-            out[symbol] = (qty * price) / SETTINGS.book_aum_usd
+            out[symbol] = (qty * price) / aum_usd
     return out
 
 
 def _already_sent_today(today) -> bool:
-    """daily guard: 오늘자 orders 기록이 real & not skipped 면 이미 전송된 것."""
+    """daily guard: 오늘자 orders 기록이 real & not skipped'이고, 그중 실제로 거래소에
+    전송 성공한 주문(exchange_result 존재)이 하나라도 있어야 '이미 전송됨'으로 본다.
+    전부 error(프리플라이트 실패/마크가격 없음 등)뿐이면 아무것도 안 나간 것이므로
+    재시도를 막지 않는다(예전엔 전부 실패해도 top-level skipped=False라 daily guard에
+    걸려 하루 종일 재시도 불가였음)."""
     p = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
     if not p.exists():
         return False
@@ -80,32 +92,57 @@ def _already_sent_today(today) -> bool:
         record = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return record.get("mode") == "real" and not record.get("skipped")
+    if record.get("mode") != "real" or record.get("skipped"):
+        return False
+    already = any(o.get("exchange_result") for o in record.get("orders", []))
+    log.info("_already_sent_today(%s): record.mode=%s record.skipped=%s -> %s",
+             today, record.get("mode"), record.get("skipped"), already)
+    return already
 
 
-def _send_real_orders(orders):
-    """각 주문 dict 에 exchange_result 또는 error 를 채운다."""
+def _send_real_orders(orders, aum_usd):
+    """각 주문 dict 에 exchange_result 또는 error 를 채운다.
+    aum_usd: 그 사이클에서 조회한 실제 계좌 총자산 -- 주문 수량 = delta * aum_usd / price."""
     from src.live.exchange import exchange
+
+    log.info("_send_real_orders 시작: %d건 %s (aum_usd=%.2f)",
+             len(orders), [o["coin"] for o in orders], aum_usd)
+
+    # 프리플라이트: 원웨이 모드 확인(헷지 모드면 전량 막음, fail-closed).
+    if SETTINGS.require_one_way_mode:
+        try:
+            exchange.assert_one_way_mode()
+        except Exception as exc:
+            log.exception("원웨이 모드 프리플라이트 실패")
+            for o in orders:
+                o["error"] = f"프리플라이트 실패(주문 미전송): {exc}"
+            return
+
     prices = exchange.get_mark_prices()
+    log.info("get_mark_prices 결과: %d개 심볼 (예: %s)",
+             len(prices), list(prices.items())[:3])
     for o in orders:
         symbol = o["coin"]
         price = prices.get(symbol)
         if not price:
             o["error"] = f"{symbol} mark price 없음 -- 미전송"
+            log.warning("%s: mark price 조회 실패 (prices dict 에 없음)", symbol)
             continue
-        raw_qty = (o["delta"] * SETTINGS.book_aum_usd) / price
+        raw_qty = (o["delta"] * aum_usd) / price
         try:
             exchange.set_leverage(symbol)
             qty = exchange.round_quantity(symbol, raw_qty)
             if qty == 0.0:
                 o["error"] = "반올림 수량 0 (minQty 미만) -- 미전송"
+                log.warning("%s: 반올림 후 수량 0 (raw_qty=%s)", symbol, raw_qty)
                 continue
             side = "BUY" if raw_qty > 0 else "SELL"
             result = exchange.place_market_order(symbol, side, abs(qty))
             o["exchange_result"] = {"status": getattr(result, "status", None),
                                     "sent_quantity": abs(qty)}
         except Exception as exc:
-            o["error"] = str(exc)
+            log.exception("%s 주문 처리 중 예외", symbol)
+            o["error"] = f"{type(exc).__name__}: {exc}"
 
 
 def portfolio_drift(target_weights, current_weights):
@@ -138,7 +175,16 @@ def generate_orders(target_record, positions_path=None, today=None,
                   "skip_reason": "실매매 주문 오늘 이미 전송됨(daily guard)",
                   "orders": [], "n_orders": 0}
     else:
-        current = (_real_current_weights() if mode == "real"
+        aum_usd = None
+        if mode == "real":
+            from src.live.exchange import exchange
+            try:
+                aum_usd = exchange.get_account_equity()
+            except Exception:
+                log.exception("실제 계좌 총자산 조회 실패 -- SETTINGS.book_aum_usd(%.2f)로 폴백",
+                              SETTINGS.book_aum_usd)
+                aum_usd = SETTINGS.book_aum_usd
+        current = (_real_current_weights(aum_usd) if mode == "real"
                    else load_positions(positions_path))
         target = target_record.get("weights", {})
         drift = portfolio_drift(target, current)
@@ -155,10 +201,11 @@ def generate_orders(target_record, positions_path=None, today=None,
             return record
         orders = compute_orders(target, current, dust_threshold=dust_threshold)
         if mode == "real" and orders:
-            _send_real_orders(orders)
+            _send_real_orders(orders, aum_usd)
         record = {"date": today.isoformat(), "mode": mode, "skipped": False,
                   "orders": orders, "n_orders": len(orders), "drift": drift,
                   "rebalance_band": rebalance_band,
+                  "aum_usd": aum_usd,
                   "target_weights": target, "previous_weights": current}
         if mode == "paper":
             save_positions(target, positions_path)  # 즉시·완전 체결 가정

@@ -65,6 +65,8 @@ def collect_alpha_series(alphas_dir=None, rebuild=False):
     out = {}
     for spec in specs:
         fields = spec_required_fields(spec.expression, spec.neutralization)
+        if SETTINGS.execution == "next_open":
+            fields = set(fields) | {"open"}   # 시가 체결 손익 계산용
         panels = P.load_panels_for_bar(fields, bar=spec.bar, rebuild=rebuild)
         close = panels["close"]
         universe = P.build_universe_mask(close.index, close.columns)
@@ -218,6 +220,8 @@ def collect_alpha_books(alphas_dir=None, rebuild=False, families=None):
     all_fields = set()
     for s in specs:
         all_fields |= spec_required_fields(s.expression, s.neutralization)
+    if SETTINGS.execution == "next_open":
+        all_fields |= {"open"}   # 시가 체결 손익 계산용
     master_panels = P.load_panels_for_bar(sorted(all_fields), bar=master_bar,
                                           rebuild=rebuild)
     mclose = master_panels["close"]
@@ -230,6 +234,9 @@ def collect_alpha_books(alphas_dir=None, rebuild=False, families=None):
     # to_master ffill 이 유니버스 이탈 코인의 stale 가중치를 끌고 가 마스크를 무효화하므로
     # (build_portfolio 와 동일 버그), to_master 직후 마스터 그리드 마스크를 다시 씌운다.
     master_universe = P.build_universe_mask(master_index, mclose.columns) > 0.5
+    # 상장폐지 등으로 가격 데이터가 끊긴 칸도 거래 불가 → 유니버스에서 제외
+    # (pipeline.build_portfolio 와 동일 수정 — 라이브/백테스트 정합).
+    master_universe &= mclose.notna()
 
     pos_panels, series = {}, {}
     for s in specs:

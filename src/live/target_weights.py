@@ -1,4 +1,4 @@
-﻿"""target_weights — 승인 포트폴리오 config -> 오늘의 목표 가중치 행.
+"""target_weights — 승인 포트폴리오 config -> 오늘의 목표 가중치 행.
 
 라이브 계층의 첫 조각. build_portfolio 를 그대로 재사용해 전체 히스토리로
 combine+risk 를 돌리고, 결과 가중치 패널의 '마지막 행'을 오늘의 목표로 삼는다
@@ -10,6 +10,7 @@ freshness 게이트를 먼저 통과: 데이터가 안 온(stale) 알파는 결�
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -17,7 +18,18 @@ from src.backtest.spec import load_all
 from src.portfolio import pipeline as PP
 from src.live import freshness as FR
 
+log = logging.getLogger("quant.live.target_weights")
+
 _DUST = 1e-6
+
+
+def _row_to_dict(panel):
+    """가중치 패널의 '마지막 행'을 {coin: weight} 로 (NaN/dust 제외). 없으면 {}."""
+    if panel is None or getattr(panel, "empty", True):
+        return {}
+    last = panel.iloc[-1]
+    return {c: float(w) for c, w in last.items()
+            if w == w and abs(float(w)) > _DUST}
 
 
 def _select_specs(cfg, alphas_dir="data/strategy/alphas"):
@@ -33,6 +45,36 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
     """cfg -> {date, weights:{coin:weight}, held_alphas, alpha_weights, diagnostics}."""
     today = today or datetime.now(timezone.utc).date()
     specs = _select_specs(cfg, alphas_dir=alphas_dir)
+
+    if rebuild:
+        from src.backtest import panel as P
+        from src.backtest.evaluate import spec_required_fields
+        from src.config.backtest_settings import SETTINGS
+
+        # 파이프라인이 항상 로드하는 필드까지 포함해야 증분 후 캐시가 전부 최신이 된다.
+        all_fields = {"close", "funding_rate", "quote_volume"}
+        if SETTINGS.execution == "next_open":
+            all_fields.add("open")   # 시가 체결 손익 계산용
+        for s in specs:
+            all_fields |= spec_required_fields(s.expression, s.neutralization)
+        all_fields &= set(P.FIELD_SPECS) | set(P.DERIVED)
+
+        log.info("패널 증분 업데이트 시작: %s", sorted(all_fields))
+        for f in sorted(all_fields):
+            try:
+                P.update_panel(f)
+            except Exception as e:
+                log.warning("패널 증분 업데이트 실패 %r (전체 재빌드로 폴백): %s", f, e)
+                P.load_panel(f, rebuild=True)
+        P.update_funding_events()
+
+        # 방금 캐시를 증분으로 최신화했으므로, 아래 build_portfolio 에 rebuild=True 를
+        # 그대로 넘기면 전체 재빌드(~5분)를 또 해서 증분 업데이트가 무의미해진다.
+        # 단, 증분 업데이트는 1d 패널만 다루므로 1d 외 bar 알파가 있으면 안전하게 유지.
+        if all(getattr(s, "bar", "1d") == "1d" for s in specs):
+            rebuild = False
+        else:
+            log.info("1d 외 bar 알파 존재 → 증분 캐시를 신뢰하지 않고 전체 재빌드 유지")
 
     g = FR.gate(specs, today=today, max_staleness_days=max_staleness_days)
     diagnostics = {"all_alphas_stale": g["all_stale"],
@@ -50,7 +92,9 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
     final = out["weights"]
     if final.empty:
         return {"date": today.isoformat(), "weights": {}, "held_alphas": fresh_names,
-                "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics, "day_returns": {}}
+                "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics,
+                "day_returns": {}, "pre_risk_weights": {}, "alpha_contributions": {},
+                "risk_stages": out.get("stages", [])}
 
     last_row = final.iloc[-1]
     weights = {c: float(w) for c, w in last_row.items()
@@ -64,6 +108,18 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
         last_ret = returns_df.iloc[-1]
         day_returns = {c: float(r) for c, r in last_ret.items() if r == r}
 
+    # ---- 텔레메트리(기여도 분석)용 상세 필드 ----
+    # pre_risk_weights: 리스크 오버레이 '적용 전' 결합북의 오늘 행. 최종 weights 와
+    # 비교하면 리스크 로직이 포지션을 얼마나 줄였는지(drag/benefit)를 역산할 수 있다.
+    pre_risk_weights = _row_to_dict(out.get("combined_weights"))
+    # alpha_contributions: 알파별 '결합북 내 기여분'의 오늘 행 (Σ = pre_risk_weights).
+    # 다음 사이클의 day_returns 와 내적하면 알파별 당일 손익 기여가 나온다.
+    alpha_contributions = {name: _row_to_dict(panel)
+                           for name, panel in (out.get("contributions") or {}).items()}
+
     return {"date": today.isoformat(), "weights": weights, "held_alphas": fresh_names,
             "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics,
-            "day_returns": day_returns}
+            "day_returns": day_returns,
+            "pre_risk_weights": pre_risk_weights,
+            "alpha_contributions": alpha_contributions,
+            "risk_stages": out.get("stages", [])}

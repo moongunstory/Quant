@@ -1,4 +1,4 @@
-﻿"""panel — Quant 원자료(심볼별 parquet)를 "date×coin" 표로 바꾼다.
+"""panel — Quant 원자료(심볼별 parquet)를 "date×coin" 표로 바꾼다.
 
 이 파일이 coin 과 Quant 의 가장 큰 차이다. coin 은 자체 ingest/core.panel 을 쓰지만,
 Quant 는 src/collector 가 심볼별로 시간단위 parquet 를 저장한다. 여기서 그걸 읽어
@@ -64,8 +64,11 @@ def _symbols_for(dataset: str):
     return sorted(p.stem for p in d.glob("*.parquet"))
 
 
-def _series_at(dataset, time_col, value_col, agg, symbol, offset):
-    """한 심볼의 parquet 를 읽어 offset(예 '1D','8h','1h') 시리즈로. 못 읽으면 None."""
+def _series_at(dataset, time_col, value_col, agg, symbol, offset, since=None):
+    """한 심볼의 parquet 를 읽어 offset(예 '1D','8h','1h') 시리즈로. 못 읽으면 None.
+
+    since: 이 타임스탬프 이후 데이터만 읽음(증분 업데이트용). None이면 전체 읽기.
+    """
     path = SETTINGS.processed_dir / dataset / f"{symbol}.parquet"
     try:
         df = pd.read_parquet(path, columns=[time_col, value_col])
@@ -75,8 +78,12 @@ def _series_at(dataset, time_col, value_col, agg, symbol, offset):
         return None
     t = pd.to_datetime(df[time_col], utc=True)
     s = pd.Series(df[value_col].to_numpy(), index=t).sort_index()
+    if since is not None:
+        s = s[s.index >= since]
     # 중복 타임스탬프 제거(metrics 에 중복 존재) 후 지정 주기로 집계
     s = s[~s.index.duplicated(keep="last")]
+    if s.empty:
+        return None
     out = s.resample(offset).agg(agg)
     out.name = symbol
     return out
@@ -192,6 +199,92 @@ def save_panel(field, panel):
     panel.to_parquet(panel_path(field))
 
 
+def update_panel(field) -> pd.DataFrame:
+    """캐시 패널에 새 데이터만 이어 붙이는 증분 업데이트.
+
+    캐시가 없으면 전체 빌드로 폴백. 캐시 마지막 날(last_date) 하루 전부터
+    다시 읽어 당일 미완성 봉이 있어도 정확히 이어 붙임.
+    전체 재빌드(~5분) 대신 수 초 만에 완료되므로 라이브 --refresh 에 최적.
+    """
+    # 파생 필드: 구성 필드 두 개를 각각 증분 갱신한 뒤 나눗셈만 다시 한다(수 초).
+    if field in DERIVED:
+        num_f, den_f = DERIVED[field]
+        num = update_panel(num_f)
+        den = update_panel(den_f).replace(0.0, pd.NA)
+        panel = (num / den).astype(float)
+        save_panel(field, panel)
+        return panel
+
+    path = panel_path(field)
+    if not path.exists():
+        log.info("[증분] %s 캐시 없음 → 전체 빌드", field)
+        panel = build_panel(field)
+        save_panel(field, panel)
+        return panel
+
+    cached = _read_cache(path)
+    if cached is None or cached.empty:
+        panel = build_panel(field)
+        save_panel(field, panel)
+        return panel
+
+    # 마지막 날 하루 전부터 다시 읽어 당일 미완성 봉을 덮어씀
+    last_date = cached.index.max()
+    since_ts = last_date - pd.Timedelta(days=1)  # 하루 전부터 재처리
+    since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts
+
+    if field not in FIELD_SPECS:
+        raise KeyError(f"알 수 없는 field {field!r}")
+    dataset, time_col, value_col, agg = FIELD_SPECS[field]
+    offset = "1D"
+
+    new_cols = {}    # 기존 심볼: since_ts 이후만
+    fresh_cols = {}  # 신규 편입 심볼: 캐시에 이력이 없으므로 '전체'를 읽어야 함
+    for sym in _symbols_for(dataset):
+        if sym in cached.columns:
+            s = _series_at(dataset, time_col, value_col, agg, sym, offset, since=since_ts)
+            if s is not None and s.notna().any():
+                new_cols[sym] = s
+        else:
+            # since 로 자르면 신규 심볼의 과거 이력이 영구 NaN 으로 남는다.
+            s = _series_at(dataset, time_col, value_col, agg, sym, offset)
+            if s is not None and s.notna().any():
+                fresh_cols[sym] = s
+
+    if not new_cols and not fresh_cols:
+        log.info("[증분] %s 신규 데이터 없음 → 캐시 그대로", field)
+        return cached
+
+    combined = cached
+    if new_cols:
+        new_panel = pd.DataFrame(new_cols).sort_index()
+        if new_panel.index.tzinfo is None:
+            new_panel.index = new_panel.index.tz_localize("UTC")
+        new_panel.index = new_panel.index.normalize()
+
+        # 기존 캐시에서 재처리 구간(since_ts 이후) 제거 후 신규 데이터 이어 붙임
+        cutoff = since_ts.normalize()
+        old_part = cached[cached.index < cutoff]
+        combined = pd.concat([old_part, new_panel], axis=0).sort_index()
+        all_cols = old_part.columns.union(new_panel.columns)
+        combined = combined.reindex(columns=all_cols)
+
+    if fresh_cols:
+        fresh_panel = pd.DataFrame(fresh_cols).sort_index()
+        if fresh_panel.index.tzinfo is None:
+            fresh_panel.index = fresh_panel.index.tz_localize("UTC")
+        fresh_panel.index = fresh_panel.index.normalize()
+        combined = combined.combine_first(fresh_panel)  # 인덱스/컬럼 합집합 병합
+        log.info("[증분] %s 신규 심볼 %d개 전체 이력 편입: %s",
+                 field, len(fresh_cols), sorted(fresh_cols))
+
+    log.info("[증분] %s: %d일 → %d일 (+%d행)", field,
+             len(cached), len(combined), len(combined) - len(cached))
+
+    save_panel(field, combined)
+    return combined
+
+
 def load_panel(field, rebuild=False):
     """캐시가 있으면 로드, 없거나 rebuild=True 면 새로 만들고 저장."""
     path = panel_path(field)
@@ -296,6 +389,57 @@ def build_funding_events() -> pd.DataFrame:
 
 def funding_events_path():
     return SETTINGS.panel_dir / "_funding_events.parquet"
+
+
+def update_funding_events() -> pd.DataFrame | None:
+    """펀딩 이벤트 패널을 증분 업데이트(라이브 --refresh 전용).
+
+    캐시 마지막 타임스탬프 이후 데이터만 읽어 이어 붙임.
+    캐시가 없으면 전체 빌드로 폴백.
+    """
+    path = funding_events_path()
+    if not path.exists():
+        return load_funding_events(rebuild=True)
+
+    cached = _read_cache(path)
+    if cached is None or cached.empty:
+        return load_funding_events(rebuild=True)
+
+    last_ts = cached.index.max()
+    since_ts = last_ts - pd.Timedelta(hours=8)  # 마지막 8h 봉부터 재처리
+    since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts
+
+    dataset, time_col, value_col = "fundingRate", "calc_time", "last_funding_rate"
+    new_cols = {}
+    for sym in _symbols_for(dataset):
+        path_sym = SETTINGS.processed_dir / dataset / f"{sym}.parquet"
+        try:
+            df = pd.read_parquet(path_sym, columns=[time_col, value_col])
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        t = pd.to_datetime(df[time_col], unit="ms", utc=True)
+        s = pd.Series(df[value_col].to_numpy(), index=t).sort_index()
+        s = s[s.index >= since_ts]
+        s = s[~s.index.duplicated(keep="last")]
+        if s.notna().any():
+            new_cols[sym] = s
+
+    if not new_cols:
+        log.info("[증분] funding_events 신규 데이터 없음 → 캐시 그대로")
+        return cached
+
+    new_panel = pd.DataFrame(new_cols).sort_index()
+    old_part = cached[cached.index < since_ts]
+    combined = pd.concat([old_part, new_panel], axis=0).sort_index()
+    all_cols = old_part.columns.union(new_panel.columns)
+    combined = combined.reindex(columns=all_cols)
+
+    log.info("[증분] funding_events: %d행 → %d행", len(cached), len(combined))
+    SETTINGS.panel_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(funding_events_path())
+    return combined
 
 
 def load_funding_events(rebuild=False):

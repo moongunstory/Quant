@@ -1,4 +1,8 @@
-﻿import argparse
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import argparse
 import logging
 
 import pandas as pd
@@ -59,6 +63,8 @@ def run_universe_refresh(args):
 def _run_one_backtest(spec, rebuild=False):
     """spec -> EngineResult (패널/유니버스 자동 로드)."""
     fields = spec_required_fields(spec.expression, spec.neutralization)
+    if SETTINGS.execution == "next_open":
+        fields = set(fields) | {"open"}   # 시가 체결 손익 계산용
     panels = P.load_panels_for_bar(fields, bar=spec.bar, rebuild=rebuild)
     close = panels["close"]
     universe = P.build_universe_mask(close.index, close.columns)
@@ -87,6 +93,9 @@ def _print_alpha_report(spec, result, m, validate=False, n_perm=500, save_curve=
     print(f"  sharpe        {m['sharpe']:+.3f}")
     print(f"  sharpe_recent {m.get('sharpe_recent', float('nan')):+.3f}  (최근 90일)")
     print(f"  sharpe_hl     {m.get('sharpe_hl', float('nan')):+.3f}  (반감기 90일 가중)")
+    print(f"  sortino       {m.get('sortino', float('nan')):+.3f}  (하방위험 대비)")
+    print(f"  calmar        {m.get('calmar', float('nan')):+.3f}  (연수익/최대낙폭)")
+    print(f"  win_rate      {m.get('win_rate', float('nan')):.3f}  (이익 난 날 비율, 참고용)")
     print(f"  ann_return    {m['ann_return']:+.4f}  (1단위 북 연환산)")
     print(f"  mdd           {m['mdd']:.4f}")
     print(f"  turnover      {m['turnover']:.3f}  (하루 평균)")
@@ -124,13 +133,17 @@ def _print_ranking(rows):
     """(name, metrics dict) 목록을 fitness 내림차순 랭킹 표로 출력."""
     rows = sorted(rows, key=lambda r: r[1]["fitness"], reverse=True)
     print(f"\n{'알파':22s} {'sharpe':>8s} {'s_rec90':>8s} {'s_hl':>7s} "
+          f"{'sortino':>8s} {'calmar':>7s} {'win%':>6s} "
           f"{'fitness':>8s} {'turnover':>9s} {'mdd':>7s} "
           f"{'ic_1d':>7s} {'ic_5d':>7s} {'ic_10d':>8s} {'ic_20d':>8s}")
-    print("-" * 108)
+    print("-" * 130)
     for name, m in rows:
         print(f"{name:22s} {m['sharpe']:+8.3f} "
               f"{m.get('sharpe_recent', float('nan')):+8.3f} "
               f"{m.get('sharpe_hl', float('nan')):+7.3f} "
+              f"{m.get('sortino', float('nan')):+8.3f} "
+              f"{m.get('calmar', float('nan')):+7.3f} "
+              f"{m.get('win_rate', float('nan')) * 100:6.1f} "
               f"{m['fitness']:+8.3f} "
               f"{m['turnover']:9.3f} {m['mdd']:7.4f} "
               f"{m.get('ic_1d', float('nan')):+7.4f} "
@@ -281,6 +294,9 @@ def run_portfolio(args):
     print(f"알파비중: " + ", ".join(f"{n}={w:.3f}" for n, w in out['alpha_weights'].items()))
     print("-" * 60)
     print(f"  sharpe        {m['sharpe']:+.3f}")
+    print(f"  sortino       {m.get('sortino', float('nan')):+.3f}")
+    print(f"  calmar        {m.get('calmar', float('nan')):+.3f}")
+    print(f"  win_rate      {m.get('win_rate', float('nan')):.3f}  (참고용)")
     print(f"  ann_return    {m['ann_return']:+.4f}")
     print(f"  mdd           {m['mdd']:.4f}")
     print(f"  vol(자산변동률) {m['vol']:.4f}")
@@ -346,6 +362,31 @@ def run_bot(args):
     """텔레그램 Polling 봇 구동."""
     from src.live import telegram_bot as TB
     TB.start_polling_bot()
+
+
+def run_telemetry_send(args):
+    """최근 N일 텔레메트리를 zip 으로 묶어 텔레그램으로 전송(크론/람다 월간 스케줄용).
+
+    예) 매월 1일 09:00 KST 자동 전송:
+        0 0 1 * *  cd /path/Quant && python main.py telemetry-send --days 30
+    --no-send 를 주면 전송 없이 zip 파일만 생성(경로 출력)."""
+    from src.live import ledger as LG
+    if args.no_send:
+        zip_path = LG.build_telemetry_bundle(days=args.days)
+        if zip_path is None:
+            print(f"묶을 텔레메트리 파일이 없습니다 (최근 {args.days}일).")
+        else:
+            print(f"번들 생성 완료(전송 안 함): {zip_path}")
+        return
+    from src.live import telegram_bot as TB
+    ok = TB.send_telemetry_bundle(days=args.days)
+    print("텔레메트리 번들 전송:", "성공" if ok else "실패/대상없음")
+
+
+def run_attribution(args):
+    """전송받은 텔레메트리(zip/폴더/json)로 알파·리스크 기여도를 로컬 분석."""
+    from src.live import attribution as AT
+    AT.run(args.source, out_dir=args.out_dir)
 
 
 
@@ -476,7 +517,8 @@ def main():
         "live", help="라이브 사이클(가상/실매매): freshness -> 목표가중 -> 주문 -> 원장",
     )
     live_parser.add_argument("--config", default="data/strategy/portfolio/config.json")
-    live_parser.add_argument("--mode", choices=["paper", "real"], default="paper")
+    live_parser.add_argument("--mode", choices=["paper", "real"], default=None,
+                             help="paper=가상매매(기본), real=실매매/테스트넷. 생략 시 data/runtime/live/config.json 따름")
     live_parser.add_argument("--refresh", action="store_true", help="사이클 전 데이터 최신화(top100×채택필드)")
     live_parser.add_argument("--rebuild", action="store_true", help="패널 캐시 재빌드")
     live_parser.add_argument("--max-staleness-days", type=int, default=None)
@@ -486,6 +528,26 @@ def main():
         "bot", help="라이브 텔레그램 Polling 봇 구동"
     )
     bot_parser.set_defaults(func=run_bot)
+
+    telemetry_send_parser = subparsers.add_parser(
+        "telemetry-send",
+        help="최근 N일 텔레메트리를 zip 으로 묶어 텔레그램 전송(크론/람다 월간 스케줄용)",
+    )
+    telemetry_send_parser.add_argument("--days", type=int, default=30,
+                                       help="묶을 기간(일). 기본 30")
+    telemetry_send_parser.add_argument("--no-send", action="store_true",
+                                       help="전송 없이 zip 파일만 생성")
+    telemetry_send_parser.set_defaults(func=run_telemetry_send)
+
+    attribution_parser = subparsers.add_parser(
+        "attribution",
+        help="전송받은 텔레메트리(zip/폴더)로 알파·리스크 기여도 로컬 분석",
+    )
+    attribution_parser.add_argument("source",
+                                    help="telemetry zip / 폴더 / 단일 json 경로")
+    attribution_parser.add_argument("--out-dir", default=".",
+                                    help="리포트 저장 폴더(기본: 현재 폴더)")
+    attribution_parser.set_defaults(func=run_attribution)
 
     args = parser.parse_args()
     args.func(args)

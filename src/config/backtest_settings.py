@@ -30,6 +30,17 @@ class Settings:
     # 코인은 365일 거래 -> 샤프 연율화에 252가 아니라 365 사용.
     trading_days_per_year: int = int(os.environ.get("QUANT_TRADING_DAYS", 365))
 
+    # 체결가 가정. 백테스트 손익을 어느 가격에 체결됐다고 볼지:
+    #  "close"     (기본) 신호를 만든 그 봉 종가에 즉시 체결됐다고 가정(close→close).
+    #              구현이 단순하고 슬리피지로 보정하지만, '결정=체결' 순간이 겹쳐 약간
+    #              낙관적.
+    #  "next_open" 신호는 봉 종가에 나지만 체결은 '다음 봉 시가'라고 가정(open→open).
+    #              실전(종가 보고 다음 봉에 주문)과 더 정합적 = 백테스트 신뢰도↑.
+    #              대신 종가→다음시가 갭 움직임은 포기. open 패널이 필요.
+    # 기본은 "close"라 기존 숫자/동작은 그대로. 신뢰도 점검 땐 QUANT_EXECUTION=next_open
+    # 으로 돌려 두 결과를 비교한다(엣지가 체결가정에 얼마나 의존하는지 측정).
+    execution: str = os.environ.get("QUANT_EXECUTION", "close")
+
     # ---- 포트폴리오 결합(selection) ----
     # low_correlation 선택 시 이미 뽑은 알파와 |net-PnL 상관|이 이 값 이상이면
     # 제외(greedy dedup). coin D-값 이식(기본 0.5).
@@ -54,6 +65,15 @@ class Settings:
     # participation_cap: 코인 자기 ADV 대비 최대 보유비율 + 가정 북 규모(USD).
     participation_rate: float = _f("QUANT_PARTICIPATION_RATE", 0.05)
     book_aum_usd: float = _f("QUANT_BOOK_AUM_USD", 100_000.0)
+
+    # ---- 실매매(real) 거래소 안전설정 ----
+    # 진입 전 각 심볼 레버리지를 이 배수로 강제 설정한다. 기본 1배(현물처럼, 청산위험
+    # 최소). 거래소의 심볼 기본값(10~20배 등)으로 잘못 진입하는 사고를 막는다.
+    # 이 값 설정에 실패하면 그 심볼 주문은 전송하지 않는다(fail-closed, orders.py).
+    target_leverage: int = int(os.environ.get("QUANT_TARGET_LEVERAGE", 1))
+    # 실매매 전 계정이 '원웨이 모드'인지 확인하고, 헷지 모드면 주문을 막을지 여부.
+    # 이 프로그램의 주문은 positionSide="BOTH"(원웨이 전용)라 헷지 모드에선 실패한다.
+    require_one_way_mode: bool = os.environ.get("QUANT_REQUIRE_ONE_WAY", "1") not in ("0", "false", "False")
 
     @property
     def processed_dir(self) -> Path:

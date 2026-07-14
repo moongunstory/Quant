@@ -20,7 +20,7 @@ from src.live.state import load_live_state
 log = logging.getLogger("quant.live.handler")
 
 
-def run_cycle(config_path, mode="paper", today=None, refresh=False,
+def run_cycle(config_path, mode=None, today=None, refresh=False,
               max_staleness_days=None, rebuild=False):
     """한 사이클 실행. -> {target, orders} 요약 dict."""
     today = today or datetime.now(timezone.utc).date()
@@ -39,11 +39,14 @@ def run_cycle(config_path, mode="paper", today=None, refresh=False,
             "orders": {"date": today.isoformat(), "mode": mode, "skipped": True, "skip_reason": "봇 비활성화 상태"}
         }
 
-    # 설정 파일에 지정된 모드("paper" 또는 "real")로 실행 모드를 결정함
-    mode = live_cfg.get("mode", mode)
+    # [동적 설정 반영] CLI에서 --mode를 명시한 경우 CLI 우선, 생략 시 config.json 따름.
+    # config.json 기본값도 없으면 최종 fallback으로 "paper" 사용.
+    if mode is None:
+        mode = live_cfg.get("mode", "paper")
     cfg = load_portfolio_spec(config_path)
 
     if refresh:
+        rebuild = True  # 데이터 최신화 시 패널 캐시 재빌드(rebuild)도 강제로 활성화합니다.
         try:
             from src.collector import live_refresh as LR
             LR.run(cfg)
@@ -82,6 +85,15 @@ def run_cycle(config_path, mode="paper", today=None, refresh=False,
     if mode == "real" and not order_record.get("skipped"):
         OR.save_positions(target.get("weights", {}))
 
+    # [플라이트 레코더] 이 사이클의 상세 스냅샷을 telemetry-<date>.json 으로 남긴다.
+    # prev_positions = paper_current(주문 전 보유) — 당일 day_returns 를 실제로 번 포지션.
+    # 실패해도 사이클 자체는 계속(감사용 보조 기록이므로 fail-open).
+    try:
+        LG.record_telemetry(target, order_record, prev_positions=paper_current,
+                            today=today, mode=mode)
+    except Exception as e:
+        log.warning("텔레메트리 스냅샷 기록 실패(사이클은 계속): %s", e)
+
     res = {"target": target, "orders": order_record}
 
     # [텔레그램 보고서 자동 발송] 사이클 결과를 유저에게 전달합니다.
@@ -98,7 +110,7 @@ def _print_summary(res):
     t, o = res["target"], res["orders"]
     print(f"\n=== 라이브 사이클 {t['date']} (mode={o['mode']}) ===")
     if t["diagnostics"].get("all_alphas_stale"):
-        print("  ⚠ 모든 알파 STALE -> 목표 미생성, 포지션 유지(SKIP)")
+        print("  [경고] 모든 알파 STALE -> 목표 미생성, 포지션 유지(SKIP)")
         print("  stale:", t["diagnostics"].get("stale_alphas"))
         return
     if t["diagnostics"].get("stale_alphas"):

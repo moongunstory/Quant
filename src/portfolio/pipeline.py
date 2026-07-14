@@ -113,6 +113,8 @@ def build_portfolio(cfg: PortfolioSpec, rebuild=False, alphas_dir="data/strategy
     all_fields = set()
     for s in specs:
         all_fields |= spec_required_fields(s.expression, s.neutralization)
+    if SETTINGS.execution == "next_open":
+        all_fields |= {"open"}   # 시가 체결 손익 계산용(마스터+per-alpha 공통 로드)
     master_panels = P.load_panels_for_bar(sorted(all_fields), bar=master_bar, rebuild=rebuild)
     mclose = master_panels["close"]
     master_index = mclose.index
@@ -123,6 +125,10 @@ def build_portfolio(cfg: PortfolioSpec, rebuild=False, alphas_dir="data/strategy
     # (523 union 전체로 번짐), to_master 직후 이 마스크를 다시 씌워 이탈 코인을 0 으로 눌러준다.
     # 월별 멤버십이라 유니버스 안에 남아있는 코인의 '다음 리밸런싱까지 보유'는 안 깨진다.
     master_universe = P.build_universe_mask(master_index, mclose.columns) > 0.5
+    # 스냅샷 멤버라도 상장폐지 등으로 가격 데이터가 끊긴 날부터는 거래 자체가 불가능하다.
+    # close 가 NaN 인 칸을 유니버스에서 제외해, 죽은 코인의 stale 가중치가 다음 월간
+    # 스냅샷까지 목표 포지션에 남는 것(2026-07-13: 상폐 14종목이 목표에 잔존)을 막는다.
+    master_universe &= mclose.notna()
 
     pos_panels = {}   # 알파별 '마스터 그리드 보유 포지션'(delay 반영)
     net_pnls = {}     # 알파별 마스터 그리드 순손익(가중 계산용)
@@ -210,6 +216,12 @@ def build_portfolio(cfg: PortfolioSpec, rebuild=False, alphas_dir="data/strategy
         "net_pnl": final.net_pnl,
         "metrics": m,
         "alpha_weights": alpha_w,
+        # 텔레메트리/기여도분석용: 리스크 오버레이 '적용 전' 결합북(combined)과
+        # 알파별 기여분(contributions, Σ=combined). 최종 final_weights 와 비교하면
+        # 리스크 로직이 포지션을 얼마나 줄였는지(drag/benefit)를 역산할 수 있다.
+        # 백테스트 수치엔 영향 없음 — 내부에서 이미 계산된 값을 반환에 얹기만 함.
+        "combined_weights": combined,
+        "contributions": contributions,
         "directional_on": directional_on,
         "directional_alphas": [n for n in directional_alphas if n in pos_panels],
         "stages": risk_out["stages"],

@@ -5,6 +5,9 @@
 
 쉬운 설명:
   sharpe       위험대비수익. 높을수록 변동 대비 꾸준한 이익.
+  sortino      샤프의 하방위험 버전(손실 변동만 벌줌). 높을수록 좋음.
+  calmar       연수익/최대낙폭. 얕게 물리며 벌수록 높음.
+  win_rate     이익 난 날 비율(참고용 — 선택 기준엔 미반영).
   ann_return   1단위 북의 연 환산 평균수익(비용 차감 후).
   turnover     하루에 북의 몇 %를 갈아엎는지(높을수록 수수료 많음).
   mdd          자본곡선 최대낙폭(작을수록 안전).
@@ -92,6 +95,41 @@ def realized_vol(net_pnl):
     return float(sd * np.sqrt(_ann()))
 
 
+def sortino(net_pnl, target=0.0):
+    """소르티노 — 샤프와 같은데 분모를 '손실 쪽 변동성'만으로 잰다. 이익으로 출렁이는
+    것은 벌주지 않고, 아래로 떨어지는 위험만 본다. 하방편차 = sqrt(평균(min(r-target,0)^2)).
+    하방 변동이 없으면(전부 이익) 0 반환(무한대 방지)."""
+    r = pd.Series(net_pnl).dropna()
+    if len(r) < 2:
+        return 0.0
+    downside = np.minimum(r.values - target, 0.0)
+    dd = float(np.sqrt(np.mean(downside ** 2)))
+    if dd == 0 or np.isnan(dd):
+        return 0.0
+    return float((r.mean() - target) / dd * np.sqrt(_ann()))
+
+
+def calmar(net_pnl):
+    """칼마 — 연환산수익 ÷ 최대낙폭(MDD). '얼마나 아프게(깊게 물리며) 벌었나'.
+    같은 수익이라도 낙폭이 얕을수록 높다. MDD가 0이면 0 반환."""
+    ar = ann_return(net_pnl)
+    mdd = max_drawdown(net_pnl)
+    if mdd <= 0 or np.isnan(mdd):
+        return 0.0
+    return float(ar / mdd)
+
+
+def win_rate(net_pnl):
+    """승률 — 이익 난 날 비율(손익 0인 날은 분모에서 제외). 참고 지표로만 쓴다:
+    승률이 높다고 좋은 전략은 아니다(가끔 크게 터지면 승률 높아도 손실). fitness/선택
+    기준에는 넣지 않는다."""
+    r = pd.Series(net_pnl).dropna()
+    r = r[r != 0.0]
+    if r.empty:
+        return 0.0
+    return float((r > 0).mean())
+
+
 def avg_turnover(turnover):
     r = pd.Series(turnover).dropna()
     return float(r.mean()) if not r.empty else 0.0
@@ -148,6 +186,9 @@ def compute(result):
         "sharpe": s,
         "sharpe_recent": recent_sharpe(result.net_pnl),      # 최근 90일
         "sharpe_hl": halflife_weighted_sharpe(result.net_pnl),  # 반감기 90일 가중
+        "sortino": sortino(result.net_pnl),                  # 하방위험 대비 수익
+        "calmar": calmar(result.net_pnl),                    # 연수익/최대낙폭
+        "win_rate": win_rate(result.net_pnl),                # 이익 난 날 비율(참고용)
         "fitness": fitness(s, ar, to),
         "ic":     ic_mean,
         "ic_1d":  horizon_ics[1],
