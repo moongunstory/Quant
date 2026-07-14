@@ -31,7 +31,12 @@ def mark_to_market(weights, day_returns, today=None):
     if p.exists():
         lines = [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
         if lines:
-            prev_equity = float(json.loads(lines[-1]).get("equity", 0.0))
+            last = json.loads(lines[-1])
+            # 같은 날 두 번 실행(수동 + 스케줄)해도 하루 손익이 이중으로 쌓이지 않게,
+            # 오늘 이미 기록이 있으면 기존 값을 그대로 반환(중복 append 방지).
+            if last.get("date") == today.isoformat():
+                return float(last.get("day_pnl", 0.0)), float(last.get("equity", 0.0))
+            prev_equity = float(last.get("equity", 0.0))
     equity = prev_equity + day_pnl
 
     p.parent.mkdir(parents=True, exist_ok=True)

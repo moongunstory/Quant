@@ -135,3 +135,55 @@ def build_telemetry_bundle(days=30, today=None, telemetry_dir=None, out_dir=None
         for p in files:
             zf.write(p, arcname=p.name)
     return zip_path
+
+
+# ---------------------------------------------------------------- 보존기간(retention)
+def _file_day(path: Path, prefix: str):
+    """파일명에서 날짜 추출(prefix-YYYY-MM-DD.*). 못 읽으면 None(=삭제 안 함)."""
+    stem = path.stem
+    raw = stem[len(prefix):] if stem.startswith(prefix) else None
+    try:
+        return date.fromisoformat(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def prune_old(days=90, today=None):
+    """`days` 일보다 오래된 날짜별 기록 파일 삭제. 반환: 삭제한 파일 수.
+
+    대상(전부 하루 한 개씩 생기는 파일들):
+      - logs/live-<date>.jsonl               (이벤트 로그)
+      - runtime/live/orders_<date>.json      (주문 기록)
+      - runtime/live/telemetry/telemetry-<date>.json (텔레메트리 스냅샷)
+      - runtime/live/telemetry/bundles/*.zip (텔레그램 전송용 임시 zip — 전부 삭제 대상 후보)
+
+    paper_equity.jsonl / positions.json 은 '누적 상태'라서 건드리지 않는다.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=int(days))
+    live_dir = SETTINGS.data_dir / "runtime" / "live"
+    targets = [
+        (SETTINGS.logs_dir, "live-????-??-??.jsonl", "live-"),
+        (live_dir, "orders_????-??-??.json", "orders_"),
+        (Path(TELEMETRY_DIR), "telemetry-????-??-??.json", "telemetry-"),
+        (Path(TELEMETRY_DIR) / "bundles", "telemetry-bundle-*_????-??-??.zip", None),
+    ]
+    removed = 0
+    for d, pattern, prefix in targets:
+        if not d.exists():
+            continue
+        for p in d.glob(pattern):
+            if prefix is not None:
+                day = _file_day(p, prefix)
+            else:  # bundle: 이름 끝의 종료일 기준
+                try:
+                    day = date.fromisoformat(p.stem.rsplit("_", 1)[-1])
+                except ValueError:
+                    day = None
+            if day is not None and day < cutoff:
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed

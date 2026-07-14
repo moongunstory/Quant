@@ -82,8 +82,16 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
 
     # mode == "real" 일 때도 로컬 가상 포지션을 target 가중치로 갱신하여 다음 사이클의 PnL 계산에 반영되게 합니다.
     # mode == "paper" 일 때는 OR.generate_orders 내부에서 자동으로 save_positions를 수행하므로 생략합니다.
+    # 단, 실전송에 성공한 주문이 하나도 없으면(프리플라이트 실패 등) 갱신하지 않는다 —
+    # 실제로는 아무것도 안 움직였는데 그림자 장부만 '다 체결됨'이 되어 PnL 추적이 어긋나는 것 방지.
+    # (주문이 아예 0건 = 이미 목표와 일치 상태라면 갱신해도 무방하므로 갱신.)
     if mode == "real" and not order_record.get("skipped"):
-        OR.save_positions(target.get("weights", {}))
+        sent_orders = order_record.get("orders", [])
+        any_sent = any(o.get("exchange_result") for o in sent_orders)
+        if any_sent or not sent_orders:
+            OR.save_positions(target.get("weights", {}))
+        else:
+            log.warning("실전송 성공 주문 0건 -- 그림자 포지션(positions.json) 갱신 보류")
 
     # [플라이트 레코더] 이 사이클의 상세 스냅샷을 telemetry-<date>.json 으로 남긴다.
     # prev_positions = paper_current(주문 전 보유) — 당일 day_returns 를 실제로 번 포지션.
@@ -95,6 +103,15 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
         log.warning("텔레메트리 스냅샷 기록 실패(사이클은 계속): %s", e)
 
     res = {"target": target, "orders": order_record}
+
+    # [보존기간] 90일 지난 날짜별 기록(이벤트로그/주문기록/텔레메트리/번들zip)을 정리해
+    # 로그가 무한히 쌓이지 않게 한다. 실패해도 사이클은 계속(fail-open).
+    try:
+        n = LG.prune_old(days=90, today=today)
+        if n:
+            log.info("오래된 기록 %d개 정리(90일 초과)", n)
+    except Exception as e:
+        log.warning("오래된 기록 정리 실패(사이클은 계속): %s", e)
 
     # [텔레그램 보고서 자동 발송] 사이클 결과를 유저에게 전달합니다.
     try:

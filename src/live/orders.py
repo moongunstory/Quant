@@ -47,19 +47,28 @@ def save_positions(weights, path=None):
 
 
 def compute_orders(target_weights, current_weights, dust_threshold=DUST_THRESHOLD_DEFAULT):
-    """target/current: {coin: weight}. -> [{coin,current_weight,target_weight,delta,side}]
-    (|delta|>dust 인 코인만, |delta| 내림차순 = 큰 이동 먼저)."""
+    """target/current: {coin: weight}. -> [{coin,current_weight,target_weight,delta,side,close}]
+
+    - |delta|>dust 인 코인만. 단 '목표 0 인데 보유 중'(close=True)인 코인은 dust 미만이어도
+      포함해 완전 청산한다(예전엔 dust 미만 잔여 포지션이 영원히 안 닫혀 실계좌에 쌓임).
+    - 정렬: 노출을 '줄이는' 주문(청산/축소) 먼저 -> 증거금을 확보한 뒤 신규/증액 주문.
+      (증거금이 빠듯할 때 매수가 먼저 나가면 -2019 증거금 부족이 날 수 있음.)
+      같은 그룹 안에서는 |delta| 큰 순."""
     coins = set(target_weights) | set(current_weights)
     orders = []
     for c in sorted(coins):
         cur = float(current_weights.get(c, 0.0))
         tgt = float(target_weights.get(c, 0.0))
         delta = tgt - cur
-        if abs(delta) < dust_threshold:
+        is_close = tgt == 0.0 and cur != 0.0
+        if abs(delta) < dust_threshold and not is_close:
             continue
         orders.append({"coin": c, "current_weight": cur, "target_weight": tgt,
-                       "delta": delta, "side": "buy" if delta > 0 else "sell"})
-    orders.sort(key=lambda o: -abs(o["delta"]))
+                       "delta": delta, "side": "buy" if delta > 0 else "sell",
+                       "close": is_close})
+    # 노출 축소(|target| < |current|) 주문 먼저(False < True), 그 안에서 |delta| 큰 순.
+    orders.sort(key=lambda o: (abs(o["target_weight"]) >= abs(o["current_weight"]),
+                               -abs(o["delta"])))
     return orders
 
 
@@ -121,8 +130,35 @@ def _send_real_orders(orders, aum_usd):
     prices = exchange.get_mark_prices()
     log.info("get_mark_prices 결과: %d개 심볼 (예: %s)",
              len(prices), list(prices.items())[:3])
+
+    # 청산(close=True) 주문은 '실제 보유 수량'을 그대로 닫는다(reduce_only).
+    # weight 기반 delta 환산·LOT 반올림을 거치면 잔여 수량이 남을 수 있기 때문.
+    open_positions = {}
+    if any(o.get("close") for o in orders):
+        try:
+            open_positions = exchange.get_open_positions()
+        except Exception:
+            log.exception("청산용 포지션 조회 실패 -- close 주문은 개별 에러 처리됨")
+
     for o in orders:
         symbol = o["coin"]
+        if o.get("close"):
+            pos_qty = float(open_positions.get(symbol, 0.0))
+            if pos_qty == 0.0:
+                o["error"] = "청산 대상인데 거래소 포지션 없음 -- 미전송"
+                log.warning("%s: 청산 주문인데 실제 포지션 0", symbol)
+                continue
+            try:
+                side = "SELL" if pos_qty > 0 else "BUY"
+                result = exchange.place_market_order(symbol, side, abs(pos_qty),
+                                                     reduce_only=True)
+                o["exchange_result"] = {"status": getattr(result, "status", None),
+                                        "sent_quantity": abs(pos_qty),
+                                        "reduce_only": True}
+            except Exception as exc:
+                log.exception("%s 청산 주문 처리 중 예외", symbol)
+                o["error"] = f"{type(exc).__name__}: {exc}"
+            continue
         price = prices.get(symbol)
         if not price:
             o["error"] = f"{symbol} mark price 없음 -- 미전송"
@@ -143,6 +179,25 @@ def _send_real_orders(orders, aum_usd):
         except Exception as exc:
             log.exception("%s 주문 처리 중 예외", symbol)
             o["error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _write_order_record(record, today):
+    """orders_<date>.json 저장.
+
+    보호 로직: 오늘 이미 '실전송 성공' 기록이 있는데 새 record 에는 성공 전송이 없으면
+    (daily guard skip, all_alphas_stale skip, 페이퍼 기록 등) 덮어쓰지 않는다.
+    예전엔 guard 의 skip 기록이 원본 전송 기록을 덮어써서, 다음 실행 때
+    _already_sent_today 가 skip 기록을 보고 '안 보냈다'고 판단 -> 주문 재전송되는
+    (잠김<->풀림 반복) 버그가 있었다."""
+    out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
+    new_has_sent = any(o.get("exchange_result") for o in record.get("orders", []))
+    if not new_has_sent and _already_sent_today(today):
+        log.info("orders_%s.json 에 실전송 성공 기록 존재 -- 새 기록(전송 없음)으로 덮어쓰지 않음",
+                 today.isoformat())
+        return out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path
 
 
 def portfolio_drift(target_weights, current_weights):
@@ -180,10 +235,15 @@ def generate_orders(target_record, positions_path=None, today=None,
             from src.live.exchange import exchange
             try:
                 aum_usd = exchange.get_account_equity()
-            except Exception:
-                log.exception("실제 계좌 총자산 조회 실패 -- SETTINGS.book_aum_usd(%.2f)로 폴백",
-                              SETTINGS.book_aum_usd)
-                aum_usd = SETTINGS.book_aum_usd
+            except Exception as exc:
+                # fail-closed: 실제 계좌 크기를 모르면 주문 수량을 계산할 수 없다.
+                # (예전엔 고정 가정치 book_aum_usd 로 폴백 -> 실계좌보다 크면 과대 주문 위험)
+                log.exception("실제 계좌 총자산 조회 실패 -- fail-closed, 이번 사이클 주문 보류")
+                record = {"date": today.isoformat(), "mode": mode, "skipped": True,
+                          "skip_reason": f"계좌 총자산 조회 실패(fail-closed, 주문 미전송): {exc}",
+                          "orders": [], "n_orders": 0}
+                _write_order_record(record, today)
+                return record
         current = (_real_current_weights(aum_usd) if mode == "real"
                    else load_positions(positions_path))
         target = target_record.get("weights", {})
@@ -195,9 +255,7 @@ def generate_orders(target_record, positions_path=None, today=None,
                                       "-- 아직 충분히 다르지 않음, 리밸런싱 보류(포지션 유지)"),
                       "orders": [], "n_orders": 0, "drift": drift,
                       "rebalance_band": rebalance_band}
-            out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+            _write_order_record(record, today)
             return record
         orders = compute_orders(target, current, dust_threshold=dust_threshold)
         if mode == "real" and orders:
@@ -210,7 +268,5 @@ def generate_orders(target_record, positions_path=None, today=None,
         if mode == "paper":
             save_positions(target, positions_path)  # 즉시·완전 체결 가정
 
-    out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_order_record(record, today)
     return record

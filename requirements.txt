@@ -1,1 +1,9 @@
-pip install python-binance python-dotenv binance-sdk-derivatives-trading-usds-futures
+# 실행에 필요한 외부 패키지 (표준 라이브러리는 제외)
+# 설치: pip install -r requirements.txt
+pandas
+numpy
+pyarrow                                       # parquet 파일 읽기/쓰기 엔진 (pandas가 내부에서 사용)
+requests                                      # 바이낸스 아카이브/REST 수집, 텔레그램 전송
+python-dotenv                                 # .env 파일 로드
+binance-sdk-derivatives-trading-usds-futures  # 바이낸스 USDS 선물 주문/계좌 SDK
+matplotlib                                    # (선택) 기여도 분석 그래프 PNG — 없어도 라이브 사이클은 동작
