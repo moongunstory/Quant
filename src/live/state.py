@@ -8,8 +8,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# 모든 데이터 파일은 data 폴더 하위에 위치하게 함
-CONFIG_PATH = Path("data/runtime/live/config.json")
+from src.config.backtest_settings import SETTINGS
+
+# 모든 데이터 파일은 data 폴더 하위에 위치하게 함.
+# SETTINGS.data_dir(=환경변수 QUANT_DATA_DIR, 기본 "data")를 따라가므로 Lambda(/tmp)에서도
+# 쓰기 가능한 위치를 가리킨다. 로컬에서는 기존과 동일하게 data/runtime/live/config.json.
+CONFIG_PATH = SETTINGS.data_dir / "runtime" / "live" / "config.json"
 
 
 def load_live_state() -> dict:

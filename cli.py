@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
+import json
 import logging
 
 import pandas as pd
@@ -364,6 +365,35 @@ def run_bot(args):
     TB.start_polling_bot()
 
 
+def run_set_webhook(args):
+    """텔레그램 웹훅 등록/해제/조회 (Lambda Function URL 연동).
+
+    예)
+      python cli.py set-webhook --url https://<id>.lambda-url.<region>.on.aws/
+      python cli.py set-webhook --delete
+      python cli.py set-webhook --info
+    --secret 생략 시 .env 의 TELEGRAM_WEBHOOK_SECRET 를 사용한다(Lambda 도 같은 값이어야 함).
+    """
+    from src.live import telegram_bot as TB
+
+    if args.info:
+        print(json.dumps(TB.get_webhook_info(), indent=2, ensure_ascii=False))
+        return
+    if args.delete:
+        print(json.dumps(TB.delete_webhook(), indent=2, ensure_ascii=False))
+        return
+    if not args.url:
+        print("등록하려면 --url 을 주세요. (해제는 --delete, 상태확인은 --info)")
+        return
+
+    secret = args.secret or os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    if not secret:
+        print("⚠️  TELEGRAM_WEBHOOK_SECRET 이 없습니다. 위장 요청 차단을 위해 .env 에 설정하거나"
+              " --secret 로 넘기는 것을 강력히 권장합니다(Lambda 환경변수와 동일 값).")
+    res = TB.set_webhook(args.url, secret=secret)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+
+
 def run_telemetry_send(args):
     """최근 N일 텔레메트리를 zip 으로 묶어 텔레그램으로 전송(크론/람다 월간 스케줄용).
 
@@ -528,6 +558,17 @@ def main():
         "bot", help="라이브 텔레그램 Polling 봇 구동"
     )
     bot_parser.set_defaults(func=run_bot)
+
+    set_webhook_parser = subparsers.add_parser(
+        "set-webhook", help="텔레그램 웹훅 등록/해제/조회 (Lambda Function URL 연동)"
+    )
+    set_webhook_parser.add_argument("--url", default=None,
+                                    help="Lambda Function URL (예: https://<id>.lambda-url.<region>.on.aws/)")
+    set_webhook_parser.add_argument("--secret", default=None,
+                                    help="비밀토큰. 생략 시 .env 의 TELEGRAM_WEBHOOK_SECRET 사용")
+    set_webhook_parser.add_argument("--delete", action="store_true", help="웹훅 해제(폴링으로 복귀)")
+    set_webhook_parser.add_argument("--info", action="store_true", help="현재 웹훅 상태 조회")
+    set_webhook_parser.set_defaults(func=run_set_webhook)
 
     telemetry_send_parser = subparsers.add_parser(
         "telemetry-send",

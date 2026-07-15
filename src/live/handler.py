@@ -99,6 +99,16 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
         else:
             log.warning("실전송 성공 주문 0건 -- 그림자 포지션(positions.json) 갱신 보류")
 
+    # [실시간 손익용 진입가 스냅샷] 이번 사이클에 실제로 리밸런싱이 일어났으면(주문 SKIP 이 아니면)
+    # 그 시점의 마크가격을 코인별로 저장한다. 텔레그램 /잔고 가 나중에 '현재가 vs 진입가'로
+    # 실시간 가상 손익을 계산하는 근거다. 마크가격 조회 실패해도 사이클은 계속(fail-open).
+    if not order_record.get("skipped"):
+        try:
+            from src.live import live_pnl as LP
+            LP.snapshot_entry_prices(target.get("weights", {}), mode=mode, today=today)
+        except Exception as e:
+            log.warning("진입가 스냅샷 실패(사이클은 계속): %s", e)
+
     # [플라이트 레코더] 이 사이클의 상세 스냅샷을 telemetry-<date>.json 으로 남긴다.
     # prev_positions = paper_current(주문 전 보유) — 당일 day_returns 를 실제로 번 포지션.
     # 실패해도 사이클 자체는 계속(감사용 보조 기록이므로 fail-open).

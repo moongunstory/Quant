@@ -16,12 +16,16 @@ from pathlib import Path
 
 from src.live.state import load_live_state, save_live_state
 from src.live import orders as OR
+from src.config.backtest_settings import SETTINGS
 
 log = logging.getLogger("quant.live.telegram_bot")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or ALLOWED_CHAT_ID
+# 웹훅 위장 요청 차단용 비밀 토큰. 텔레그램이 setWebhook 시 등록한 값을 매 요청 헤더
+# X-Telegram-Bot-Api-Secret-Token 에 실어 보낸다. lambda_handler 가 이 값과 대조한다.
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
 
 def send_telegram_message(text: str, parse_mode: str = "HTML") -> dict | None:
@@ -132,7 +136,7 @@ def cmd_status():
 
     # 마지막 실행일 체크
     last_run = "기록 없음"
-    equity_file = Path("data/runtime/live/paper_equity.jsonl")
+    equity_file = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
     if equity_file.exists():
         eq_lines = [l for l in equity_file.read_text(encoding="utf-8").splitlines() if l.strip()]
         if eq_lines:
@@ -178,7 +182,7 @@ def cmd_balance():
     # 가상 자산 로드
     equity = 0.0
     day_pnl = 0.0
-    equity_file = Path("data/runtime/live/paper_equity.jsonl")
+    equity_file = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
     if equity_file.exists():
         eq_lines = [l for l in equity_file.read_text(encoding="utf-8").splitlines() if l.strip()]
         if eq_lines:
@@ -189,12 +193,32 @@ def cmd_balance():
             except Exception:
                 pass
 
+    cfg = load_live_state()
+
     lines = []
     lines.append("<b>[자산 현황]</b>")
-    lines.append(f"• 누적 가상 수익률(PnL): {equity:+.6f}")
-    lines.append(f"• 당일 가상 손익: {day_pnl:+.6f}")
 
-    cfg = load_live_state()
+    # 실시간 가상 손익: 리밸런싱 시점 진입가 vs 현재 마크가격으로 지금 이 순간 손익을 계산.
+    # 진입가 스냅샷/현재가가 없으면 저장된 일일 값으로 자동 폴백.
+    live = None
+    try:
+        from src.live import live_pnl as LP
+        live = LP.compute_live_pnl(cfg["mode"])
+    except Exception as e:
+        log.warning("실시간 가상 손익 계산 실패(저장값으로 폴백): %s", e)
+        live = None
+
+    if live and live.get("ok"):
+        lines.append(f"• 실시간 가상 자산: <b>{live['live_equity']:+.6f}</b>")
+        lines.append(f"   └ 기준(마지막 종가): {live['base_equity']:+.6f}")
+        lines.append(f"   └ 리밸런싱 이후 실시간 변동: {live['intraday_return']:+.6f}")
+        lines.append(f"   └ 현재가 반영: {live['n_priced']}/{live['n_total']}종목 (진입 기준일 {live.get('as_of')})")
+    else:
+        lines.append(f"• 누적 가상 수익률(PnL): {equity:+.6f}")
+        lines.append(f"• 당일 가상 손익: {day_pnl:+.6f}")
+        if live and live.get("reason"):
+            lines.append(f"   └ <i>실시간 계산 불가({live['reason']}) — 저장값 표시</i>")
+
     if cfg["mode"] == "real":
         lines.append("\n<b>[실제 거래소 잔고 (바이낸스 데모)]</b>")
         try:
@@ -266,6 +290,24 @@ def cmd_run():
         send_telegram_message(f"❌ 즉시 실행 중 에러 발생: <code>{e}</code>")
 
 
+def cmd_run_deferred():
+    """웹훅용 /실행: 무거운 사이클을 지금 동기 실행하지 않고 '접수'만 안내한다.
+
+    /실행 은 데이터 수집+주문까지 수 분이 걸린다. 텔레그램 웹훅은 몇 초 안에 응답하지 않으면
+    같은 명령을 재시도해 사이클이 중복 실행될 수 있다. 그래서 웹훅에서는 즉시 안내만 보내고,
+    무거운 실행은 예약된 자동 사이클(EventBridge 크론)에 맡긴다.
+    (향후 개선: Lambda 를 async 로 self-invoke 해 실제 즉시 실행을 붙일 수 있다.)"""
+    cfg = load_live_state()
+    if not cfg["enabled"]:
+        send_telegram_message("⚠️ 봇이 중단 상태(disabled)입니다. 먼저 <code>/토글</code>로 활성화해 주세요.")
+        return
+    send_telegram_message(
+        "⚡ <b>/실행 접수</b>\n"
+        "무거운 데이터 수집·주문은 예약된 자동 사이클에서 처리됩니다.\n"
+        "지금 당장 강제로 돌리려면 로컬에서 <code>python main.py</code> 라이브 실행을 사용하세요."
+    )
+
+
 def cmd_clear():
     try:
         OR.save_positions({})
@@ -275,7 +317,7 @@ def cmd_clear():
 
 
 def cmd_snapshot():
-    snap_dir = Path("data/market/universe")
+    snap_dir = SETTINGS.data_dir / "market" / "universe"
     if not snap_dir.exists():
         send_telegram_message("❌ universe_snapshots 폴더가 존재하지 않습니다.")
         return
@@ -419,20 +461,35 @@ def cmd_help():
     send_telegram_message("\n".join(lines))
 
 
-def handle_message(msg: dict):
-    """단일 메시지에 대해 권한 필터를 적용하여 한글 명령어를 분기 처리합니다."""
+# 상태(config.json/positions.json 등)를 '변경'하는 명령. 웹훅에서 처리 후 R2 로 다시
+# 업로드(sync_up)해야 다음 크론이 옛 상태로 덮어쓰지 않는다.
+MUTATING_COMMANDS = {"/모드", "/토글", "/초기화"}
+
+
+def parse_command(msg: dict) -> tuple[str, str]:
+    """메시지에서 (cmd, arg) 를 추출. 명령이 아니면 ("", "").
+    lambda_handler 가 명령별로 어떤 데이터를 R2 에서 받을지 결정할 때도 쓴다."""
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/"):
+        return "", ""
+    parts = text.split(maxsplit=1)
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+def handle_message(msg: dict, webhook: bool = False) -> bool:
+    """단일 메시지에 권한 필터를 적용해 한글 명령어를 분기 처리한다.
+
+    webhook=True: /실행 을 동기 실행하지 않고 접수 안내만 보낸다(cmd_run_deferred).
+    반환값: 상태를 변경했으면 True(웹훅이 sync_up 하도록). 아니면 False.
+    """
     chat_id = str(msg.get("chat", {}).get("id", ""))
     if chat_id != ALLOWED_CHAT_ID:
         log.warning(f"허용되지 않은 사용자 차단 (Chat ID: {chat_id})")
-        return
+        return False
 
-    text = msg.get("text", "").strip()
-    if not text.startswith("/"):
-        return
-
-    parts = text.split(maxsplit=1)
-    cmd = parts[0]
-    arg = parts[1] if len(parts) > 1 else ""
+    cmd, arg = parse_command(msg)
+    if not cmd:
+        return False
 
     if cmd == "/상태":
         cmd_status()
@@ -445,7 +502,7 @@ def handle_message(msg: dict):
     elif cmd == "/토글":
         cmd_toggle()
     elif cmd == "/실행":
-        cmd_run()
+        cmd_run_deferred() if webhook else cmd_run()
     elif cmd == "/초기화":
         cmd_clear()
     elif cmd == "/스냅샷":
@@ -456,6 +513,62 @@ def handle_message(msg: dict):
         cmd_telemetry(arg)
     elif cmd in ("/도움말", "/help", "/start"):
         cmd_help()
+
+    return cmd in MUTATING_COMMANDS
+
+
+def set_webhook(url: str, secret: str | None = None) -> dict | None:
+    """텔레그램에 웹훅 URL 을 등록한다(setWebhook).
+
+    url    : Lambda Function URL (예: https://xxxx.lambda-url.ap-northeast-2.on.aws/)
+    secret : 등록할 비밀 토큰(미지정 시 env TELEGRAM_WEBHOOK_SECRET). 이후 텔레그램이
+             매 요청 헤더에 실어 보내므로 lambda 가 위장 요청을 걸러낼 수 있다.
+    등록 후에는 getUpdates(폴링)와 동시 사용이 불가하다(둘 중 하나만).
+    """
+    if not TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN 이 없어 웹훅을 등록할 수 없습니다.")
+        return None
+    secret = secret or WEBHOOK_SECRET
+    payload = {"url": url, "drop_pending_updates": "true"}
+    if secret:
+        payload["secret_token"] = secret
+    api = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    try:
+        req = urllib.request.Request(api, data=data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"setWebhook 실패: {e}")
+        return None
+
+
+def delete_webhook() -> dict | None:
+    """웹훅 등록을 해제한다(다시 폴링으로 돌아갈 때 사용)."""
+    if not TOKEN:
+        return None
+    api = f"https://api.telegram.org/bot{TOKEN}/deleteWebhook"
+    data = urllib.parse.urlencode({"drop_pending_updates": "true"}).encode("utf-8")
+    try:
+        req = urllib.request.Request(api, data=data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"deleteWebhook 실패: {e}")
+        return None
+
+
+def get_webhook_info() -> dict | None:
+    """현재 웹훅 등록 상태 조회(getWebhookInfo). 디버깅용."""
+    if not TOKEN:
+        return None
+    api = f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo"
+    try:
+        with urllib.request.urlopen(api, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"getWebhookInfo 실패: {e}")
+        return None
 
 
 def start_polling_bot():

@@ -9,9 +9,15 @@ DATA_ROOT는 프로젝트 루트 기준 상대경로다.
 여기서 절대경로를 주입하는 방식을 나중에 고려해야 한다.
 """
 
+import os
 from pathlib import Path
 
-DATA_ROOT = Path("data")
+# DATA_ROOT는 기본값이 프로젝트 루트 기준 상대경로 "data" 지만,
+# 환경변수 QUANT_DATA_DIR 로 덮어쓸 수 있다. (backtest_settings.Settings.data_dir 와 동일한 변수)
+# Lambda 처럼 파일시스템이 /tmp 빼고 읽기전용인 환경에서는 QUANT_DATA_DIR=/tmp/quant-data
+# 로 지정해, 수집기(full_collector/live_refresh)의 저장 경로도 쓰기 가능한 위치로 옮긴다.
+# 로컬에서는 이 변수를 안 주므로 기존과 동일하게 "data" 를 쓴다.
+DATA_ROOT = Path(os.environ.get("QUANT_DATA_DIR", "data"))
 
 # ── 디렉토리 구조 ────────────────────────────────────────────────────────────
 #
