@@ -4,9 +4,10 @@
 # 컨테이너 이미지는 10GB까지 허용되어 여유가 훨씬 크다.
 FROM public.ecr.aws/lambda/python:3.11
 
-# 의존성 설치 (matplotlib 등 실제로 안 쓰는 건 requirements.txt에서 이미 제외됨)
+# 의존성 설치. pip 를 먼저 최신화해야 contourpy 등에서 소스빌드 대신 미리 만든
+# 휠(wheel)을 정확히 골라온다(옛 pip 는 sdist 를 받아 g++ 없어서 빌드 실패).
 COPY requirements.txt ${LAMBDA_TASK_ROOT}
-RUN pip install -r requirements.txt --no-cache-dir
+RUN pip install --upgrade pip && pip install -r requirements.txt --no-cache-dir
 
 # 코드 복사.
 # 주의: src 폴더는 통째로 복사해야 한다 — src/backtest 안의 panel.py/spec.py를

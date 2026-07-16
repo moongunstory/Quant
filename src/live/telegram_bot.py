@@ -94,8 +94,78 @@ def send_telegram_document(file_path, caption: str = "") -> dict | None:
         return None
 
 
+def send_telegram_photo(file_path, caption: str = "") -> dict | None:
+    """urllib 만으로 텔레그램에 이미지를 전송(sendPhoto, multipart/form-data).
+
+    send_telegram_document 과 같은 방식이지만 name="photo" 로 보내 채팅창에 '사진'으로
+    바로 뜨게 한다(문서 첨부가 아니라). caption 은 HTML 파싱. 실패 시 None."""
+    if not TOKEN or not CHAT_ID:
+        log.warning("텔레그램 설정(TOKEN, CHAT_ID)이 유실되어 사진 전송을 건너뜁니다.")
+        return None
+
+    path = Path(file_path)
+    if not path.exists():
+        log.error(f"전송할 이미지가 존재하지 않습니다: {file_path}")
+        return None
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    boundary = "----QuantEngineBoundary7MA4YWxkTrZu0gW"
+    file_content = path.read_bytes()
+
+    parts = []
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{CHAT_ID}\r\n".encode("utf-8")
+    )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n".encode("utf-8")
+    )
+    if caption:
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode("utf-8")
+        )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"{path.name}\"\r\n"
+        f"Content-Type: image/png\r\n\r\n".encode("utf-8")
+    )
+    parts.append(file_content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    req = urllib.request.Request(url, data=body)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"텔레그램 사진 전송 실패: {e}")
+        return None
+
+
 def send_cycle_report(res: dict):
-    """라이브 사이클 실행 요약을 보기 좋게 포맷하여 텔레그램으로 전송합니다."""
+    """라이브 사이클 실행 요약을 보기 좋게 포맷하여 텔레그램으로 전송합니다.
+
+    1순위: 대시보드 PNG 를 사진으로 전송(한눈에 보는 그림).
+    실패하면 기존 텍스트 요약으로 폴백(fail-open) — 어떤 경우에도 최소 한 번은 보고가 간다."""
+    try:
+        from src.live import dashboard as DB
+        png = DB.render_cycle_dashboard(res)
+        if png is not None:
+            t, o = res["target"], res["orders"]
+            cap = (f"<b>{t.get('date','')} 라이브 사이클 완료</b> · "
+                   f"모드 <code>{o.get('mode','?')}</code>")
+            resp = send_telegram_photo(png, caption=cap)
+            if resp is not None:
+                return  # 사진 전송 성공 — 텍스트 중복 발송 안 함
+        log.warning("대시보드 전송 실패 — 텍스트 요약으로 폴백")
+    except Exception as e:
+        log.warning("대시보드 경로 실패(텍스트로 폴백): %s", e)
+
+    _send_cycle_report_text(res)
+
+
+def _send_cycle_report_text(res: dict):
+    """기존 텍스트 요약(폴백용)."""
     t, o = res["target"], res["orders"]
     lines = []
     lines.append(f"<b>=== 라이브 사이클 실행 완료 ({t['date']}) ===</b>")
@@ -124,35 +194,52 @@ def send_cycle_report(res: dict):
 
 # ---- 명령어 핸들러 구현 ----
 
+def _mode_kr(mode: str) -> str:
+    """실매매 모드를 초보자용 설명으로."""
+    return {
+        "paper": "모의투자 (실제 돈 안 씀)",
+        "testnet": "테스트넷 (연습 계좌)",
+        "live": "실거래 (실제 돈)",
+    }.get(mode, mode)
+
+
+def _weight_line(coin: str, w: float, rank=None) -> str:
+    """비중(-0.022)을 초보자용 '숏 SIREN 2.2%' 한 줄로."""
+    name = coin.replace("USDT", "")
+    side = "🟢롱" if w > 0 else "🔴숏"
+    head = f"{rank}. " if rank is not None else "• "
+    return f"{head}{side} <code>{name}</code>  {abs(w) * 100:.1f}%"
+
+
 def cmd_status():
     cfg = load_live_state()
     pos = OR.load_positions()
 
     lines = []
-    lines.append("<b>[봇 상태 정보]</b>")
-    lines.append(f"• 작동 상태: <b>{'🟢 작동 중' if cfg['enabled'] else '🔴 중단됨'}</b>")
-    lines.append(f"• 실매매 모드: <code>{cfg['mode']}</code>")
-    lines.append(f"• 포트폴리오 설정: <code>{cfg['config_path']}</code>")
+    lines.append("<b>[봇 상태]</b>")
+    lines.append(f"• 지금 작동: <b>{'🟢 켜짐 (매일 자동 매매)' if cfg['enabled'] else '🔴 꺼짐 (매매 안 함)'}</b>")
+    lines.append(f"• 매매 방식: <b>{_mode_kr(cfg['mode'])}</b>")
 
     # 마지막 실행일 체크
-    last_run = "기록 없음"
+    last_run = "아직 없음"
     equity_file = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
     if equity_file.exists():
         eq_lines = [l for l in equity_file.read_text(encoding="utf-8").splitlines() if l.strip()]
         if eq_lines:
             try:
-                last_run = json.loads(eq_lines[-1]).get("date", "기록 없음")
+                last_run = json.loads(eq_lines[-1]).get("date", "아직 없음")
             except Exception:
                 pass
-    lines.append(f"• 마지막 실행일: <code>{last_run}</code>")
+    lines.append(f"• 마지막으로 매매한 날: <code>{last_run}</code>")
 
     # 포지션 요약
-    lines.append(f"\n• 현재 가상 포지션 수: <b>{len(pos)}종목</b>")
+    lines.append(f"\n• 지금 들고 있는 종목: <b>{len(pos)}개</b>")
     if pos:
         sorted_pos = sorted(pos.items(), key=lambda x: -abs(x[1]))
-        lines.append("<b>[상위 5개 포지션]</b>")
+        lines.append("가장 크게 베팅한 5개:")
         for coin, weight in sorted_pos[:5]:
-            lines.append(f"  • <code>{coin}</code>: {weight:+.4f}")
+            lines.append(_weight_line(coin, weight))
+        lines.append("\n<i>전체 목록은 /포지션 · 손익은 /잔고</i>")
 
     send_telegram_message("\n".join(lines))
 
@@ -160,13 +247,19 @@ def cmd_status():
 def cmd_positions():
     pos = OR.load_positions()
     if not pos:
-        send_telegram_message("현재 보유 중인 포지션이 없습니다.")
+        send_telegram_message("지금은 들고 있는 종목이 없어요.")
         return
 
-    lines = ["<b>[보유 포지션 전체 목록]</b>"]
     sorted_pos = sorted(pos.items(), key=lambda x: -abs(x[1]))
+    n_long = sum(1 for w in pos.values() if w > 0)
+    n_short = len(pos) - n_long
+    lines = [
+        f"<b>[내 포지션 전체 {len(pos)}개]</b>",
+        f"🟢롱(오를 것에 베팅) {n_long}개 · 🔴숏(내릴 것에 베팅) {n_short}개",
+        "옆 숫자 = 전체 자본에서 그 종목이 차지하는 비중\n",
+    ]
     for i, (coin, w) in enumerate(sorted_pos):
-        lines.append(f"{i+1}. <code>{coin}</code>: {w:+.4f}")
+        lines.append(_weight_line(coin, w, rank=i + 1))
 
     chunk = []
     for line in lines:
@@ -194,9 +287,15 @@ def cmd_balance():
                 pass
 
     cfg = load_live_state()
+    book = float(getattr(SETTINGS, "book_aum_usd", 100_000.0))
+
+    def money(rate: float) -> str:
+        """수익률(0.0027)을 '≈ +$270' 처럼 시작자본 대비 금액으로."""
+        return f"≈ {rate * book:+,.0f}$"
 
     lines = []
-    lines.append("<b>[자산 현황]</b>")
+    lines.append("<b>[내 자산 현황]</b>")
+    lines.append(f"<i>시작 자본 ${book:,.0f} 기준 · 모의투자</i>\n")
 
     # 실시간 가상 손익: 리밸런싱 시점 진입가 vs 현재 마크가격으로 지금 이 순간 손익을 계산.
     # 진입가 스냅샷/현재가가 없으면 저장된 일일 값으로 자동 폴백.
@@ -209,15 +308,18 @@ def cmd_balance():
         live = None
 
     if live and live.get("ok"):
-        lines.append(f"• 실시간 가상 자산: <b>{live['live_equity']:+.6f}</b>")
-        lines.append(f"   └ 기준(마지막 종가): {live['base_equity']:+.6f}")
-        lines.append(f"   └ 리밸런싱 이후 실시간 변동: {live['intraday_return']:+.6f}")
-        lines.append(f"   └ 현재가 반영: {live['n_priced']}/{live['n_total']}종목 (진입 기준일 {live.get('as_of')})")
+        eq = live["live_equity"]
+        emoji = "📈" if eq >= 0 else "📉"
+        lines.append(f"{emoji} <b>지금 손익: {eq * 100:+.2f}%</b>  ({money(eq)})")
+        lines.append(f"   └ 어제 마감 기준: {live['base_equity'] * 100:+.2f}%")
+        lines.append(f"   └ 오늘 장중 변동: {live['intraday_return'] * 100:+.2f}%")
+        lines.append(f"   └ 현재가 반영된 종목: {live['n_priced']}/{live['n_total']}개")
     else:
-        lines.append(f"• 누적 가상 수익률(PnL): {equity:+.6f}")
-        lines.append(f"• 당일 가상 손익: {day_pnl:+.6f}")
+        emoji = "📈" if equity >= 0 else "📉"
+        lines.append(f"{emoji} <b>누적 손익: {equity * 100:+.2f}%</b>  ({money(equity)})")
+        lines.append(f"   └ 오늘 하루 손익: {day_pnl * 100:+.2f}%")
         if live and live.get("reason"):
-            lines.append(f"   └ <i>실시간 계산 불가({live['reason']}) — 저장값 표시</i>")
+            lines.append("   └ <i>실시간 가격 반영이 안 돼 저장된 값으로 보여드려요</i>")
 
     if cfg["mode"] == "real":
         lines.append("\n<b>[실제 거래소 잔고 (바이낸스 데모)]</b>")
