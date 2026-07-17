@@ -131,6 +131,8 @@ def _handle_webhook(event, context):
             RS.sync_down(("market/universe",))      # 최신 월 스냅샷 필요
         elif cmd in ("/텔레메트리", "/로그파일"):
             RS.sync_down(("runtime",))               # 날짜별 텔레메트리 파일 필요
+        elif cmd in ("/이유", "/왜", "/기록", "/매매기록"):
+            RS.sync_down(("runtime/live/telemetry",))  # 알파 기여/매매 복원용 스냅샷 필요
     except Exception as e:
         log.error("웹훅 R2 다운로드 실패(계속 진행): %s", e, exc_info=True)
 

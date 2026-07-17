@@ -117,13 +117,23 @@ def sync_down(prefixes: Iterable[str] = DOWN_PREFIXES) -> int:
         return 0
     client = _client()
     root = _data_dir()
-    n = 0
+    
+    keys_to_download = []
     for prefix in prefixes:
         for key in _iter_remote_keys(client, prefix):
+            keys_to_download.append(key)
+            
+    n = len(keys_to_download)
+    if n > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        def download_one(key):
             dest = root / key
             dest.parent.mkdir(parents=True, exist_ok=True)
             client.download_file(_bucket(), key, str(dest))
-            n += 1
+            
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            executor.map(download_one, keys_to_download)
+            
     log.info("R2 다운로드 완료: %d개 파일 (prefixes=%s)", n, list(prefixes))
     return n
 
@@ -138,15 +148,24 @@ def sync_down_files(keys: Iterable[str]) -> int:
         return 0
     client = _client()
     root = _data_dir()
+    keys_list = list(keys)
     n = 0
-    for key in keys:
-        dest = root / key
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            client.download_file(_bucket(), key, str(dest))
-            n += 1
-        except Exception as e:
-            log.debug("sync_down_files: %s 없음/실패(건너뜀): %s", key, e)
+    if keys_list:
+        from concurrent.futures import ThreadPoolExecutor
+        def download_one(key):
+            dest = root / key
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                client.download_file(_bucket(), key, str(dest))
+                return 1
+            except Exception as e:
+                log.debug("sync_down_files: %s 없음/실패(건너뜀): %s", key, e)
+                return 0
+                
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = executor.map(download_one, keys_list)
+            n = sum(results)
+            
     log.info("R2 타깃 다운로드: %d개 파일", n)
     return n
 
@@ -169,12 +188,22 @@ def sync_up(prefixes: Iterable[str] = UP_PREFIXES) -> int:
         return 0
     client = _client()
     root = _data_dir()
-    n = 0
+    
+    files_to_upload = []
     for prefix in prefixes:
         for path in _iter_local_files(prefix):
+            files_to_upload.append(path)
+            
+    n = len(files_to_upload)
+    if n > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        def upload_one(path):
             key = path.relative_to(root).as_posix()
             client.upload_file(str(path), _bucket(), key)
-            n += 1
+            
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            executor.map(upload_one, files_to_upload)
+            
     log.info("R2 업로드 완료: %d개 파일 (prefixes=%s)", n, list(prefixes))
     return n
 
@@ -266,13 +295,13 @@ def push_initial() -> int:
     """로컬 → R2 초기 주입. panel/universe/scan 전체 + 스코프 processed(데이터셋×top100)만."""
     client = _client()
     root = _data_dir()
-    n = 0
+    
+    files_to_upload = []
 
     # 1) 패널·유니버스·스캔은 통째로 (작음)
     for prefix in ("market/panel", "market/universe", "market/scan"):
         for path in _iter_local_files(prefix):
-            client.upload_file(str(path), _bucket(), path.relative_to(root).as_posix())
-            n += 1
+            files_to_upload.append(path)
 
     # 2) 원본(processed)은 스코프 데이터셋 × top-100 심볼 + 각 데이터셋 manifest 만
     members = _latest_universe_members()
@@ -283,13 +312,20 @@ def push_initial() -> int:
             continue
         mani = dsdir / "_manifest.json"
         if mani.exists():
-            client.upload_file(str(mani), _bucket(), mani.relative_to(root).as_posix())
-            n += 1
+            files_to_upload.append(mani)
         for sym in members:
             f = dsdir / f"{sym}.parquet"
             if f.exists():
-                client.upload_file(str(f), _bucket(), f.relative_to(root).as_posix())
-                n += 1
+                files_to_upload.append(f)
+
+    n = len(files_to_upload)
+    if n > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        def upload_one(path):
+            client.upload_file(str(path), _bucket(), path.relative_to(root).as_posix())
+            
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            executor.map(upload_one, files_to_upload)
 
     log.info("초기 주입 완료: %d개 파일 (datasets=%s, top100=%d종목)", n, datasets, len(members))
     return n

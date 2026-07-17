@@ -406,7 +406,7 @@ def cmd_run_deferred():
     send_telegram_message(
         "⚡ <b>/실행 접수</b>\n"
         "무거운 데이터 수집·주문은 예약된 자동 사이클에서 처리됩니다.\n"
-        "지금 당장 강제로 돌리려면 로컬에서 <code>python main.py</code> 라이브 실행을 사용하세요."
+        "지금 당장 강제로 돌리려면 로컬에서 <code>python cli.py live --refresh</code> 를 사용하세요."
     )
 
 
@@ -483,10 +483,232 @@ def cmd_risk():
         send_telegram_message(f"❌ 리스크 정보 파싱 실패: <code>{e}</code>")
 
 
+# 알파 이름 -> 초보자용 한 줄 설명 (없는 이름은 영어 그대로 노출)
+ALPHA_KR = {
+    "taker_flow_follow": "공격적 매수세 따라가기",
+    "range_high_60d": "60일 신고가 추세 타기",
+    "range_high_120d": "120일 신고가 추세 타기",
+    "crowd_ls_fade": "개미 쏠림 반대로 가기",
+    "funding_carry": "이자(펀딩비) 챙기기",
+    "funding_carry_7d": "이자(펀딩비) 챙기기(7일)",
+    "funding_carry_30d": "이자(펀딩비) 챙기기(30일)",
+    "funding_carry_stable": "꾸준한 이자만 챙기기",
+    "funding_carry_signed": "이자 방향 그대로 베팅",
+    "funding_accel": "이자 급등 코인 숏",
+    "premium_fade": "선물 과열 되돌림 노리기",
+    "spot_basis_fade": "현물 대비 비싼 선물 숏",
+    "clean_momentum": "차분한 상승 추세 타기",
+    "mom60_turnover_neutral": "60일 추세 타기(볼륨 보정)",
+    "idio_momentum_20d": "개별 코인 고유 추세 타기",
+    "smart_dumb_divergence": "큰손 따라가기",
+    "toptrader_conviction_momentum": "큰손 확신 추세 타기",
+    "whale_concentration_fade": "큰손 몰빵 반대로 가기",
+    "amihud_illiq": "거래 얇은 코인 프리미엄",
+    "book_liquidity_premium": "호가 얇은 코인 프리미엄",
+    "illiq_crowd_fade": "얇은 쏠림 반대로 가기",
+    "book_imbalance_momentum": "호가창 매수 우위 따라가기",
+    "reversal_5d": "5일 급등락 되돌림 노리기",
+    "breakout_lowfunding": "과열 없는 돌파 타기",
+    "breakout_uncrowded": "한산한 돌파 타기",
+}
+
+
+def _alpha_kr(name: str) -> str:
+    kr = ALPHA_KR.get(name)
+    return f"{kr}({name})" if kr else name
+
+
+def _latest_telemetry() -> dict | None:
+    """가장 최근 telemetry-<date>.json 스냅샷(없으면 None)."""
+    from src.live import ledger as LG
+    files = LG.list_recent_telemetry(days=14)
+    if not files:
+        return None
+    try:
+        return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("최근 텔레메트리 파싱 실패: %s", e)
+        return None
+
+
+def _norm_coin(arg: str, candidates) -> str | None:
+    """사용자 입력(btc, BTC, BTCUSDT...)을 실제 심볼로. 못 찾으면 None."""
+    a = (arg or "").strip().upper().replace("/", "").replace(" ", "")
+    if not a:
+        return None
+    cands = list(candidates)
+    for c in (a, a + "USDT"):
+        if c in cands:
+            return c
+    hits = [c for c in cands if a in c]
+    return hits[0] if hits else None
+
+
+def _pct(v: float) -> str:
+    """비중(0.0212)을 '2.12%' 로."""
+    return f"{abs(v) * 100:.2f}%"
+
+
+def _usd(v: float) -> str:
+    """금액을 보기 좋게: 10$ 이상은 정수, 미만은 센트까지."""
+    return f"{v:+,.0f}$" if abs(v) >= 10 else f"{v:+,.2f}$"
+
+
+def cmd_why(arg: str):
+    """/이유 <코인> — 이 코인을 왜 이 방향·이 비중으로 잡았는지 알파/리스크 분해."""
+    snap = _latest_telemetry()
+    if snap is None:
+        send_telegram_message("❌ 최근 2주 내 텔레메트리 기록이 없어요. 사이클이 한 번 돌아야 생겨요.")
+        return
+
+    tgt_all = snap.get("target_weights") or {}
+    pre_all = snap.get("pre_risk_weights") or {}
+    contribs = snap.get("alpha_contributions") or {}
+    date = snap.get("date", "?")
+
+    arg = (arg or "").strip()
+    if not arg:
+        top = sorted(tgt_all.items(), key=lambda x: -abs(x[1]))[:5]
+        lines = ["<b>[/이유 사용법]</b>",
+                 "<code>/이유 BTC</code> 처럼 코인 이름을 붙여주세요.",
+                 "\n지금 크게 베팅 중인 코인 (여기서 골라보세요):"]
+        for c, w in top:
+            lines.append(_weight_line(c, w))
+        send_telegram_message("\n".join(lines))
+        return
+
+    coin = _norm_coin(arg, set(tgt_all) | set(pre_all))
+    if coin is None:
+        send_telegram_message(f"❌ <code>{arg}</code> 는 지금 포트폴리오에 없어요.\n"
+                              "전체 목록은 /포지션 으로 확인할 수 있어요.")
+        return
+
+    tgt = float(tgt_all.get(coin, 0.0))
+    pre = float(pre_all.get(coin, 0.0))
+    name = coin.replace("USDT", "")
+    side = "🟢롱 (오른다에 베팅)" if tgt > 0 else "🔴숏 (내린다에 베팅)"
+
+    lines = [f"<b>[{name} — 왜 이렇게 잡았나]</b> <i>({date} 기준)</i>",
+             f"최종 결정: <b>{side} · 계좌의 {_pct(tgt)}</b>\n"]
+
+    # ① 알파(전략)들의 의견
+    lines.append("<b>① 전략들의 의견</b> (+ 는 사자, − 는 팔자)")
+    rows = []
+    for a, panel in contribs.items():
+        v = float(panel.get(coin, 0.0))
+        if abs(v) < 1e-6:
+            continue
+        rows.append((a, v))
+    rows.sort(key=lambda x: -abs(x[1]))
+    if rows:
+        for a, v in rows:
+            arrow = "🟢사자" if v > 0 else "🔴팔자"
+            lines.append(f" • {_alpha_kr(a)}: {arrow} {_pct(v)}")
+        agree = sum(1 for _, v in rows if (v > 0) == (pre > 0))
+        lines.append(f" = 의견 합계: <b>{'사자' if pre > 0 else '팔자'} {_pct(pre)}</b> "
+                     f"({len(rows)}명 중 {agree}명이 같은 방향)")
+    else:
+        lines.append(" (이 코인에 의견을 낸 전략이 없어요)")
+
+    # ② 안전장치(리스크) 조정
+    lines.append("\n<b>② 안전장치의 조정</b>")
+    if pre != 0.0 and tgt != 0.0 and (pre > 0) != (tgt > 0):
+        lines.append(f" 전략 의견 {_pct(pre)} → 최종 {_pct(tgt)} 인데 <b>방향이 뒤집혔어요</b>."
+                     " 롱숏 균형 맞추기 등 안전장치가 강하게 개입한 경우예요.")
+    elif pre != 0.0:
+        ratio = tgt / pre
+        if ratio < 0.995:
+            lines.append(f" 전략 의견 {_pct(pre)} → 최종 {_pct(tgt)} "
+                         f"(<b>베팅을 {(1 - ratio) * 100:.0f}% 줄임</b>)")
+            lines.append(" 이유: 한 코인 몰빵 방지 · 출렁임 조절 · 급락 차단 같은"
+                         " 안전장치들이 차례로 다듬은 결과예요. (목록: /리스크)")
+        elif ratio > 1.005:
+            lines.append(f" 전략 의견 {_pct(pre)} → 최종 {_pct(tgt)} "
+                         f"(<b>베팅을 {(ratio - 1) * 100:.0f}% 키움</b>)")
+            lines.append(" 이유: 요즘 시장이 차분해서 안전장치가 규모를 살짝 키웠어요.")
+        else:
+            lines.append(f" 전략 의견 {_pct(pre)} 그대로 통과 (조정 거의 없음)")
+    else:
+        lines.append(f" 전략 합계는 0이었는데 최종 {_pct(tgt)} — 드문 경우예요.")
+
+    lines.append("\n<i>지금 손익은 /잔고 · 끝난 매매는 /기록</i>")
+    send_telegram_message("\n".join(lines))
+
+
+def cmd_history(arg: str):
+    """/기록 [개수|코인] — 진입→종료가 끝난 매매를 시간순으로 손익과 함께."""
+    from src.live import trade_history as TH
+
+    arg = (arg or "").strip()
+    n_show, coin_filter = 15, None
+    if arg:
+        if arg.isdigit():
+            n_show = max(1, min(50, int(arg)))
+        else:
+            coin_filter = arg
+
+    try:
+        closed, still_open, span = TH.load_closed_trades(days=90)
+    except Exception as e:
+        send_telegram_message(f"❌ 매매 기록 계산 실패: <code>{e}</code>")
+        return
+
+    if not closed and not still_open:
+        send_telegram_message("아직 기록이 없어요. 사이클이 며칠 쌓이면 여기서 볼 수 있어요.")
+        return
+
+    if coin_filter:
+        c = _norm_coin(coin_filter, {e["coin"] for e in closed})
+        if c is None:
+            send_telegram_message(f"❌ <code>{coin_filter}</code> 의 끝난 매매가 없어요.\n"
+                                  "숫자를 주면 최근 N건을 보여줘요. 예: <code>/기록 30</code>")
+            return
+        closed = [e for e in closed if e["coin"] == c]
+
+    if not closed:
+        send_telegram_message(f"아직 끝난 매매가 없어요. (지금 들고 있는 건 {len(still_open)}개 — /포지션)")
+        return
+
+    book = float(getattr(SETTINGS, "book_aum_usd", 100_000.0))
+    shown = closed[-n_show:]
+
+    head = f"<b>[끝난 매매 기록]</b> <i>({span[0]} ~ {span[1]} 관측)</i>"
+    sub = (f"전체 {len(closed)}건 중 최근 {len(shown)}건 · 오래된 것부터\n"
+           f"손익은 계좌 전체 기준 (시작 자본 ${book:,.0f} 가정)\n")
+    lines = [head, sub]
+
+    total = 0.0
+    for i, e in enumerate(shown, 1):
+        name = e["coin"].replace("USDT", "")
+        side = "🟢롱" if e["side"] > 0 else "🔴숏"
+        entry = ("~" if e.get("entry_approx") else "") + str(e["entry_date"])[5:]
+        exit_ = str(e["exit_date"])[5:]
+        emoji = "💰" if e["pnl"] >= 0 else "💸"
+        lines.append(f"{i}. {side} <code>{name}</code>  {entry} 진입 → {exit_} 종료 ({e['days']}일)")
+        lines.append(f"   베팅 평균 {_pct(e['avg_weight'])} · "
+                     f"{emoji} <b>{e['pnl'] * 100:+.3f}%</b> (≈ {_usd(e['pnl'] * book)})")
+        total += e["pnl"]
+
+    lines.append(f"\n표시된 {len(shown)}건 합계: <b>{total * 100:+.3f}%</b> (≈ {_usd(total * book)})")
+    lines.append(f"<i>지금 들고 있는 {len(still_open)}개는 /포지션 · 기록은 최근 90일까지만 보관</i>")
+    if not coin_filter:
+        lines.append("<i>코인 하나만 보려면 /기록 BTC · 더 보려면 /기록 30</i>")
+
+    # 텔레그램 4096자 제한 → 나눠 보내기
+    chunk = []
+    for line in lines:
+        if sum(len(l) + 1 for l in chunk) + len(line) > 3800:
+            send_telegram_message("\n".join(chunk))
+            chunk = []
+        chunk.append(line)
+    if chunk:
+        send_telegram_message("\n".join(chunk))
+
+
 def send_telemetry_bundle(days: int = 30, caption: str | None = None) -> bool:
     """최근 `days` 일 텔레메트리를 zip 으로 묶어 텔레그램으로 전송. 성공 여부 반환.
 
-    텔레그램 명령어(/텔레메트리)와 크론 자동전송(main.py telemetry-send)이 공유한다.
+    텔레그램 명령어(/텔레메트리)와 크론 자동전송(cli.py telemetry-send)이 공유한다.
     묶을 파일이 없으면 안내 메시지만 보내고 False."""
     from src.live import ledger as LG
     zip_path = LG.build_telemetry_bundle(days=days)
@@ -496,7 +718,7 @@ def send_telemetry_bundle(days: int = 30, caption: str | None = None) -> bool:
     size_kb = zip_path.stat().st_size / 1024
     cap = caption or (f"📦 텔레메트리 번들 (최근 {days}일)\n"
                       f"파일: {zip_path.name} ({size_kb:.1f} KB)\n"
-                      f"로컬에서 <code>python main.py attribution {zip_path.name}</code> 로 기여도 분석하세요.")
+                      f"로컬에서 <code>python cli.py attribution {zip_path.name}</code> 로 기여도 분석하세요.")
     res = send_telegram_document(zip_path, caption=cap)
     return bool(res and res.get("ok"))
 
@@ -556,6 +778,8 @@ def cmd_help():
         "• <code>/실행</code>: 당일 라이브 사이클 즉시 강제 수행 (데이터 갱신)",
         "• <code>/스냅샷</code>: 최신 월 스냅샷 정보 및 최종 재밸런싱 실행일 조회",
         "• <code>/리스크</code>: 현재 작동 중인 리스크 오버레이 모듈 상태 요약",
+        "• <code>/이유 &lt;코인&gt;</code>: 그 코인을 왜 이 방향·비중으로 잡았는지 (전략별 의견 + 안전장치 조정)",
+        "• <code>/기록 [개수|코인]</code>: 진입→종료가 끝난 매매 목록 (시간순, 건별 손익)",
         "• <code>/텔레메트리 [일수|날짜]</code>: 사이클 텔레메트리(기여도 분석용) 파일/번들 전송 (기본 30일 zip)",
         "• <code>/초기화</code>: 로컬 가상 포지션 초기화",
         "• <code>/도움말</code>: 봇 도움말 보기"
@@ -611,6 +835,10 @@ def handle_message(msg: dict, webhook: bool = False) -> bool:
         cmd_snapshot()
     elif cmd == "/리스크":
         cmd_risk()
+    elif cmd in ("/이유", "/왜"):
+        cmd_why(arg)
+    elif cmd in ("/기록", "/매매기록"):
+        cmd_history(arg)
     elif cmd in ("/텔레메트리", "/로그파일"):
         cmd_telemetry(arg)
     elif cmd in ("/도움말", "/help", "/start"):
