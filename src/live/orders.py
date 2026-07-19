@@ -184,17 +184,35 @@ def _send_real_orders(orders, aum_usd):
 def _write_order_record(record, today):
     """orders_<date>.json 저장.
 
-    보호 로직: 오늘 이미 '실전송 성공' 기록이 있는데 새 record 에는 성공 전송이 없으면
-    (daily guard skip, all_alphas_stale skip, 페이퍼 기록 등) 덮어쓰지 않는다.
+    보호 로직 1(실전송): 오늘 이미 '실전송 성공' 기록이 있는데 새 record 에는 성공 전송이
+    없으면 (daily guard skip, all_alphas_stale skip, 페이퍼 기록 등) 덮어쓰지 않는다.
     예전엔 guard 의 skip 기록이 원본 전송 기록을 덮어써서, 다음 실행 때
     _already_sent_today 가 skip 기록을 보고 '안 보냈다'고 판단 -> 주문 재전송되는
-    (잠김<->풀림 반복) 버그가 있었다."""
+    (잠김<->풀림 반복) 버그가 있었다.
+
+    보호 로직 2(재실행 기록 보존): 하루에 두 번 이상 실행되면(스케줄 중복·수동실행·배포)
+    첫 실행이 리밸런싱을 마치고 positions.json 을 목표로 저장하므로, 그날 나중 실행은
+    이미 목표=현재라 주문 0건이 나온다. 이 0건 기록이 아침의 진짜 리밸런싱 기록(43건 등)을
+    덮어써 대시보드/텔레메트리가 '오늘 0건'으로 보이던 문제 -> 오늘 기록에 실제 주문이
+    있었으면(n_orders>0), 새 기록의 주문이 그보다 적을 때는 덮어쓰지 않는다(진짜 매매 보존)."""
     out_path = Path(SETTINGS.data_dir) / "runtime" / "live" / f"orders_{today.isoformat()}.json"
     new_has_sent = any(o.get("exchange_result") for o in record.get("orders", []))
     if not new_has_sent and _already_sent_today(today):
         log.info("orders_%s.json 에 실전송 성공 기록 존재 -- 새 기록(전송 없음)으로 덮어쓰지 않음",
                  today.isoformat())
         return out_path
+    # 보호 로직 2: 오늘 이미 더 많은 주문(진짜 리밸런싱) 기록이 있으면 no-op 재실행으로 덮지 않음.
+    new_n = record.get("n_orders", len(record.get("orders", [])))
+    if out_path.exists():
+        try:
+            prev = json.loads(out_path.read_text(encoding="utf-8"))
+            prev_n = prev.get("n_orders", len(prev.get("orders", [])))
+            if prev_n > new_n:
+                log.info("orders_%s.json 에 더 많은 주문 기록(%d건) 존재 -- 재실행 %d건으로 덮어쓰지 않음(진짜 매매 보존)",
+                         today.isoformat(), prev_n, new_n)
+                return out_path
+        except Exception:
+            pass
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
     return out_path

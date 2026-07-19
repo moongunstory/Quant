@@ -68,18 +68,26 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
               today=today)
 
     # [가상 매매 상시 트래킹] 모드와 무관하게 로컬 시뮬레이션(Paper) PnL 을 트래킹합니다.
+    # paper_current(주문 전 보유)는 generate_orders 가 positions.json 을 덮어쓰기 전에 캡처해야 한다.
+    # 실제 손익 반영(mark_to_market)은 이번 사이클 회전율(order_record.drift)을 알아야
+    # 매매비용을 정직하게 차감할 수 있으므로 generate_orders 이후로 미룬다.
     paper_current = OR.load_positions()
     day_returns = target.get("day_returns", {})
-    if day_returns and paper_current:
-        try:
-            from src.live import paper as PA
-            day_pnl, equity = PA.mark_to_market(paper_current, day_returns, today=today)
-            log.info("[Paper PnL] 일일 가상 손익: %+.6f | 누적 가상 자산: %.6f", day_pnl, equity)
-        except Exception as e:
-            log.warning("로컬 가상 매매 PnL 업데이트 실패: %s", e)
 
     order_record = OR.generate_orders(target, today=today, mode=mode,
                                       rebalance_band=getattr(cfg, "rebalance_band", 0.0))
+
+    if day_returns and paper_current:
+        try:
+            from src.live import paper as PA
+            # 리밸런싱이 실제로 일어났을 때만(SKIP 아님) 회전율 비용 차감. 밴드로 보류/스킵이면 비용 0.
+            turnover = 0.0 if order_record.get("skipped") else float(order_record.get("drift", 0.0))
+            day_pnl, equity = PA.mark_to_market(paper_current, day_returns, today=today,
+                                                turnover=turnover)
+            log.info("[Paper PnL] 일일 가상 손익: %+.6f | 누적 가상 자산: %.6f (회전율=%.4f)",
+                     day_pnl, equity, turnover)
+        except Exception as e:
+            log.warning("로컬 가상 매매 PnL 업데이트 실패: %s", e)
     LG.record("orders", {"date": order_record["date"], "mode": mode,
                          "skipped": order_record.get("skipped", False),
                          "n_orders": order_record.get("n_orders", 0),

@@ -20,11 +20,20 @@ from src.config.backtest_settings import SETTINGS
 EQUITY_PATH = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
 
 
-def mark_to_market(weights, day_returns, today=None):
+def mark_to_market(weights, day_returns, today=None, turnover=0.0):
     """weights: {coin: weight}(어제 목표=오늘 보유). day_returns: {coin: 당일수익률}.
-    당일 페이퍼 손익 = Σ weight*return. equity 곡선에 append 후 (day_pnl, equity) 반환."""
+    turnover: 이번 사이클 리밸런싱 회전율(=목표와 현재의 총 L1 드리프트, orders 의 'drift').
+
+    당일 페이퍼 손익 = Σ weight*return − 매매비용. 매매비용 = turnover × (수수료+슬리피지).
+    (예전엔 비용을 0 으로 뒀는데, '비용은 백테스트에 이미 반영됨' 가정이 라이브 회전율=
+     백테스트 회전율일 때만 성립한다. 실제 라이브 회전율로 직접 차감해 곡선을 정직하게.)
+    백테스트 engine 과 동일 공식: cost = turnover × (taker_fee_pct + slippage_pct)/100.
+    equity 곡선에 append 후 (day_pnl, equity) 반환."""
     today = today or datetime.now(timezone.utc).date()
-    day_pnl = sum(float(w) * float(day_returns.get(c, 0.0)) for c, w in weights.items())
+    gross_pnl = sum(float(w) * float(day_returns.get(c, 0.0)) for c, w in weights.items())
+    cost_rate = (SETTINGS.taker_fee_pct + SETTINGS.slippage_pct) / 100.0
+    trade_cost = float(turnover) * cost_rate
+    day_pnl = gross_pnl - trade_cost
 
     prev_equity = 0.0
     p = Path(EQUITY_PATH)
@@ -42,5 +51,7 @@ def mark_to_market(weights, day_returns, today=None):
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"date": today.isoformat(), "day_pnl": day_pnl,
-                            "equity": equity}, ensure_ascii=False) + "\n")
+                            "gross_pnl": gross_pnl, "trade_cost": trade_cost,
+                            "turnover": float(turnover), "equity": equity},
+                           ensure_ascii=False) + "\n")
     return day_pnl, equity
