@@ -67,13 +67,29 @@ class Settings:
     book_aum_usd: float = _f("QUANT_BOOK_AUM_USD", 100_000.0)
 
     # ---- 실매매(real) 거래소 안전설정 ----
-    # 진입 전 각 심볼 레버리지를 이 배수로 강제 설정한다. 기본 1배(현물처럼, 청산위험
-    # 최소). 거래소의 심볼 기본값(10~20배 등)으로 잘못 진입하는 사고를 막는다.
+    # [원칙1: 위험 숫자는 하나 — 레버리지는 그 하나에서 파생되는 '허가 상한'일 뿐]
+    #
+    # 진짜 위험은 '실제로 얼마나 드느냐' = 전략의 총노출(Σ|w|)이 쥔다. 그 총노출은 이미
+    # 검증된 리스크 스택(config.json 의 gross_cap, 현재 1.5)이 하드캡으로 통제한다.
+    # 거래소 레버리지 '설정값'은 위험이 아니라 "여기까지 들어도 됨"이라는 허가 상한일 뿐:
+    # 상한을 넉넉히 열어도 실제로 1.5만 들면 위험은 1.5 그대로다(신용카드 한도를 올려도
+    # 실제 쓴 만큼만 빚인 것과 같다).
+    #
+    # 예전 문제: 레버리지=1(허가 1배)인데 전략은 1.5배어치를 시켜서, 총노출이 1.0을 넘는
+    # 순간 나머지 주문이 -2019(증거금 부족)로 거부 → 실전이 백테스트보다 체계적으로 과소
+    # 투자됐다. 이제 레버리지는 총노출 위에 '헤드룸'을 두는 파생값(3배)으로 둔다: gross_cap
+    # 1.5 대비 여유 2배라 증거금 병목이 사라진다. 진짜 위험 통제는 여전히 gross_cap 하나뿐.
+    # (실제 위험 수준을 바꾸려면 이 값이 아니라 config.json 의 gross_cap 을 바꿔야 한다.)
     # 이 값 설정에 실패하면 그 심볼 주문은 전송하지 않는다(fail-closed, orders.py).
-    target_leverage: int = int(os.environ.get("QUANT_TARGET_LEVERAGE", 1))
+    target_leverage: int = int(os.environ.get("QUANT_TARGET_LEVERAGE", 3))
     # 실매매 전 계정이 '원웨이 모드'인지 확인하고, 헷지 모드면 주문을 막을지 여부.
     # 이 프로그램의 주문은 positionSide="BOTH"(원웨이 전용)라 헷지 모드에선 실패한다.
     require_one_way_mode: bool = os.environ.get("QUANT_REQUIRE_ONE_WAY", "1") not in ("0", "false", "False")
+    # 실매매 전 계정 마진모드가 '크로스(cross)'인지 확인하고, 독립(isolated)이면 주문을 막을지 여부.
+    # 이 전략은 롱숏이 서로 증거금을 받쳐주는 크로스 마진을 암묵적으로 가정한다. 독립 모드면
+    # 포지션마다 담보가 따로 놀아, 한 코인이 반대로 크게 가면 다른 코인 이익이 못 받쳐주고
+    # '그 하나만' 개별 청산될 수 있다 → fail-closed 로 막고 사람이 크로스로 바꾸게 한다.
+    require_cross_margin: bool = os.environ.get("QUANT_REQUIRE_CROSS", "1") not in ("0", "false", "False")
 
     @property
     def processed_dir(self) -> Path:

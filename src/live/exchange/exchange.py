@@ -19,17 +19,27 @@ from src.live.exchange.order import place_market_order as _place_market_order
 
 log = logging.getLogger("quant.live.exchange")
 
-# 심볼별 LOT step 캐시(거래소 exchangeInfo 에서 1회 조회). 미조회 시 기본 step.
+# 심볼별 거래소 필터 캐시(exchangeInfo 에서 1회 조회). 미조회 시 기본값.
+#   _LOT_STEP_CACHE      : LOT_SIZE stepSize (수량 반올림 단위)
+#   _MIN_NOTIONAL_CACHE  : MIN_NOTIONAL notional (주문 최소 명목가, USDT)
 _LOT_STEP_CACHE: dict[str, float] = {}
+_MIN_NOTIONAL_CACHE: dict[str, float] = {}
 _DEFAULT_QTY_STEP = 0.001
+_DEFAULT_MIN_NOTIONAL = 5.0   # 바이낸스 USDT-M 선물 통상 최소 명목가(폴백)
 _LOT_STEP_CACHE_LOADED = False
+
+# 이번 실행에서 이미 레버리지를 세팅한 심볼(심볼당 1회만 호출 → API 낭비/속도 개선).
+# 컨테이너 재사용 시에도 멱등이라 유지되어 무방(값이 안 바뀌면 재호출 불필요).
+_LEVERAGE_SET_CACHE: set[str] = set()
 
 
 def _ensure_lot_step_cache(mode="real"):
-    """exchangeInfo 를 1회 조회해 심볼별 LOT_SIZE stepSize 로 _LOT_STEP_CACHE 를 채운다.
+    """exchangeInfo 를 1회 조회해 심볼별 LOT_SIZE stepSize + MIN_NOTIONAL 을 캐시한다.
     이전엔 이 캐시가 절대 채워지지 않아 모든 심볼이 기본 step(0.001)으로 반올림됐고,
     그 결과 정수 단위(step=1)만 허용하는 심볼(예: 1000BONKUSDT)에 소수점 수량을 보내
-    바이낸스가 -1111 'Precision is over the maximum defined for this asset.' 로 거부했다."""
+    바이낸스가 -1111 'Precision is over the maximum defined for this asset.' 로 거부했다.
+    MIN_NOTIONAL 도 같은 조회에서 채워, 작은 주문이 -4164(최소 명목가 미만)로 거부되기
+    전에 로컬에서 걸러낸다(orders.py)."""
     global _LOT_STEP_CACHE_LOADED
     if _LOT_STEP_CACHE_LOADED:
         return
@@ -37,17 +47,41 @@ def _ensure_lot_step_cache(mode="real"):
     resp = client.rest_api.exchange_information()
     data = resp.data() if hasattr(resp, "data") else resp
     n = 0
+    n_notional = 0
     for s in getattr(data, "symbols", None) or []:
+        got_lot = False
         for f in getattr(s, "filters", None) or []:
-            if getattr(f, "filter_type", None) == "LOT_SIZE":
+            ftype = getattr(f, "filter_type", None)
+            if ftype == "LOT_SIZE" and not got_lot:
                 try:
                     _LOT_STEP_CACHE[s.symbol] = float(f.step_size)
                     n += 1
+                    got_lot = True
                 except (TypeError, ValueError):
                     continue
-                break
-    log.info("exchangeInfo LOT_SIZE step 캐시 로드: %d개 심볼", n)
+            elif ftype == "MIN_NOTIONAL":
+                # 필드명은 SDK/버전에 따라 notional 또는 min_notional 로 올 수 있어 둘 다 시도.
+                raw = getattr(f, "notional", None)
+                if raw is None:
+                    raw = getattr(f, "min_notional", None)
+                try:
+                    if raw is not None:
+                        _MIN_NOTIONAL_CACHE[s.symbol] = float(raw)
+                        n_notional += 1
+                except (TypeError, ValueError):
+                    pass
+    log.info("exchangeInfo 캐시 로드: LOT_SIZE %d개, MIN_NOTIONAL %d개 심볼", n, n_notional)
     _LOT_STEP_CACHE_LOADED = True
+
+
+def min_notional(symbol, mode="real"):
+    """심볼의 최소 주문 명목가(USDT). 캐시 미로드면 먼저 채운다. 없으면 기본값."""
+    if not _LOT_STEP_CACHE_LOADED:
+        try:
+            _ensure_lot_step_cache(mode)
+        except Exception:
+            log.exception("exchangeInfo 캐시 로드 실패 -- 기본 min_notional 사용")
+    return _MIN_NOTIONAL_CACHE.get(symbol, _DEFAULT_MIN_NOTIONAL)
 
 
 def _raw_position_information(mode="real"):
@@ -124,6 +158,57 @@ def assert_one_way_mode(mode="real"):
         )
 
 
+def detect_margin_mode(mode="real", symbols=None):
+    """마진모드를 position_information_v2 응답의 margin_type 필드로 판별.
+      크로스  : margin_type == "cross"   (또는 "crossed")
+      독립    : margin_type == "isolated"
+    바이낸스에서 마진모드는 '심볼별' 설정이므로, symbols 를 주면 그 심볼들만 본다
+    (오늘 매매할 종목만 검사 → 안 쓰는 심볼 하나가 isolated 라고 전체를 막지 않음).
+    대상 중 하나라도 isolated 면 'isolated'(안전한 쪽), 전부 cross 면 'cross',
+    판별 불가/대상 없음이면 'unknown'.
+
+    (테스트넷 실응답 확인 완료: 필드명 'margin_type', 값 'cross'/'isolated'.)"""
+    rows = _raw_position_information(mode)
+    if not rows:
+        return "unknown"
+    want = {s.upper() for s in symbols} if symbols else None
+    seen = set()
+    for p in rows:
+        if want is not None and str(getattr(p, "symbol", "")).upper() not in want:
+            continue
+        mt = getattr(p, "margin_type", None)
+        if mt is None:
+            mt = getattr(p, "marginType", None)
+        if mt is None:
+            continue
+        seen.add(str(mt).strip().lower())
+    if not seen:
+        return "unknown"
+    if "isolated" in seen:
+        return "isolated"
+    if seen & {"cross", "crossed"}:
+        return "cross"
+    return "unknown"
+
+
+def assert_cross_margin(mode="real", symbols=None):
+    """실매매 프리플라이트: (매매할 심볼들이) 크로스 마진이 아니면 막는다(fail-closed).
+    이 전략은 롱숏이 서로 증거금을 받쳐주는 크로스 마진 전제이므로, 독립(isolated)이면
+    한 코인만 개별 청산되는 사고가 날 수 있어 사람이 먼저 바꾸게 한다. symbols 를 주면
+    그 종목만 검사한다(안 쓰는 심볼 때문에 전체가 막히는 과잉차단 방지). 'unknown'도
+    안전하게 막는다."""
+    mm = detect_margin_mode(mode, symbols=symbols)
+    log.info("assert_cross_margin(symbols=%s): detected=%s",
+             (list(symbols)[:5] if symbols else "ALL"), mm)
+    if mm != "cross":
+        raise RuntimeError(
+            f"매매 대상 심볼의 마진모드가 '{mm}' 입니다. 이 전략은 크로스(Cross) 마진 전용입니다"
+            " (롱숏이 서로 증거금을 받쳐주는 구조 가정). 바이낸스 선물 설정에서 해당 심볼들을"
+            " 'Cross Margin'으로 바꾼 뒤 다시 실행하세요. (독립 모드면 한 코인만 개별 청산되어"
+            " 시장중립 가정이 깨질 수 있어 fail-closed 로 막습니다.)"
+        )
+
+
 def get_mark_prices(mode="real"):
     """{symbol: mark_price}."""
     client = get_client(mode)
@@ -177,15 +262,25 @@ def set_leverage(symbol, leverage=None, mode="real"):
     올려서(fail-closed) 호출자(orders._send_real_orders)가 그 심볼 주문을 전송하지
     않게 한다 = '원하는 레버리지를 확인 못 하면 거래 안 함'."""
     leverage = SETTINGS.target_leverage if leverage is None else leverage
+    # 심볼당 이번 실행에서 이미 세팅했으면 재호출 생략(멱등, API 낭비 방지).
+    if symbol in _LEVERAGE_SET_CACHE:
+        return None
     client = get_client(mode)
-    return client.rest_api.change_initial_leverage(symbol=symbol, leverage=int(leverage))
+    result = client.rest_api.change_initial_leverage(symbol=symbol, leverage=int(leverage))
+    _LEVERAGE_SET_CACHE.add(symbol)
+    return result
 
 
-def place_market_order(symbol, side, quantity, mode="real", reduce_only=False):
-    """시장가 주문 전송(orders.py 가 호출). trade/order.place_market_order 래핑."""
+def place_market_order(symbol, side, quantity, mode="real", reduce_only=False,
+                       client_order_id=None):
+    """시장가 주문 전송(orders.py 가 호출). trade/order.place_market_order 래핑.
+
+    client_order_id: 주면 거래소에 newClientOrderId 로 실려, 같은 id 의 주문이 두 번
+    가면 바이낸스가 중복으로 거부한다 → 재실행/재시도 시 이중 진입 방지(멱등)."""
     client = get_client(mode)
-    log.info("place_market_order 전송: symbol=%s side=%s qty=%s reduce_only=%s",
-              symbol, side, quantity, reduce_only)
-    result = _place_market_order(client, symbol, side, quantity, reduce_only=reduce_only)
+    log.info("place_market_order 전송: symbol=%s side=%s qty=%s reduce_only=%s coid=%s",
+              symbol, side, quantity, reduce_only, client_order_id)
+    result = _place_market_order(client, symbol, side, quantity, reduce_only=reduce_only,
+                                 client_order_id=client_order_id)
     log.info("place_market_order 응답: %r", result)
     return result
