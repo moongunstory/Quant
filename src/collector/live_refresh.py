@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -72,6 +73,22 @@ def _current_top100():
     return set(d.get("members", []))
 
 
+def _latest_snapshot_ym():
+    """최신 universe_snapshot 파일의 YYYY-MM. 없으면 None."""
+    snap_dir = SETTINGS.universe_snapshot_dir
+    yms = [p.stem for p in Path(snap_dir).glob("[0-9]*.json")
+           if not p.stem.endswith("_diff")]
+    return max(yms) if yms else None
+
+
+def _expected_snapshot_ym(today=None):
+    """오늘 기준 '있어야 할' 최신 스냅샷의 YYYY-MM = 지난달 말 리밸런싱분.
+    (스냅샷은 월말 리밸런싱 산출물이라, 7월 매매는 6월말 스냅샷(2026-06)을 쓴다.)"""
+    today = today or datetime.now(timezone.utc).date()
+    prev_month_end = today.replace(day=1) - timedelta(days=1)
+    return prev_month_end.strftime("%Y-%m")
+
+
 def compute_scope(cfg, alphas_dir="data/strategy/alphas"):
     """cfg -> {fields, datasets, symbols, alphas}. 라이브 최신화 스코프."""
     specs = load_all(alphas_dir)
@@ -104,6 +121,25 @@ def run(cfg, alphas_dir="data/strategy/alphas", max_workers=10, deadline: Option
         return scope
 
     from src.collector import full_collector
+
+    # ---- 월간 유니버스 자동 갱신 (2026-07-24 추가) ----
+    # 예전엔 universe_maintenance 가 CLI 수동 실행 또는 콜드스타트 1회뿐이라,
+    # 프로덕션(Lambda)에서는 top-100 스냅샷이 첫 배포 시점에 영원히 얼어붙었다.
+    # 새 달로 넘어갔는데 지난달 말 스냅샷이 없으면 여기서 월간 갱신 체인을 돌려
+    # 유니버스가 스스로 최신을 유지하게 한다. 실패해도 기존 스냅샷으로 계속(fail-open)
+    # — 유니버스가 한 달 낡는 것이 사이클 전체가 죽는 것보다 낫다.
+    latest_ym = _latest_snapshot_ym()
+    expected_ym = _expected_snapshot_ym()
+    if latest_ym is not None and latest_ym < expected_ym:
+        log.info("유니버스 스냅샷 %s 가 기대치 %s 보다 오래됨 → 월간 갱신 체인 자동 실행",
+                 latest_ym, expected_ym)
+        try:
+            from src.collector import universe_maintenance
+            universe_maintenance.run(deadline=deadline)
+            scope = compute_scope(cfg, alphas_dir=alphas_dir)
+            log.info("월간 유니버스 갱신 후 스코프 재계산: top100=%d종목", scope["n_symbols"])
+        except Exception as e:
+            log.warning("월간 유니버스 갱신 실패(기존 스냅샷으로 계속): %s", e)
 
     # 라이브는 데이터셋(필드 스코핑) + 종목(현재 top-100) 둘 다 좁힌다.
     # 스냅샷이 아예 없으면(cold-start) 경고만 하지 말고 유니버스 갱신 체인을 1회 돌려

@@ -14,6 +14,8 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from src.backtest.spec import load_all
 from src.portfolio import pipeline as PP
 from src.live import freshness as FR
@@ -83,7 +85,8 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
 
     if g["all_stale"]:
         return {"date": today.isoformat(), "weights": {}, "held_alphas": [],
-                "alpha_weights": {}, "diagnostics": diagnostics, "day_returns": {}}
+                "alpha_weights": {}, "diagnostics": diagnostics,
+                "day_returns": {}, "day_returns_rows": []}
 
     fresh_names = [s.name for s in g["fresh"]]
     cfg_fresh = replace(cfg, alphas=fresh_names)
@@ -93,7 +96,8 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
     if final.empty:
         return {"date": today.isoformat(), "weights": {}, "held_alphas": fresh_names,
                 "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics,
-                "day_returns": {}, "pre_risk_weights": {}, "alpha_contributions": {},
+                "day_returns": {}, "day_returns_rows": [],
+                "pre_risk_weights": {}, "alpha_contributions": {},
                 "risk_stages": out.get("stages", [])}
 
     last_row = final.iloc[-1]
@@ -102,11 +106,31 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
     diagnostics["target_row_date"] = str(final.index[-1].date())
 
     # 당일 수익률 추출 (자산 가치 평가용)
+    #
+    # 주의(2026-07-24 수정): 패널의 마지막 행은 '오늘의 미완성(부분) 봉'인 경우가
+    # 대부분이다 — 수집이 매일 자정 직후(예: UTC 00:10)에 돌기 때문에 오늘 행에는
+    # 겨우 10~20분치 가격만 담겨 있다. 그 부분봉 수익률을 '하루 손익'으로 쓰면
+    # 페이퍼 자산곡선이 매일 하루 수익의 대부분(자정 직후~다음날 자정)을 영구
+    # 누락한다(실측: paper 일손익이 정상 일변동의 1/10 이하로 찍힘).
+    # → 손익 평가는 '오늘(사이클 날짜) 이전의 완결된 행'만 쓴다.
+    #   (목표 가중치는 그대로 마지막 행을 쓴다 — 포지션은 shift(delay)라 이미
+    #    어제까지의 완결 데이터로 계산돼 있고, 부분봉 행이 있어야 신호가 하루
+    #    늦지 않는다. 여기서 고치는 건 '손익 평가 행'뿐이다.)
     returns_df = out["result"].returns
     day_returns = {}
+    day_returns_rows = []   # [{"date": "YYYY-MM-DD", "returns": {coin: ret}}, ...] 완결일만
     if not returns_df.empty:
-        last_ret = returns_df.iloc[-1]
-        day_returns = {c: float(r) for c, r in last_ret.items() if r == r}
+        cutoff = pd.Timestamp(today)
+        if returns_df.index.tz is not None:
+            cutoff = cutoff.tz_localize(returns_df.index.tz)
+        complete = returns_df.loc[returns_df.index < cutoff]
+        # 최근 7일까지만: 스케줄이 며칠 빠졌어도 페이퍼 곡선이 따라잡을 수 있게(paper.py).
+        for ts, row in complete.tail(7).iterrows():
+            vals = {c: float(r) for c, r in row.items() if r == r}
+            day_returns_rows.append({"date": pd.Timestamp(ts).date().isoformat(),
+                                     "returns": vals})
+        if day_returns_rows:
+            day_returns = day_returns_rows[-1]["returns"]
 
     # ---- 텔레메트리(기여도 분석)용 상세 필드 ----
     # pre_risk_weights: 리스크 오버레이 '적용 전' 결합북의 오늘 행. 최종 weights 와
@@ -119,7 +143,7 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
 
     return {"date": today.isoformat(), "weights": weights, "held_alphas": fresh_names,
             "alpha_weights": out["alpha_weights"], "diagnostics": diagnostics,
-            "day_returns": day_returns,
+            "day_returns": day_returns, "day_returns_rows": day_returns_rows,
             "pre_risk_weights": pre_risk_weights,
             "alpha_contributions": alpha_contributions,
             "risk_stages": out.get("stages", [])}

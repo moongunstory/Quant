@@ -20,38 +20,73 @@ from src.config.backtest_settings import SETTINGS
 EQUITY_PATH = SETTINGS.data_dir / "runtime" / "live" / "paper_equity.jsonl"
 
 
-def mark_to_market(weights, day_returns, today=None, turnover=0.0):
+def mark_to_market(weights, day_returns, today=None, turnover=0.0, returns_rows=None):
     """weights: {coin: weight}(어제 목표=오늘 보유). day_returns: {coin: 당일수익률}.
     turnover: 이번 사이클 리밸런싱 회전율(=목표와 현재의 총 L1 드리프트, orders 의 'drift').
 
-    당일 페이퍼 손익 = Σ weight*return − 매매비용. 매매비용 = turnover × (수수료+슬리피지).
-    (예전엔 비용을 0 으로 뒀는데, '비용은 백테스트에 이미 반영됨' 가정이 라이브 회전율=
-     백테스트 회전율일 때만 성립한다. 실제 라이브 회전율로 직접 차감해 곡선을 정직하게.)
-    백테스트 engine 과 동일 공식: cost = turnover × (taker_fee_pct + slippage_pct)/100.
-    equity 곡선에 append 후 (day_pnl, equity) 반환."""
+    returns_rows (2026-07-24): [{"date": "YYYY-MM-DD", "returns": {coin: ret}}, ...]
+    target_weights 가 만든 '완결된 봉'의 일자별 수익률(오늘 부분봉 제외). 주어지면:
+      - 마지막 기록 이후의 완결일들을 순서대로 전부 반영한다(스케줄이 하루 빠져도
+        다음 사이클이 따라잡음 — 빠진 날 동안 포지션은 안 바뀌었으므로 같은 weights 로
+        평가하는 게 정확하다).
+      - 기록의 date = '수익이 난 날'(완결일). 같은 날 재실행하면 새 완결일이 없어
+        자동으로 중복 방지된다.
+    없으면(하위호환) 종전처럼 day_returns 한 행을 사이클 날짜로 기록한다.
+
+    페이퍼 손익 = Σ weight*return − 매매비용. 매매비용 = turnover × (수수료+슬리피지)
+    — 백테스트 engine 과 동일 공식. 비용은 이번 사이클 리밸런싱 1회분이므로 마지막
+    행에만 차감한다. equity 곡선에 append 후 (day_pnl, equity) 반환."""
     today = today or datetime.now(timezone.utc).date()
-    gross_pnl = sum(float(w) * float(day_returns.get(c, 0.0)) for c, w in weights.items())
     cost_rate = (SETTINGS.taker_fee_pct + SETTINGS.slippage_pct) / 100.0
-    trade_cost = float(turnover) * cost_rate
-    day_pnl = gross_pnl - trade_cost
+    trade_cost_cycle = float(turnover) * cost_rate
 
     prev_equity = 0.0
+    last_rec = None
+    last_date = None
     p = Path(EQUITY_PATH)
     if p.exists():
         lines = [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
         if lines:
-            last = json.loads(lines[-1])
-            # 같은 날 두 번 실행(수동 + 스케줄)해도 하루 손익이 이중으로 쌓이지 않게,
-            # 오늘 이미 기록이 있으면 기존 값을 그대로 반환(중복 append 방지).
-            if last.get("date") == today.isoformat():
-                return float(last.get("day_pnl", 0.0)), float(last.get("equity", 0.0))
-            prev_equity = float(last.get("equity", 0.0))
+            last_rec = json.loads(lines[-1])
+            prev_equity = float(last_rec.get("equity", 0.0))
+            last_date = last_rec.get("date")
+
+    if returns_rows:
+        rows = [r for r in returns_rows
+                if r.get("date") and (last_date is None or r["date"] > last_date)]
+        if not rows:
+            # 새 완결일 없음(같은 날 재실행 등) → 기존 마지막 기록 그대로(중복 방지).
+            if last_rec is not None:
+                return float(last_rec.get("day_pnl", 0.0)), float(last_rec.get("equity", 0.0))
+            return 0.0, 0.0
+        equity = prev_equity
+        day_pnl = 0.0
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            for i, r in enumerate(rows):
+                rets = r["returns"]
+                gross = sum(float(w) * float(rets.get(c, 0.0)) for c, w in weights.items())
+                is_last = (i == len(rows) - 1)
+                cost = trade_cost_cycle if is_last else 0.0
+                day_pnl = gross - cost
+                equity += day_pnl
+                f.write(json.dumps({"date": r["date"], "day_pnl": day_pnl,
+                                    "gross_pnl": gross, "trade_cost": cost,
+                                    "turnover": float(turnover) if is_last else 0.0,
+                                    "equity": equity}, ensure_ascii=False) + "\n")
+        return day_pnl, equity
+
+    # ---- 하위호환 경로: day_returns 한 행, 사이클 날짜 기준 중복 방지 ----
+    gross_pnl = sum(float(w) * float(day_returns.get(c, 0.0)) for c, w in weights.items())
+    day_pnl = gross_pnl - trade_cost_cycle
+    if last_rec is not None and last_date == today.isoformat():
+        return float(last_rec.get("day_pnl", 0.0)), float(last_rec.get("equity", 0.0))
     equity = prev_equity + day_pnl
 
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"date": today.isoformat(), "day_pnl": day_pnl,
-                            "gross_pnl": gross_pnl, "trade_cost": trade_cost,
+                            "gross_pnl": gross_pnl, "trade_cost": trade_cost_cycle,
                             "turnover": float(turnover), "equity": equity},
                            ensure_ascii=False) + "\n")
     return day_pnl, equity

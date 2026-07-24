@@ -82,8 +82,11 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
             from src.live import paper as PA
             # 리밸런싱이 실제로 일어났을 때만(SKIP 아님) 회전율 비용 차감. 밴드로 보류/스킵이면 비용 0.
             turnover = 0.0 if order_record.get("skipped") else float(order_record.get("drift", 0.0))
+            # returns_rows: '완결된 봉'만 담긴 일자별 수익률(오늘 부분봉 제외) —
+            # 페이퍼 곡선이 하루 수익을 통째로 평가하고, 스케줄 누락일도 따라잡는다.
             day_pnl, equity = PA.mark_to_market(paper_current, day_returns, today=today,
-                                                turnover=turnover)
+                                                turnover=turnover,
+                                                returns_rows=target.get("day_returns_rows"))
             log.info("[Paper PnL] 일일 가상 손익: %+.6f | 누적 가상 자산: %.6f (회전율=%.4f)",
                      day_pnl, equity, turnover)
         except Exception as e:

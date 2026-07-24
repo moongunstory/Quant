@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -206,14 +207,18 @@ def _send_real_orders(orders, aum_usd, today, open_positions=None):
             except Exception:
                 log.exception("청산용 포지션 조회 실패 -- close 주문은 개별 에러 처리됨")
 
-    for o in orders:
+    def _send_one(o):
+        """주문 dict 하나 전송 시도. 성공 시 o['exchange_result'], 실패 시 o['error'].
+        네트워크 등 '예외'로 실패한 경우만 o['_transient']=True 로 표시해 1회 재시도
+        대상이 되게 한다(수량 0/최소명목가 미만/포지션 없음 등은 재시도해도 같으므로
+        영구 실패로 둔다)."""
         symbol = o["coin"]
         if o.get("close"):
             pos_qty = float(open_positions.get(symbol, 0.0))
             if pos_qty == 0.0:
                 o["error"] = "청산 대상인데 거래소 포지션 없음 -- 미전송"
                 log.warning("%s: 청산 주문인데 실제 포지션 0", symbol)
-                continue
+                return
             try:
                 side = "SELL" if pos_qty > 0 else "BUY"
                 coid = _client_order_id(today, symbol, side)
@@ -223,18 +228,20 @@ def _send_real_orders(orders, aum_usd, today, open_positions=None):
                 if not ok:
                     o["error"] = f"청산 주문 거부/미체결 status={status}"
                     log.warning("%s: 청산 주문 미체결 status=%s", symbol, status)
-                    continue
+                    return
+                o.pop("error", None)
                 o["exchange_result"] = {"status": status, "sent_quantity": abs(pos_qty),
                                         "reduce_only": True, "client_order_id": coid}
             except Exception as exc:
                 log.exception("%s 청산 주문 처리 중 예외", symbol)
                 o["error"] = f"{type(exc).__name__}: {exc}"
-            continue
+                o["_transient"] = True
+            return
         price = prices.get(symbol)
         if not price:
             o["error"] = f"{symbol} mark price 없음 -- 미전송"
             log.warning("%s: mark price 조회 실패 (prices dict 에 없음)", symbol)
-            continue
+            return
         raw_qty = (o["delta"] * aum_usd) / price
         try:
             exchange.set_leverage(symbol)
@@ -242,14 +249,14 @@ def _send_real_orders(orders, aum_usd, today, open_positions=None):
             if qty == 0.0:
                 o["error"] = "반올림 수량 0 (minQty 미만) -- 미전송"
                 log.warning("%s: 반올림 후 수량 0 (raw_qty=%s)", symbol, raw_qty)
-                continue
+                return
             # 최소 명목가(MIN_NOTIONAL) 로컬 검증 — 미만이면 -4164 거부 전에 스킵.
             notional = abs(qty) * price
             floor = exchange.min_notional(symbol)
             if notional < floor:
                 o["error"] = f"명목가 {notional:.2f} < 최소 {floor:.2f} -- 미전송(스킵)"
                 log.warning("%s: 명목가 %.2f < 최소 %.2f 스킵", symbol, notional, floor)
-                continue
+                return
             side = "BUY" if raw_qty > 0 else "SELL"
             coid = _client_order_id(today, symbol, side)
             result = exchange.place_market_order(symbol, side, abs(qty), client_order_id=coid)
@@ -257,12 +264,31 @@ def _send_real_orders(orders, aum_usd, today, open_positions=None):
             if not ok:
                 o["error"] = f"주문 거부/미체결 status={status}"
                 log.warning("%s: 주문 미체결 status=%s", symbol, status)
-                continue
+                return
+            o.pop("error", None)
             o["exchange_result"] = {"status": status, "sent_quantity": abs(qty),
                                     "client_order_id": coid}
         except Exception as exc:
             log.exception("%s 주문 처리 중 예외", symbol)
             o["error"] = f"{type(exc).__name__}: {exc}"
+            o["_transient"] = True
+
+    for o in orders:
+        _send_one(o)
+
+    # ---- 일시 오류 1회 재시도 (2026-07-24 추가) ----
+    # 예전엔 재시도가 없어서, 주문 하나가 네트워크/일시 오류로 실패하면 daily guard
+    # (성공 주문이 하나라도 있으면 당일 재실행 차단) 때문에 그 포지션이 다음 사이클까지
+    # 24시간 목표와 어긋난 채 방치됐다. 같은 clientOrderId 를 다시 쓰므로, 첫 전송이
+    # 사실은 거래소에 접수됐는데 응답만 유실된 경우에도 이중 진입은 불가능(멱등).
+    retries = [o for o in orders if o.pop("_transient", False) and not o.get("exchange_result")]
+    if retries:
+        log.info("일시 오류 주문 %d건 5초 후 1회 재시도: %s",
+                 len(retries), [o["coin"] for o in retries])
+        time.sleep(5)
+        for o in retries:
+            _send_one(o)
+            o.pop("_transient", None)   # 기록(JSON)에 내부 플래그가 남지 않게 정리
 
 
 def _write_order_record(record, today):
