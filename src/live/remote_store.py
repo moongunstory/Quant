@@ -112,17 +112,34 @@ def _iter_remote_keys(client, prefix: str) -> Iterable[str]:
 
 
 def sync_down(prefixes: Iterable[str] = DOWN_PREFIXES) -> int:
-    """R2 → 로컬(data_dir). prefix 하위 오브젝트를 전부 내려받는다. 받은 파일 수 반환."""
+    """R2 → 로컬(data_dir). prefix 하위 오브젝트를 내려받는다. 받은 파일 수 반환.
+
+    (2026-07-24) 로컬에 '같은 크기'로 이미 존재하는 파일은 건너뛴다 — 원자료가 ~8GB 라
+    매 실행 전체 다운로드는 Lambda 시간/네트워크 낭비다. 따뜻한(재사용) 컨테이너에서는
+    /tmp 에 어제 데이터가 남아 있어 대부분 스킵되고, 콜드스타트(빈 /tmp)에서는 전과
+    동일하게 전체를 받는다(스킵 대상이 없으므로 동작 변화 없음)."""
     if not is_enabled():
         return 0
     client = _client()
     root = _data_dir()
-    
+
     keys_to_download = []
+    skipped = 0
     for prefix in prefixes:
-        for key in _iter_remote_keys(client, prefix):
-            keys_to_download.append(key)
-            
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                local = root / key
+                if local.exists() and local.stat().st_size == obj["Size"]:
+                    skipped += 1
+                    continue
+                keys_to_download.append(key)
+    if skipped:
+        log.info("R2 다운로드 스킵: %d개 파일(로컬과 크기 동일 — 변경 없음)", skipped)
+
     n = len(keys_to_download)
     if n > 0:
         from concurrent.futures import ThreadPoolExecutor
@@ -179,21 +196,51 @@ def _iter_local_files(prefix: str) -> Iterable[Path]:
             yield p
 
 
-def sync_up(prefixes: Iterable[str] = UP_PREFIXES) -> int:
-    """로컬(data_dir) → R2. prefix 하위 파일을 전부 업로드. 올린 파일 수 반환.
+# 크기 비교로 '안 바뀐 파일' 업로드를 건너뛰는 prefix (대용량 원자료·캐시).
+# parquet 은 내용이 바뀌면 압축 결과 크기가 사실상 항상 달라지므로 크기 비교로 충분하다.
+# runtime(포지션/원장)과 universe(스냅샷 JSON)는 작지만 절대 유실되면 안 되므로
+# 비교 없이 무조건 업로드한다.
+_SIZE_SKIP_PREFIXES = ("market/processed", "market/panel", "market/scan")
 
-    데이터가 작아(패널 81MB, 런타임 수 MB) 매번 전체 업로드해도 R2 는 ingress/egress 무료라
-    비용이 없다. 변경분만 골라내는 최적화는 필요해지면 그때 추가."""
+
+def _remote_size_map(client, prefix: str) -> dict:
+    """{key: size} — prefix 하위 원격 오브젝트 크기 맵(증분 업로드 판단용)."""
+    sizes = {}
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
+        for obj in page.get("Contents", []):
+            sizes[obj["Key"]] = obj["Size"]
+    return sizes
+
+
+def sync_up(prefixes: Iterable[str] = UP_PREFIXES) -> int:
+    """로컬(data_dir) → R2. prefix 하위 파일을 업로드. 올린 파일 수 반환.
+
+    (2026-07-24) 대용량 prefix(market/processed·panel·scan)는 원격과 '크기가 같은'
+    파일을 건너뛴다 — 예전엔 매 실행 수백 개의 몇 년치 원본 parquet 를 통째로 재업로드해
+    Lambda 실행시간을 태웠다(그만큼 수집/매매 예산이 줄었다). 하루에 실제로 바뀌는 건
+    증분 수집이 이어붙인 파일들뿐이다. runtime/universe 는 무조건 업로드(유실 방지)."""
     if not is_enabled():
         return 0
     client = _client()
     root = _data_dir()
-    
+
     files_to_upload = []
+    skipped = 0
     for prefix in prefixes:
+        size_check = any(prefix.startswith(p) or p.startswith(prefix)
+                         for p in _SIZE_SKIP_PREFIXES)
+        remote_sizes = _remote_size_map(client, prefix) if size_check else {}
         for path in _iter_local_files(prefix):
+            key = path.relative_to(root).as_posix()
+            if size_check and key.startswith(_SIZE_SKIP_PREFIXES) \
+                    and remote_sizes.get(key) == path.stat().st_size:
+                skipped += 1
+                continue
             files_to_upload.append(path)
-            
+    if skipped:
+        log.info("R2 업로드 스킵: %d개 파일(원격과 크기 동일 — 변경 없음)", skipped)
+
     n = len(files_to_upload)
     if n > 0:
         from concurrent.futures import ThreadPoolExecutor

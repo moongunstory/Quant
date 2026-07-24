@@ -55,6 +55,41 @@ def run_full_collector(args):
     full_collector.run(datasets=args.datasets, max_workers=args.workers)
 
 
+def run_downsample_metrics(args):
+    """기존 metrics parquet(5분봉)을 1시간봉으로 일괄 변환(용량 ~1/12).
+
+    패널은 일 단위 집계만 쓰므로 알파/백테스트 값은 사실상 동일하다.
+    변환 후 R2 를 쓰면 `python -m src.live.remote_store push` 로 올려야
+    Lambda 도 작은 파일을 받는다(키가 같아 자동 교체됨)."""
+    from src.collector.full_collector import downsample_metrics_1h
+
+    d = SETTINGS.processed_dir / "metrics"
+    files = sorted(d.glob("*.parquet"))
+    if not files:
+        print(f"변환할 파일 없음: {d}")
+        return
+    tot_before = tot_after = 0
+    for p in files:
+        before = p.stat().st_size
+        try:
+            df = pd.read_parquet(p)
+            out = downsample_metrics_1h(df)
+            if len(out) < len(df):
+                out.to_parquet(p, index=False)
+        except Exception as e:
+            print(f"  {p.stem:22s} 실패: {e}")
+            continue
+        after = p.stat().st_size
+        tot_before += before
+        tot_after += after
+        if args.verbose:
+            print(f"  {p.stem:22s} {len(df):>8,}행 → {len(out):>8,}행  "
+                  f"{before/1e6:8.1f}MB → {after/1e6:8.1f}MB")
+    print(f"\n합계 {len(files)}개 파일: {tot_before/1e9:.2f}GB → {tot_after/1e9:.2f}GB "
+          f"(절감 {max(tot_before-tot_after,0)/1e9:.2f}GB)")
+    print("R2 사용 시 다음으로 업로드: python -m src.live.remote_store push")
+
+
 def run_universe_refresh(args):
     """월간 유니버스 갱신 체인: 심볼목록 -> 경량 스캔 -> 월별 top-100 스냅샷."""
     from src.collector import universe_maintenance
@@ -462,6 +497,13 @@ def main():
         help="심볼 단위 병렬 워커 수 (기본 10). 요청 간격은 전역 스로틀이 별도로 보장",
     )
     full_collector_parser.set_defaults(func=run_full_collector)
+
+    downsample_parser = subparsers.add_parser(
+        "downsample-metrics",
+        help="기존 metrics parquet(5분봉)을 1시간봉으로 일괄 변환 — R2 무료한도(10GB) 확보용, 1회 실행",
+    )
+    downsample_parser.add_argument("--verbose", action="store_true", help="파일별 변환 내역 출력")
+    downsample_parser.set_defaults(func=run_downsample_metrics)
 
     backtest_build_panel_parser = subparsers.add_parser("backtest-build-panel", help="심볼별 parquet -> date×coin 패널 캐시")
     backtest_build_panel_parser.add_argument("--fields", nargs="+", default=None)

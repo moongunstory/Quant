@@ -103,7 +103,7 @@ def fetch_funding_rate_recent(symbol: str, start_ms: int, end_ms: int) -> pd.Dat
     return df[["calc_time", "funding_interval_hours", "last_funding_rate"]]
 
 
-def fetch_metrics_recent(symbol: str, start_ms: int, end_ms: int, period: str = "5m") -> pd.DataFrame:
+def fetch_metrics_recent(symbol: str, start_ms: int, end_ms: int, period: str = "1h") -> pd.DataFrame:
     """
     metrics REST 폴백. 아카이브 metrics 한 파일은 실제로 5개의 서로 다른 REST
     엔드포인트를 합성한 것임 (2026-07-09 fapi.binance.com 직접 조회로 필드명 실측 확인):

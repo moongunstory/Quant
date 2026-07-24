@@ -366,6 +366,43 @@ def _collect_monthly_only(symbol, meta_entry, rules, dataset, storage_key) -> Op
 
 
 # ---------------------------------------------------------------------------
+# metrics 1h 다운샘플 (2026-07-24)
+# ---------------------------------------------------------------------------
+# 원본 아카이브/REST 의 metrics 는 5분 해상도인데, 패널(FIELD_SPECS)은 어차피 '일 단위'
+# 집계(mean/last)만 쓴다. 5분봉을 그대로 쌓으면 저장소의 대부분(실측 6.4GB/7.7GB)을
+# metrics 가 차지해 R2 무료 한도(10GB)를 위협한다 → 저장 전에 1시간봉으로 줄인다(~1/12).
+# 집계 방식은 패널과 정합: OI 계열은 last(시점값), 비율 계열은 mean(평균) —
+# '시간봉 평균의 일평균'은 완전한 버킷에서 '5분봉의 일평균'과 동일하므로 일 단위
+# 패널/알파 값은 사실상 변하지 않는다.
+_METRICS_1H_AGG = {
+    "sum_open_interest": "last",
+    "sum_open_interest_value": "last",
+    "count_toptrader_long_short_ratio": "mean",
+    "sum_toptrader_long_short_ratio": "mean",
+    "count_long_short_ratio": "mean",
+    "sum_taker_long_short_vol_ratio": "mean",
+}
+
+
+def downsample_metrics_1h(df: pd.DataFrame) -> pd.DataFrame:
+    """metrics DataFrame(5m 등 임의 해상도)을 1h 버킷으로 다운샘플. 스키마/컬럼 순서 유지.
+    이미 1h 이하 해상도면 사실상 no-op(같은 버킷에 행이 하나뿐)."""
+    if df is None or df.empty or "create_time" not in df.columns:
+        return df
+    out = df.copy()
+    # 반드시 '원본(5m) 타임스탬프' 기준으로 안정 정렬한 뒤에 floor 한다.
+    # floor 부터 하면 같은 시간 버킷 안이 전부 동점이라 불안정 정렬이 순서를 섞고,
+    # 'last' 가 그 시간의 진짜 마지막 값이 아닌 임의 행(예: OI=0 결함 행)을 뽑는다.
+    out["create_time"] = pd.to_datetime(out["create_time"], utc=True)
+    out = out.sort_values("create_time", kind="stable")
+    out["create_time"] = out["create_time"].dt.floor("1h")
+    keys = ["create_time"] + (["symbol"] if "symbol" in out.columns else [])
+    agg = {c: _METRICS_1H_AGG.get(c, "last") for c in out.columns if c not in keys}
+    out = out.groupby(keys, as_index=False).agg(agg)   # groupby 는 그룹 내 순서 보존
+    return out[[c for c in df.columns if c in out.columns]]
+
+
+# ---------------------------------------------------------------------------
 # 분기 3: daily_only (metrics, bookDepth) — 전체 역사를 하루 단위로 수집
 # ---------------------------------------------------------------------------
 
@@ -437,6 +474,8 @@ def _collect_daily_only(symbol, meta_entry, rules, dataset, storage_key) -> Opti
         return None
 
     new_df = pd.concat(new_frames, ignore_index=True)
+    if dataset == "metrics":
+        new_df = downsample_metrics_1h(new_df)   # 5m → 1h (저장 용량 ~1/12)
     path = storage.append_parquet(new_df, category=f"processed_{dataset}", filename=storage_key, dedup_key=spec["time_col"])
     if last_completed_date is not None:
         storage.update_last_collected(category=f"processed_{dataset}", symbol=storage_key, value=last_completed_date.strftime("%Y-%m-%d"))

@@ -61,6 +61,21 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
 
     kw = {} if max_staleness_days is None else {"max_staleness_days": max_staleness_days}
     target = TW.compute_target_weights(cfg, today=today, rebuild=rebuild, **kw)
+
+    # [시그널 나이 진단] 이 사이클이 자정(UTC) 대비 얼마나 늦게 돌았는지 기록.
+    # 백테스트 체결가정(close)은 '종가 직후 체결'이므로 실행이 늦을수록 가정과 어긋난다
+    # (실측: 2026-07-16 사이클이 16:53 에 실행 = 17시간 낡은 신호로 매매).
+    # 텔레메트리에 남겨 스케줄 이상(EventBridge 불규칙/수동 재실행)을 드러낸다.
+    try:
+        now_utc = datetime.now(timezone.utc)
+        midnight = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        age_h = (now_utc - midnight).total_seconds() / 3600.0
+        target.setdefault("diagnostics", {})["signal_age_hours"] = round(age_h, 2)
+        if age_h > 6:
+            log.warning("사이클이 자정 UTC 대비 %.1f시간 늦게 실행됨 — 신호가 낡아 "
+                        "백테스트 체결가정(close)과 어긋납니다. 스케줄 상태를 확인하세요.", age_h)
+    except Exception:
+        pass
     LG.record("target", {"date": target["date"], "n_coins": len(target["weights"]),
                          "held_alphas": target["held_alphas"],
                          "all_alphas_stale": target["diagnostics"].get("all_alphas_stale"),

@@ -153,23 +153,26 @@ def build_universe_mask(index, columns) -> pd.DataFrame:
         log.warning("universe_snapshots 없음 -> 유니버스 필터 미적용")
         return pd.DataFrame(1.0, index=index, columns=columns)
 
+    # (2026-07-24) 벡터화: 예전엔 날짜별 파이썬 루프(각 날짜마다 스냅샷 리스트 재탐색 +
+    # 행 단위 .loc 대입)였고, 이 함수는 한 사이클에 알파 수만큼(마스터 포함 5회+) 반복
+    # 호출된다. searchsorted 로 각 날짜가 속한 스냅샷 구간을 한 번에 찾고, 같은 구간의
+    # 행들을 통째로 채운다(결과는 종전과 완전 동일 — 동치성 테스트로 확인, ~3배 빠름).
     snap_dates = sorted(snaps)
-    mask = pd.DataFrame(False, index=index, columns=columns)
-    for day in index:
-        # day 이전(포함) 최근 스냅샷 찾기
-        active = None
-        for sd in snap_dates:
-            if sd <= day:
-                active = sd
-            else:
-                break
-        if active is None:
+    idx = pd.DatetimeIndex(index)
+    snap_idx = pd.DatetimeIndex(snap_dates)
+    # 각 날짜에 대해 '자기 이전(포함) 가장 최근 스냅샷'의 위치. -1 = 첫 스냅샷 이전(멤버 없음).
+    pos = snap_idx.searchsorted(idx, side="right") - 1
+    mask = pd.DataFrame(0.0, index=index, columns=columns)
+    col_set = set(columns)
+    for i, sd in enumerate(snap_dates):
+        rows = idx[pos == i]
+        if len(rows) == 0:
             continue
-        members = snaps[active] & set(columns)
+        members = list(snaps[sd] & col_set)
         if members:
-            mask.loc[day, list(members)] = True
+            mask.loc[rows, members] = 1.0
     # float(1.0/0.0)로 반환: 엔진에서 reindex 할 때 bool 다운캐스팅 경고를 피한다.
-    return mask.astype(float)
+    return mask
 
 
 # --------------------------- 캐시 --------------------------- #

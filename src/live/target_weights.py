@@ -105,6 +105,20 @@ def compute_target_weights(cfg, today=None, max_staleness_days=FR.DEFAULT_MAX_ST
                if w == w and abs(float(w)) > _DUST}  # NaN/dust 제외
     diagnostics["target_row_date"] = str(final.index[-1].date())
 
+    # ---- 부분 stale 시 노출 축소 (2026-07-24) ----
+    # 백테스트로 검증된 것은 '전체 알파가 함께 있는 북'이다. 일부 알파가 stale 로
+    # 빠지면 combine 이 남은 알파에 L1=1 을 재정규화해 '집중 북'이 되는데, 그 집중은
+    # 검증된 적이 없다(예: 4개 중 1개만 신선하면 그 알파 하나가 총노출 전부를 짊어짐).
+    # 신선 알파 비율만큼 총노출을 줄여, 알파 하나가 짊어지는 위험을 검증 당시 수준으로
+    # 유지한다. 전부 신선하면 scale=1 (no-op). stale 이 해소되면 자동 복원.
+    n_total, n_fresh = len(specs), len(fresh_names)
+    if 0 < n_fresh < n_total:
+        scale = n_fresh / n_total
+        weights = {c: w * scale for c, w in weights.items()}
+        diagnostics["stale_exposure_scale"] = round(scale, 4)
+        log.warning("알파 %d/%d 만 신선 → 총노출을 %.0f%%로 축소(미검증 집중 방지)",
+                    n_fresh, n_total, scale * 100)
+
     # 당일 수익률 추출 (자산 가치 평가용)
     #
     # 주의(2026-07-24 수정): 패널의 마지막 행은 '오늘의 미완성(부분) 봉'인 경우가
