@@ -410,10 +410,49 @@ def cmd_run_deferred():
     )
 
 
-def cmd_clear():
+def cmd_clear(arg: str = ""):
+    """/초기화 [포지션|잔고|전체] [확인] — 범위를 골라 초기화한다.
+
+    실제 삭제는 '확인'을 붙였을 때만 실행(실수 방지 2단계). 범위 없이 호출하면
+    사용법을, 범위만 주면 뭐가 지워지는지 미리보기를 보여준다.
+    """
+    from src.live import reset as RESET
+
+    parts = arg.split()
+    scope = parts[0] if parts else ""
+    confirmed = len(parts) > 1 and parts[1] == "확인"
+
+    if not scope:
+        lines = ["<b>[/초기화 사용법]</b>", "범위를 골라 주세요:"]
+        for name, desc in RESET.SCOPES.items():
+            lines.append(f"• <code>/초기화 {name}</code> — {desc}")
+        lines.append("\n실행하려면 뒤에 <code>확인</code>을 붙입니다. 예: <code>/초기화 전체 확인</code>")
+        send_telegram_message("\n".join(lines))
+        return
+
+    if scope not in RESET.SCOPES:
+        send_telegram_message(
+            f"❌ 알 수 없는 범위: <code>{scope}</code>\n"
+            f"가능한 범위: {', '.join(RESET.SCOPES)} (예: <code>/초기화 잔고 확인</code>)")
+        return
+
+    if not confirmed:
+        lines = [f"<b>[/초기화 {scope} — 미리보기]</b>", "이걸 실행하면:"]
+        lines += RESET.preview(scope)
+        lines.append("\n⚠️ 되돌릴 수 없어요. 진행하려면:")
+        lines.append(f"<code>/초기화 {scope} 확인</code>")
+        send_telegram_message("\n".join(lines))
+        return
+
     try:
-        OR.save_positions({})
-        send_telegram_message("🧹 로컬 가상 포지션(positions.json)이 성공적으로 초기화되었습니다.")
+        summary = RESET.apply_reset(scope)
+        lines = [f"🧹 <b>초기화 완료 ({scope})</b>"]
+        lines.append("• 비운 항목: " + ", ".join(summary["cleared"]))
+        if scope == "전체":
+            lines.append(f"• 기록 파일 삭제: 로컬 {summary['deleted_local']}개 · "
+                         f"클라우드(R2) {summary['deleted_remote']}개")
+        lines.append("다음 사이클부터 0에서 새로 시작합니다.")
+        send_telegram_message("\n".join(lines))
     except Exception as e:
         send_telegram_message(f"❌ 초기화 중 에러 발생: <code>{e}</code>")
 
@@ -781,7 +820,7 @@ def cmd_help():
         "• <code>/이유 &lt;코인&gt;</code>: 그 코인을 왜 이 방향·비중으로 잡았는지 (전략별 의견 + 안전장치 조정)",
         "• <code>/기록 [개수|코인]</code>: 진입→종료가 끝난 매매 목록 (시간순, 건별 손익)",
         "• <code>/텔레메트리 [일수|날짜]</code>: 사이클 텔레메트리(기여도 분석용) 파일/번들 전송 (기본 30일 zip)",
-        "• <code>/초기화</code>: 로컬 가상 포지션 초기화",
+        "• <code>/초기화 &lt;포지션|잔고|전체&gt; 확인</code>: 범위를 골라 초기화 (범위 없이 치면 사용법)",
         "• <code>/도움말</code>: 봇 도움말 보기"
     ]
     send_telegram_message("\n".join(lines))
@@ -830,7 +869,7 @@ def handle_message(msg: dict, webhook: bool = False) -> bool:
     elif cmd == "/실행":
         cmd_run_deferred() if webhook else cmd_run()
     elif cmd == "/초기화":
-        cmd_clear()
+        cmd_clear(arg)
     elif cmd == "/스냅샷":
         cmd_snapshot()
     elif cmd == "/리스크":

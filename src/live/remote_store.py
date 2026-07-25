@@ -256,6 +256,43 @@ def sync_up(prefixes: Iterable[str] = UP_PREFIXES) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 원격 삭제 (/초기화 전체 등에서 사용)
+# ---------------------------------------------------------------------------
+
+def list_keys(prefix: str) -> list:
+    """prefix 로 시작하는 원격 오브젝트 키 목록. 비활성이면 빈 리스트."""
+    if not is_enabled():
+        return []
+    client = _client()
+    return list(_iter_remote_keys(client, prefix))
+
+
+def delete_keys(keys: Iterable[str]) -> int:
+    """원격 오브젝트를 일괄 삭제(1000개 단위 배치). 지운 개수 반환.
+
+    주의: sync 계열은 삭제가 없으므로(업/다운로드만), '날짜별로 쌓이는 파일'을
+    초기화할 때는 이 함수로 R2 에서 직접 지워야 다음 sync_down 때 되살아나지 않는다."""
+    if not is_enabled():
+        return 0
+    keys_list = [k for k in keys if k]
+    if not keys_list:
+        return 0
+    client = _client()
+    n = 0
+    for i in range(0, len(keys_list), 1000):
+        batch = keys_list[i:i + 1000]
+        resp = client.delete_objects(
+            Bucket=_bucket(),
+            Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True})
+        errors = resp.get("Errors", [])
+        n += len(batch) - len(errors)
+        for err in errors:
+            log.warning("R2 삭제 실패: %s (%s)", err.get("Key"), err.get("Message"))
+    log.info("R2 오브젝트 %d개 삭제", n)
+    return n
+
+
+# ---------------------------------------------------------------------------
 # 보존기간 정리 (오래된 데이터 자동 삭제)
 # ---------------------------------------------------------------------------
 

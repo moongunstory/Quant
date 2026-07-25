@@ -190,6 +190,14 @@ def lambda_handler(event, context):
         except Exception as e:
             log.error("R2 다운로드 실패(진행은 계속 시도): %s", e, exc_info=True)
 
+        # 2-1) /초기화 전체 이후 warm 컨테이너 /tmp 에 남은 옛 기록이 sync_up 으로
+        #      되살아나는 것 방지: 초기화 마커보다 오래된 날짜별 파일을 지운다.
+        try:
+            from src.live import reset as RESET
+            RESET.enforce_reset_marker()
+        except Exception as e:
+            log.warning("초기화 마커 점검 실패(계속 진행): %s", e)
+
         config_path = os.path.join(data_dir, "strategy", "portfolio", "config.json")
 
         # Lambda 는 매매 전용이지만 '데이터 수집'은 직접 한다(refresh=True). R2 에서 내려받은

@@ -144,7 +144,9 @@ def run_cycle(config_path, mode=None, today=None, refresh=False,
     except Exception as e:
         log.warning("텔레메트리 스냅샷 기록 실패(사이클은 계속): %s", e)
 
-    res = {"target": target, "orders": order_record}
+    # prev_positions: 대시보드의 '오늘 코인별 손익 기여'용 — 당일 수익을 실제로 번
+    # 포지션은 주문 전 보유(paper_current)다(목표 가중치가 아니라).
+    res = {"target": target, "orders": order_record, "prev_positions": paper_current}
 
     # [보존기간] 90일 지난 날짜별 기록(이벤트로그/주문기록/텔레메트리/번들zip)을 정리해
     # 로그가 무한히 쌓이지 않게 한다. 실패해도 사이클은 계속(fail-open).

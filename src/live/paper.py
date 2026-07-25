@@ -70,9 +70,11 @@ def mark_to_market(weights, day_returns, today=None, turnover=0.0, returns_rows=
                 cost = trade_cost_cycle if is_last else 0.0
                 day_pnl = gross - cost
                 equity += day_pnl
+                # btc_return: 대시보드의 'BTC 그냥 보유' 비교선용(같은 날짜 기준으로 정렬돼 정확)
                 f.write(json.dumps({"date": r["date"], "day_pnl": day_pnl,
                                     "gross_pnl": gross, "trade_cost": cost,
                                     "turnover": float(turnover) if is_last else 0.0,
+                                    "btc_return": float(rets.get("BTCUSDT", 0.0)),
                                     "equity": equity}, ensure_ascii=False) + "\n")
         return day_pnl, equity
 
@@ -87,6 +89,8 @@ def mark_to_market(weights, day_returns, today=None, turnover=0.0, returns_rows=
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"date": today.isoformat(), "day_pnl": day_pnl,
                             "gross_pnl": gross_pnl, "trade_cost": trade_cost_cycle,
-                            "turnover": float(turnover), "equity": equity},
+                            "turnover": float(turnover),
+                            "btc_return": float(day_returns.get("BTCUSDT", 0.0)),
+                            "equity": equity},
                            ensure_ascii=False) + "\n")
     return day_pnl, equity
