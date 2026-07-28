@@ -51,9 +51,29 @@ def mark_to_market(weights, day_returns, today=None, turnover=0.0, returns_rows=
             prev_equity = float(last_rec.get("equity", 0.0))
             last_date = last_rec.get("date")
 
+    # 1) 초기화 마커(last_reset.json)가 있는 경우, 초기화 날짜(당일 포함) 이전의 데이터는 소급하지 않도록 함
+    reset_day = None
+    marker_path = p.parent / "last_reset.json"
+    if marker_path.exists():
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if marker.get("scope") in ("잔고", "전체") and marker.get("ts"):
+                reset_day = marker["ts"][:10]
+        except Exception:
+            pass
+
     if returns_rows:
-        rows = [r for r in returns_rows
-                if r.get("date") and (last_date is None or r["date"] > last_date)]
+        rows = []
+        for r in returns_rows:
+            d = r.get("date")
+            if not d:
+                continue
+            if reset_day is not None and d <= reset_day:
+                continue
+            if last_date is not None and d <= last_date:
+                continue
+            rows.append(r)
+
         if not rows:
             # 새 완결일 없음(같은 날 재실행 등) → 기존 마지막 기록 그대로(중복 방지).
             if last_rec is not None:
