@@ -1,4 +1,4 @@
-﻿"""알파 엔진 — AlphaSpec 하나를 포지션과 순손익으로 바꾼다.
+"""알파 엔진 — AlphaSpec 하나를 포지션과 순손익으로 바꾼다.
 
 파이프라인:
     expression -> 원점수
@@ -88,7 +88,7 @@ def run(spec, panels, universe=None, funding_events=None):
 
 
 def result_from_weights(weights, panels, delay=1, funding_events=None, spec=None,
-                        execution=None):
+                        execution=None, rebalance_band=0.0):
     """이미 만들어진 가중치 패널(신호, 지연 전) -> EngineResult.
 
     포트폴리오 결합 후 combine/risk 를 거친 최종 가중치에 대해서도 동일한 손익
@@ -120,6 +120,22 @@ def result_from_weights(weights, panels, delay=1, funding_events=None, spec=None
         raise ValueError(f"알 수 없는 execution {execution!r} (close|next_open)")
 
     positions = weights.shift(delay)  # 당일 체결 없음
+
+    if rebalance_band > 0.0:
+        sim_pos = positions.copy()
+        last_w = None
+        for idx, row in positions.iterrows():
+            if last_w is None:
+                if row.notna().any():
+                    last_w = row.fillna(0.0)
+                continue
+            row_filled = row.fillna(0.0)
+            drift = (row_filled - last_w).abs().sum()
+            if drift < rebalance_band:
+                sim_pos.loc[idx] = last_w
+            else:
+                last_w = row_filled
+        positions = sim_pos
 
     contrib = positions * returns
     gross_pnl = contrib.sum(axis=1, min_count=1)

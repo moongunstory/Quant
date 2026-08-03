@@ -1,4 +1,4 @@
-﻿"""pipeline — 승인 포트폴리오 config 를 실제 백테스트로.
+"""pipeline — 승인 포트폴리오 config 를 실제 백테스트로.
 
 흐름:
   1. config 의 알파들을 각각 백테스트(engine.run) → 알파별 (신호 가중치, 순손익)
@@ -204,7 +204,8 @@ def build_portfolio(cfg: PortfolioSpec, rebuild=False, alphas_dir="data/strategy
 
     # 포지션이 이미 delay 반영 -> 최종은 delay=0. 비용+8h펀딩 반영 순손익.
     final = engine.result_from_weights(final_weights, master_panels, delay=0,
-                                       funding_events=funding_events)
+                                       funding_events=funding_events,
+                                       rebalance_band=cfg.rebalance_band)
     m = M.compute(final)
     report = RPT.report_from_pipeline_stages(risk_out["stages"])
 

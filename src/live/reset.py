@@ -119,7 +119,18 @@ def apply_reset(scope: str, today=None) -> dict:
     cleared += ["포지션", "진입가 스냅샷"]
 
     if scope in ("잔고", "전체"):
-        _overwrite(EQUITY_PATH, "")
+        # 자산 곡선의 시작점(0.0%)을 마커 당일 날짜로 추가하여, 렌더링 시 0에서 시작해서 위/아래로 움직이도록 함.
+        reset_date_str = now.date().isoformat()
+        start_rec = {
+            "date": reset_date_str,
+            "day_pnl": 0.0,
+            "gross_pnl": 0.0,
+            "trade_cost": 0.0,
+            "turnover": 0.0,
+            "btc_return": 0.0,
+            "equity": 0.0
+        }
+        _overwrite(EQUITY_PATH, json.dumps(start_rec, ensure_ascii=False) + "\n")
         cleared.append("누적 수익곡선")
 
     deleted_local = 0

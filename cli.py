@@ -367,7 +367,7 @@ def run_walkforward(args):
             series, pos_panels, master_panels, funding_events, cfg,
             families=families, rebalance=args.rebalance, window=args.window,
             min_history=args.min_history)
-        print(f"\n=== walkforward (out-of-sample) — config '{cfg.name}' "
+        print(f"\n=== walkforward (out-of-sample) - config '{cfg.name}' "
               f"(selection+weighting+risk 스택까지 재적용) ===")
     else:
         series = WF.collect_alpha_series(rebuild=args.rebuild)

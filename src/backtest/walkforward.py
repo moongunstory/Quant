@@ -1,4 +1,4 @@
-﻿"""walkforward — '선택 과정 자체'를 미래참조 0으로 검증(과최적화 방어).
+"""walkforward — '선택 과정 자체'를 미래참조 0으로 검증(과최적화 방어).
 
 동기(coin 이식, PLAN 2026-07-11 ③-2): 전 표본 fitness 랭킹은 selector 에게
 '나중에 평가받을 바로 그 미래'를 보여주기 때문에, 2020~21 에만 수익이 몰린
@@ -340,7 +340,8 @@ def run_walkforward_portfolio(series, pos_panels, master_panels, funding_events,
             components=contributions, families=families,
             panels=panels_slc, funding_events=funding_events)
         final = engine.result_from_weights(risk_out["weights"], panels_slc,
-                                           delay=0, funding_events=funding_events)
+                                           delay=0, funding_events=funding_events,
+                                           rebalance_band=cfg.rebalance_band)
         oos.append(final.net_pnl.reindex(period_idx).fillna(0.0))
         rec["weights"] = {k: round(float(v), 4) for k, v in alpha_w.items()}
         periods.append(rec)
